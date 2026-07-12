@@ -157,6 +157,36 @@ class ERPClient:
             self._cache_set(cache_key, data)
 
         return data
+    
+    def call_method_post(self, method, data=None):
+        """Call a whitelisted method via POST: POST /api/method/<method>
+
+        Use this for the custom sales_app write endpoints (e.g.
+        sales_app.api.lead.create_lead, sales_app.api.customer.update_customer)
+        documented in the Sales App API Reference — these are actions with
+        side effects, so unlike call_method() this is never cached, and it
+        clears the read cache afterwards so a get_list()/get_doc() called
+        right after a create/update doesn't hand back stale data.
+
+        Note on CSRF: the docs mention an X-Frappe-CSRF-Token header for
+        POSTs, but that's only required for cookie/session-based logins.
+        This client authenticates with an API key/secret (Authorization:
+        token ...), which Frappe exempts from CSRF checks, so no CSRF
+        token handling is needed here.
+        """
+        if not self.base_url:
+            raise RuntimeError("ERP_URL is not configured.")
+
+        url = f"{self.base_url}/api/method/{method}"
+        response = self.session.post(url, json=(data or {}), timeout=DEFAULT_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        payload = response.json()
+
+        # Any write can make previously-cached list/doc reads stale.
+        self._cache.clear()
+
+        return payload.get("message", payload)
+
 
     def create_doc(self, doctype, data):
         """Create a new document: POST /api/resource/<Doctype>
@@ -168,6 +198,8 @@ class ERPClient:
         response = self.session.post(url, json=data, timeout=DEFAULT_TIMEOUT_SECONDS)
         response.raise_for_status()
         return response.json().get("data", {})
+
+    
 
 
 erp_client = ERPClient()

@@ -1,3 +1,27 @@
+"""
+ERP/tools/sales_write_tools.py
+
+Create/update tools for the agent, backed by the custom "sales_app"
+whitelisted-method API (see Sales App API Reference / Sales Module API
+Documentation) rather than the generic ERPNext doctype REST resource that
+sales_tools.py's read-only tools use. All of these hit
+POST /api/method/sales_app.api.<module>.<action> via
+erp_client.call_method_post().
+
+Same conventions as sales_tools.py:
+  - specific, natural-language docstrings (ToolRAG embeds these, and the
+    LLM reads them to decide when to call the tool).
+  - never raises — failures are caught and turned into a short string the
+    LLM can relay honestly.
+  - optional args are typed Optional[...] = None and resolved inside the
+    function body (see _default in sales_tools.py) so small local models
+    passing explicit `null` don't trip Pydantic validation.
+
+Add this list to ERP/tools/__init__.py:
+    from .sales_write_tools import SALES_WRITE_TOOLS
+    ALL_TOOLS = [*SALES_TOOLS, *SALES_WRITE_TOOLS]
+"""
+
 from typing import Optional
 
 from langchain_core.tools import tool
@@ -6,7 +30,8 @@ from ERP.erp_client import erp_client
 
 
 def _safe_call(label, fn):
-    
+    """Runs `fn`, returning a clean error string instead of raising if the
+    ERP call fails for any reason (network, auth, validation, etc.)."""
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001
@@ -14,7 +39,9 @@ def _safe_call(label, fn):
 
 
 def _payload(**kwargs):
-   
+    """Drops keys whose value is None, so update_* tools only send the
+    fields the caller actually specified instead of nulling out every
+    field the user didn't mention."""
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
@@ -38,7 +65,10 @@ def create_lead(
     territory: Optional[str] = None,
     target_delivery_date: Optional[str] = None,
 ):
-    
+    """Create a new sales Lead. `name` is the lead/contact person's name
+    (required). Use for requests like 'create a lead for Rahul Sharma at
+    ABC Industries' or 'add a new lead, interested in ITEM-001, qty 100'.
+    Dates should be in YYYY-MM-DD format."""
 
     def run():
         data = _payload(
@@ -74,7 +104,10 @@ def update_lead(
     quantity: Optional[str] = None,
     notes: Optional[str] = None,
 ):
-
+    """Update an existing Lead identified by its ID (e.g. 'LEAD-00001').
+    Only the fields provided are changed. Use for requests like 'mark
+    LEAD-00001 as Contacted', 'update the phone number on that lead', or
+    'change the quantity to 50 on LEAD-00001'."""
 
     def run():
         data = _payload(
@@ -116,7 +149,10 @@ def create_customer(
     country: Optional[str] = None,
     lead_id: Optional[str] = None,
 ):
-    
+    """Create a new Customer. `customer_name` is required (e.g. 'ABC
+    Industries'). Use for requests like 'create a customer called ABC
+    Industries in Pune' or 'add this lead as a customer'. Pass `lead_id`
+    to link it back to the Lead it was converted from."""
 
     def run():
         data = _payload(
@@ -158,7 +194,11 @@ def update_customer(
     state: Optional[str] = None,
     pincode: Optional[str] = None,
 ):
-    
+    """Update an existing Customer identified by its ID (e.g.
+    'CUST-0001'). Only the fields provided are changed. Use for requests
+    like 'update the credit limit for CUST-0001 to 1500000' or 'change
+    ABC Industries' payment terms to Net 45'."""
+
     def run():
         data = _payload(
             name=customer_id,
@@ -201,7 +241,11 @@ def create_opportunity(
     required_delivery_timeline: Optional[str] = None,
     notes: Optional[str] = None,
 ):
-    
+    """Create a new Opportunity, usually from a qualified Lead. Use for
+    requests like 'create an opportunity for LEAD-00001, expected
+    revenue 500000' or 'open a new opportunity in the Discussion stage'.
+    `close_date` should be YYYY-MM-DD."""
+
     def run():
         data = _payload(
             lead=lead,
@@ -237,7 +281,12 @@ def update_opportunity(
     required_delivery_timeline: Optional[str] = None,
     notes: Optional[str] = None,
 ):
-    
+    """Update an existing Opportunity identified by its ID (e.g.
+    'OPP-00001'). Only the fields provided are changed. Use for requests
+    like 'move OPP-00001 to Negotiation stage' or 'update the expected
+    revenue on that opportunity to 600000'. For a bare stage change on
+    the Pipeline board, prefer a dedicated stage-update tool if one is
+    registered; this tool works for that too via `stage`."""
 
     def run():
         data = _payload(
@@ -274,7 +323,13 @@ def create_quotation(
     note: Optional[str] = None,
     fulfilment_plant: Optional[str] = None,
 ):
-    
+    """Create a new Quotation for a customer. `customer` is the customer
+    ID (e.g. 'CUST-0001'). `items` is a list of line items, each a dict
+    like {"item_code": "ITEM-001", "qty": 50, "rate": 1200,
+    "description": "Steel Bracket"} — at least one item is required. Use
+    for requests like 'create a quotation for CUST-0001, 50 units of
+    ITEM-001 at 1200 each'. Dates should be YYYY-MM-DD."""
+
     def run():
         data = _payload(
             customer=customer,
@@ -304,7 +359,12 @@ def update_quotation(
     note: Optional[str] = None,
     status: Optional[str] = None,
 ):
-    
+    """Update an existing Quotation identified by its ID (e.g.
+    'QTN-00001'). Only the fields provided are changed — pass a full new
+    `items` list if line items need to change, since it replaces the
+    existing item set rather than merging with it. Use for requests like
+    'update QTN-00001's discount to 10%' or 'change the delivery date on
+    that quotation'."""
 
     def run():
         data = _payload(
@@ -338,7 +398,15 @@ def create_sales_order(
     submit: Optional[bool] = None,
     create_work_order: Optional[bool] = None,
 ):
-    
+    """Create a new Sales Order for a customer. `customer` is the
+    customer ID (e.g. 'CUST-0001'). `items` is a list of line items,
+    each a dict like {"item_code": "ITEM-001", "qty": 50, "rate": 1200,
+    "uom": "Nos", "warehouse": "Stores - CO"} — at least one item is
+    required. Set `submit` true to submit the order immediately rather
+    than leave it as a draft, and `create_work_order` true if a
+    manufacturing Work Order should be raised for it. Use for requests
+    like 'create a sales order for CUST-0001 for 50 units of ITEM-001'.
+    `delivery_date` should be YYYY-MM-DD."""
 
     def run():
         data = _payload(
@@ -365,7 +433,14 @@ def update_sales_order(
     delivery_date: Optional[str] = None,
     note: Optional[str] = None,
 ):
-    
+    """Update an existing Sales Order identified by its ID (e.g.
+    'SO-00001'). Only the fields provided are changed — pass a full new
+    `items` list if line items need to change, since it replaces the
+    existing item set rather than merging with it. Use for requests like
+    'push the delivery date on SO-00001 to next month' or 'update the
+    note on that sales order'. Note: this only edits a draft order —
+    submitting, cancelling, or converting an order into a delivery note
+    or invoice needs a separate action."""
 
     def run():
         data = _payload(
