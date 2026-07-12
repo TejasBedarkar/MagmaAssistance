@@ -22,8 +22,9 @@ you add a domain — they just consume whatever ALL_TOOLS ends up being.
 """
 
 from .sales_tools import SALES_TOOLS
+from .sales_write_tools import SALES_WRITE_TOOLS
 
-ALL_TOOLS = [*SALES_TOOLS]
+ALL_TOOLS = [*SALES_TOOLS, *SALES_WRITE_TOOLS]
 
 # Add more domains as you build them, e.g.:
 # from .inventory_tools import INVENTORY_TOOLS
