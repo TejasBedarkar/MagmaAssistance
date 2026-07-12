@@ -1,0 +1,156 @@
+/**
+ * Projects module — scoped theme vars (parity with sales/finance modules).
+ * Loaded from projects/routes.jsx.
+ */
+.projects-module-root {
+	--pm-bg: var(--bg, #0c1222);
+	--pm-surface: var(--surface, #161f35);
+	--pm-surface-2: var(--surface-2, #1c2740);
+	--pm-border: var(--border, rgba(148, 163, 184, 0.18));
+	--pm-text: var(--text, #e8edf7);
+	--pm-muted: var(--muted, #94a3b8);
+	--pm-accent: var(--accent, #38bdf8);
+	--pm-success: var(--success, #4ade80);
+	--pm-warning: var(--warning, #fbbf24);
+	--pm-danger: var(--danger, #f87171);
+	--pm-radius: var(--radius, 12px);
+	--pm-radius-sm: var(--radius-sm, 8px);
+	font-family: var(--font);
+	font-size: var(--text-body);
+	color: var(--text);
+}
+
+/* ── Shared PM page header (mirrors finance-page-header) ── */
+.projects-module-root .project-page-header {
+	margin-bottom: 20px;
+}
+
+.projects-module-root .project-page-header .pm-page-desc {
+	margin-bottom: 0;
+}
+
+.projects-module-root .project-page-header .pm-page-desc.project-page-header__desc--spaced {
+	margin-bottom: 12px;
+}
+
+.projects-module-root .project-page-header__toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-end;
+	gap: 12px 16px;
+}
+
+.projects-module-root .project-page-header__filters {
+	flex: 1;
+	min-width: min(100%, 280px);
+}
+
+.projects-module-root .project-page-header__filters .pm-list-filters {
+	margin-bottom: 0;
+	width: 100%;
+}
+
+.projects-module-root .project-page-header__actions {
+	display: flex;
+	align-items: flex-end;
+	flex-shrink: 0;
+	margin-bottom: 0;
+}
+
+.projects-module-root .project-page-header__meta {
+	margin-top: 12px;
+	margin-bottom: 0;
+}
+
+.projects-module-root .project-page-header__note {
+	margin-top: 10px;
+	margin-bottom: 0;
+	font-style: italic;
+}
+
+.projects-module-root .project-page-header__note--warning {
+	color: var(--warning);
+}
+
+.projects-module-root .project-page-header__note--muted {
+	color: var(--muted);
+}
+
+/* ── Data table wrapper ── */
+.projects-module-root .project-data-table {
+	overflow: visible;
+}
+
+/* Programs list — fit viewport without horizontal scroll */
+.projects-module-root .project-data-table:has(.pm-table--projects-list) .project-data-table__wrap {
+	overflow-x: hidden;
+}
+
+.projects-module-root .pm-table.pm-table--projects-list {
+	table-layout: fixed;
+	width: 100%;
+}
+
+.projects-module-root .pm-table.pm-table--projects-list .col-code {
+	width: 10%;
+}
+
+.projects-module-root .pm-table.pm-table--projects-list .col-name {
+	width: 16%;
+}
+
+.projects-module-root .pm-table.pm-table--projects-list .col-status {
+	width: 12%;
+}
+
+.projects-module-root .pm-table.pm-table--projects-list .col-manager {
+	width: 22%;
+}
+
+.projects-module-root .pm-table.pm-table--projects-list .col-team {
+	width: auto;
+}
+
+.projects-module-root .pm-table.pm-table--projects-list .col-manager,
+.projects-module-root .pm-table.pm-table--projects-list .col-team,
+.projects-module-root .pm-table.pm-table--projects-list .col-code,
+.projects-module-root .pm-table.pm-table--projects-list .col-name {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.projects-module-root .pm-table.pm-table--projects-list .col-name a.pm-cell-ellipsis {
+	display: block;
+}
+
+.projects-module-root .pm-table.pm-table--projects-list .pm-table__actions {
+	width: 88px;
+}
+
+.projects-module-root .project-row-clickable {
+	cursor: pointer;
+}
+
+.projects-module-root .project-row-clickable:hover {
+	background: var(--surface-2, rgba(148, 163, 184, 0.06));
+}
+
+/* ── Form editors: full main width (undo dashboard.css bleed after theme restructure) ── */
+.projects-module-root .pm-page.pm-form-page {
+	max-width: none;
+	width: 100%;
+	margin: 0;
+	padding: 0 0 40px;
+	box-sizing: border-box;
+}
+
+.projects-module-root .pm-form-card {
+	width: 100%;
+	max-width: none;
+}
+
+.projects-module-root .pm-form-actions {
+	width: 100%;
+	justify-content: flex-start;
+}
