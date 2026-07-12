@@ -1,0 +1,66 @@
+<<<<<<< HEAD
+# Web server (server.py runs on FastAPI + uvicorn, not Flask)
+fastapi
+uvicorn[standard]
+python-multipart
+=======
+# Web server
+flask
+flask-cors
+>>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
+
+# Agent pipeline (from Main.py)
+langchain-ollama
+langchain-core
+<<<<<<< HEAD
+# The PyPI release of openai-whisper (20240930) has a setup.py bug that
+# crashes with "KeyError: '__version__'" on Python 3.13 -- fixed on GitHub's
+# main branch but not yet published to PyPI, so install straight from git.
+git+https://github.com/openai/whisper.git
+huggingface_hub
+sounddevice
+numpy>=2.1
+# openai-whisper depends on numba, and versions of numba before 0.61 cap
+# numpy<2.1 -- since numpy never shipped a prebuilt wheel for that <2.1 range
+# on Python 3.13, pip would otherwise backtrack to a wheel-less numpy 2.0.x
+# and try (and fail) to build it from source. numba>=0.61 is the first
+# release that supports both Python 3.13 and numpy>=2.1, so pinning it
+# avoids that backtrack entirely.
+numba>=0.61
+torch
+transformers
+tqdm
+soundfile
+# Pinned explicitly: kokoro -> misaki[en] -> spacy has no upper bound, so pip
+# can otherwise resolve the wheel-less spacy 4.0.0.dev pre-release, which
+# then tries to compile blis/thinc from source and fails on Python 3.13
+# (Cython/numpy header mismatch). >=3.8 also matters on its own: older
+# spacy 3.7.x pulls a blis/thinc pair that caps numpy<2.0, and since numpy
+# never shipped an official <2.0 wheel for Python 3.13, pip falls back to
+# building numpy from source with whatever MinGW compiler is on PATH --
+# producing the "Numpy built with MINGW-W64 ... experimental" crash warning.
+# spacy>=3.8 pulls blis/thinc that support numpy>=2, which has real wheels.
+spacy>=3.8,<4
+kokoro>=0.7.1
+sentence-transformers
+
+# NOTE: Kokoro's phonemizer depends on the espeak-ng system binary, which is
+# NOT a Python package and must be installed separately:
+#   Windows: choco install espeak-ng  (or the installer at
+#            https://github.com/espeak-ng/espeak-ng/releases)
+#   Linux:   sudo apt-get install espeak-ng
+#   macOS:   brew install espeak-ng
+=======
+openai-whisper
+huggingface_hub
+sounddevice
+numpy
+torch
+transformers==4.51.3
+diffusers
+accelerate
+tqdm
+soundfile
+git+https://github.com/microsoft/VibeVoice.git
+sentence-transformers
+>>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27

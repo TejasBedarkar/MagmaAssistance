@@ -1,0 +1,48 @@
+# ---------- Frontend (Node / Vite) ----------
+node_modules/
+dist/
+dist-ssr/
+*.local
+.env
+.env.*
+!.env.example
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# OS
+.DS_Store
+
+# ---------- Backend (Python) ----------
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+*.egg-info/
+
+# Downloaded models (large, shouldn't go to GitHub)
+backend/WhisperSTT/model/
+<<<<<<< HEAD
+backend/KokoroTTS/models/
+backend/ERP/models/
+backend/models/
+
+=======
+backend/VibeVoiceTTS/models/
+backend/ERP/models
+>>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
+
+# Generated audio / temp files
+*.wav
+output.wav
+
+# Logs
+*.log

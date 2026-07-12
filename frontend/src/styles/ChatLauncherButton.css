@@ -1,0 +1,23 @@
+.chat-launcher {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  border: none;
+  background: linear-gradient(135deg, var(--color-primary), var(--color-primary-dark));
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 10px 25px rgba(59, 109, 240, 0.45);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.chat-launcher:hover {
+  transform: scale(1.06);
+  box-shadow: 0 12px 28px rgba(59, 109, 240, 0.55);
+}
+
+.chat-launcher:active {
+  transform: scale(0.97);
+}

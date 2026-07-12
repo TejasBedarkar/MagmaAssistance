@@ -1,0 +1,84 @@
+.input-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--color-border);
+  background: #fff;
+}
+
+.input-bar__field {
+  flex: 1;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 10px 16px;
+  font-size: 13.5px;
+  outline: none;
+  background: #f7f8fc;
+  color: var(--color-text);
+}
+
+.input-bar__field:focus {
+  border-color: var(--color-primary);
+  background: #fff;
+}
+
+.input-bar__mic,
+.input-bar__send {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.input-bar__mic {
+  background: #eef1f9;
+  color: var(--color-primary-dark);
+}
+
+.input-bar__mic:hover:not(:disabled) {
+  background: #e2e7f7;
+}
+
+.input-bar__mic--active {
+  background: #ff5c5c;
+  color: #fff;
+  animation: pulse-mic 1.1s infinite;
+}
+
+.input-bar__mic:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.input-bar__send {
+  background: var(--color-primary);
+  color: #fff;
+}
+
+.input-bar__send:disabled {
+  background: #c3cdea;
+  cursor: not-allowed;
+}
+
+.input-bar__send:hover:not(:disabled) {
+  background: var(--color-primary-dark);
+}
+
+@keyframes pulse-mic {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 92, 92, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(255, 92, 92, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 92, 92, 0);
+  }
+}
