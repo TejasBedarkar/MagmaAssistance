@@ -102,28 +102,10 @@ if ALL_TOOLS:
     tool_rag = ToolRAG(ALL_TOOLS, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
     tool_map = {tool.name: tool for tool in ALL_TOOLS}
 else:
-<<<<<<< HEAD
     logger.info("No ERP tools registered yet — running LLM-only.")
 
 def generate_reply(text: str) -> str:
     """Returns the assistant's reply text for a user message."""
-=======
-    logger.info("No ERP tools registered yet (ERP/tools/ALL_TOOLS is empty) — running LLM-only.")
-
-logger.info("Agent ready.")
-
-def generate_reply(text: str) -> str:
-    """Returns the assistant's reply text for a user message.
-
-    If no ERP tools are registered yet, or none of them are relevant to
-    this particular message (per ToolRAG), this is just a plain LLM call
-    — identical to the old text_chain.invoke() behaviour.
-
-    If ToolRAG finds relevant tools, only those few are bound to the LLM
-    for this turn. If the LLM decides to call one, we run it, feed the
-    result back, and ask the LLM for a final answer grounded in that data.
-    """
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
     if not tool_rag:
         return text_chain.invoke({"input": text})
 
@@ -162,15 +144,9 @@ def generate_reply(text: str) -> str:
     final_response = llm_with_tools.invoke(messages)
     return final_response.content
 
-<<<<<<< HEAD
 def _get_tts_audio(text: str):
     """Synthesizes `text` to a WAV file and returns its raw bytes, or None
     if synthesis failed. Mirrors the old Flask backend's TTS step."""
-=======
-def _get_tts_audio(text):
-    """Synthesizes `text` to a WAV file (without playing it on the server)
-    and returns the file's raw bytes, or None if synthesis failed."""
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
     wav_path = assistant.tts.synthesize_to_file(text)
     try:
         with open(wav_path, "rb") as f:
@@ -181,7 +157,6 @@ def _get_tts_audio(text):
         except OSError:
             pass
 
-<<<<<<< HEAD
 class ChatRequest(BaseModel):
     message: str
 
@@ -191,30 +166,12 @@ async def chat(req: ChatRequest):
     text = (req.message or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="message is required")
-=======
-@app.get("/api/health")
-def health():
-    return jsonify({"status": "ok"})
-
-
-@app.post("/api/chat")
-def chat():
-    data = request.get_json(silent=True) or {}
-    text = (data.get("message") or "").strip()
-
-    if not text:
-        return jsonify({"error": "message is required"}), 400
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
 
     try:
         reply = generate_reply(text)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent failed to process message: %s", text)
-<<<<<<< HEAD
         raise HTTPException(status_code=500, detail=str(exc))
-=======
-        return jsonify({"error": str(exc)}), 500
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
 
     audio_b64 = None
     try:
@@ -224,7 +181,6 @@ def chat():
     except Exception:
         logger.exception("TTS step failed; returning text-only reply")
 
-<<<<<<< HEAD
     return {"reply": reply, "audio": audio_b64}
 
 @app.post("/query")
@@ -279,11 +235,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8050))
     logger.info(f"Starting server on port {port}...")
     uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
-=======
-    return jsonify({"reply": reply, "audio": audio_b64})
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27

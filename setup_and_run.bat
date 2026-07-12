@@ -128,11 +128,7 @@ if errorlevel 1 (
 )
 
 echo.
-<<<<<<< HEAD
 echo Step 5: Installing frontend dependencies
-=======
-echo Step 4: Installing frontend dependencies
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
 echo ------------------------------------------
 if not exist "%FRONTEND_DIR%\node_modules" (
     pushd "%FRONTEND_DIR%"
@@ -156,13 +152,10 @@ echo Setup complete.
 echo.
 echo Launching backend and frontend in separate windows...
 echo -------------------------------------------------------
-<<<<<<< HEAD
 
 if exist "%ProgramFiles%\eSpeak NG\espeak-ng.exe" (
     set "PATH=%PATH%;%ProgramFiles%\eSpeak NG"
 )
-=======
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
  
 set BACKEND_PORT=8001
  

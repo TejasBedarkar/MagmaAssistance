@@ -30,15 +30,10 @@ env/
 
 # Downloaded models (large, shouldn't go to GitHub)
 backend/WhisperSTT/model/
-<<<<<<< HEAD
 backend/KokoroTTS/models/
 backend/ERP/models/
 backend/models/
 
-=======
-backend/VibeVoiceTTS/models/
-backend/ERP/models
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
 
 # Generated audio / temp files
 *.wav

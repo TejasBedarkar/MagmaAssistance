@@ -1,18 +1,11 @@
-<<<<<<< HEAD
 # Web server (server.py runs on FastAPI + uvicorn, not Flask)
 fastapi
 uvicorn[standard]
 python-multipart
-=======
-# Web server
-flask
-flask-cors
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
 
 # Agent pipeline (from Main.py)
 langchain-ollama
 langchain-core
-<<<<<<< HEAD
 # The PyPI release of openai-whisper (20240930) has a setup.py bug that
 # crashes with "KeyError: '__version__'" on Python 3.13 -- fixed on GitHub's
 # main branch but not yet published to PyPI, so install straight from git.
@@ -50,17 +43,3 @@ sentence-transformers
 #            https://github.com/espeak-ng/espeak-ng/releases)
 #   Linux:   sudo apt-get install espeak-ng
 #   macOS:   brew install espeak-ng
-=======
-openai-whisper
-huggingface_hub
-sounddevice
-numpy
-torch
-transformers==4.51.3
-diffusers
-accelerate
-tqdm
-soundfile
-git+https://github.com/microsoft/VibeVoice.git
-sentence-transformers
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
