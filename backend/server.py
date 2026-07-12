@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 import base64
 import os
 import shutil
@@ -7,38 +6,6 @@ import json
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-=======
-"""
-server.py
-
-Backend bridge between the React (Vite) frontend and the VoiceAssistant
-agent defined in Main.py:
-
-    Frontend (fetch) -> Flask /api/chat
-        -> LangChain prompt -> ChatOllama (LLM)   -> reply text
-        -> VibeVoiceTTS.synthesize_to_file()       -> reply audio (WAV, base64)
-        -> JSON { reply, audio } -> Frontend (plays audio + types out text)
-Setup:
-    1. Put this file, Main.py, and Main.py's own dependency folders
-       (WhisperSTT/, LLM/, VibeVoiceTTS/) all in this same backend/ folder.
-    2. pip install -r requirements.txt
-    3. Make sure Ollama is running locally and the model is pulled:
-           ollama pull llama3.2
-    4. python server.py
-       -> serves on http://localhost:8000
-
-The frontend calls this API via src/services/agentApi.js, which defaults
-to http://localhost:8000 (override with a VITE_API_URL env var / .env file
-in the frontend folder).
-"""
-
-import base64
-import logging
-import os
-
-from flask import Flask, jsonify, request
-from flask_cors import CORS
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.output_parsers import StrOutputParser
 
@@ -46,7 +13,6 @@ from Main import VoiceAssistant
 from ERP.tool_rag import ToolRAG
 from ERP.tools import ALL_TOOLS
 
-<<<<<<< HEAD
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent-server")
@@ -65,31 +31,13 @@ app.add_middleware(
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.2")
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
-=======
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("agent-server")
-
-app = Flask(__name__)
-
-allowed_origins = os.environ.get("FRONTEND_ORIGIN", "http://localhost:5173").split(",")
-CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
-
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.2")
-TTS_SPEAKER = os.environ.get("TTS_SPEAKER", "Carter")
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
 
 logger.info("Loading VoiceAssistant agent (Whisper=%s, LLM=%s)...", WHISPER_MODEL, LLM_MODEL)
 assistant = VoiceAssistant(
     whisper_model=WHISPER_MODEL,
     llm_model=LLM_MODEL,
-<<<<<<< HEAD
     tts_voice=TTS_VOICE,
     speak_replies=False,
-=======
-    tts_speaker=TTS_SPEAKER,
-    speak_replies=False,  # we synthesize+read the wav ourselves below
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
 )
 text_chain = assistant.prompt | assistant.llm.model | StrOutputParser()
 TOOL_RAG_TOP_K = int(os.environ.get("TOOL_RAG_TOP_K", "3"))
