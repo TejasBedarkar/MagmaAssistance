@@ -57,10 +57,7 @@ if errorlevel 1 (
 echo.
 echo Step 2: Installing Python requirements
 echo ---------------------------------------
-<<<<<<< HEAD
 set "PIP_CONSTRAINT=%BACKEND_DIR%\constraints.txt"
-=======
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
 python -m pip install --upgrade pip
 pip install -r "%BACKEND_DIR%\requirements.txt"
 if errorlevel 1 (
@@ -71,7 +68,6 @@ if errorlevel 1 (
 )
 
 echo.
-<<<<<<< HEAD
 echo Step 3: Installing espeak-ng (required by Kokoro TTS)
 echo --------------------------------------------------------
 where espeak-ng >nul 2>nul
@@ -112,13 +108,6 @@ echo ----------------------------
 python "%BACKEND_DIR%\ModelDownload.py" ^
     --whisper-dir "%BACKEND_DIR%\WhisperSTT\model" ^
     --kokoro-dir "%BACKEND_DIR%\KokoroTTS\models\kokoro-82m" ^
-=======
-echo Step 3: Downloading models
-echo ----------------------------
-python "%BACKEND_DIR%\ModelDownload.py" ^
-    --whisper-dir "%BACKEND_DIR%\WhisperSTT\model" ^
-    --vibevoice-dir "%BACKEND_DIR%\VibeVoiceTTS\models" ^
->>>>>>> 02e86db2a04e8c9d90530a261555a3f28a31bf27
     --tool-rag-dir "%BACKEND_DIR%\ERP\models\all-MiniLM-L6-v2"
 if errorlevel 1 (
     echo.
