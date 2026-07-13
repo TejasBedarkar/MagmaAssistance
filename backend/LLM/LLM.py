@@ -1,19 +1,21 @@
 """
 LLM.py
 
-A reusable LLM wrapper class around Ollama's llama3.2 model, built with LangChain.
-Can be imported and used in other LangChain projects, or run directly as a CLI chat.
+A reusable LLM wrapper class around OpenRouter's chat completions API.
+Can be imported and used in other projects, or run directly as a CLI chat.
 
 Requirements:
-    pip install langchain-ollama
+    pip install requests python-dotenv
 
-Make sure Ollama is installed and running, and that the model is pulled:
-    ollama pull llama3.2
+.env file should contain:
+    OPENROUTER_API_KEY=your_key_here
 """
 
-from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+import os
+import requests
+from dotenv import load_dotenv
 
+load_dotenv()
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful, concise, and knowledgeable AI assistant. "
@@ -24,41 +26,59 @@ DEFAULT_SYSTEM_PROMPT = (
 
 class LLM:
 
-    def __init__(self, model: str = "llama3.2", system_prompt: str = DEFAULT_SYSTEM_PROMPT, temperature: float = 0.7, base_url: str = "http://localhost:11434",):
+    def __init__(self, api_key: str = None, model: str = "nvidia/nemotron-3-ultra-550b-a55b:free", system_prompt: str = DEFAULT_SYSTEM_PROMPT, temperature: float = 0.7, base_url: str = "https://openrouter.ai/api/v1/chat/completions",):
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        if not self.api_key:
+            raise ValueError("No API key provided. Set OPENROUTER_API_KEY in your .env file or pass api_key directly.")
+
         self.model_name = model
         self.system_prompt = system_prompt
         self.temperature = temperature
-        self.model = ChatOllama(
-            model=self.model_name,
-            temperature=self.temperature,
-            base_url=base_url,
-        )
+        self.base_url = base_url
 
-        self.history = [SystemMessage(content=self.system_prompt)]
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        self.history = [{"role": "system", "content": self.system_prompt}]
 
     def set_system_prompt(self, system_prompt: str, reset_history: bool = True):
         self.system_prompt = system_prompt
         if reset_history:
-            self.history = [SystemMessage(content=self.system_prompt)]
+            self.history = [{"role": "system", "content": self.system_prompt}]
         else:
-            self.history[0] = SystemMessage(content=self.system_prompt)
+            self.history[0] = {"role": "system", "content": self.system_prompt}
 
     def chat(self, user_input: str, remember: bool = True):
-        messages = self.history + [HumanMessage(content=user_input)]
-        response = self.model.invoke(messages)
+        messages = self.history + [{"role": "user", "content": user_input}]
+
+        data = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": self.temperature,
+        }
+
+        response = requests.post(
+            self.base_url,
+            json=data,
+            headers=self.headers
+        )
+
+        reply = response.json()['choices'][0]['message']['content']
 
         if remember:
-            self.history.append(HumanMessage(content=user_input))#type:ignore
-            self.history.append(AIMessage(content=response.content))#type:ignore
+            self.history.append({"role": "user", "content": user_input})
+            self.history.append({"role": "assistant", "content": reply})
 
-        return response.content#type:ignore
+        return reply
 
     def reset(self):
-        self.history = [SystemMessage(content=self.system_prompt)]
+        self.history = [{"role": "system", "content": self.system_prompt}]
 
 
 def run_cli():
-    print(f"LLM CLI - Ollama (llama3.2). Type 'exit' or 'quit' to stop, 'reset' to clear history.\n")
+    print("LLM CLI - OpenRouter. Type 'exit' or 'quit' to stop, 'reset' to clear history.\n")
     llm = LLM()
 
     while True:
@@ -82,7 +102,7 @@ def run_cli():
             reply = llm.chat(user_input)
             print(f"AI: {reply}\n")
         except Exception as e:
-            print(f"[Error contacting Ollama: {e}]\n")
+            print(f"[Error contacting OpenRouter: {e}]\n")
 
 
 if __name__ == "__main__":
