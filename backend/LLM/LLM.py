@@ -27,7 +27,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "- Be concise. Answer directly in 1-4 sentences, or a short bullet/table for "
     "multiple items. Do not restate the question or add filler like 'Sure, I can "
     "help with that.'\n"
-    "- Format numbers, currency, and dates clearly; round large figures sensibly.\n"
+    "- All currency values are in Indian Rupees (INR). Format amounts using the "
+    "₹ symbol and the Indian numbering system (e.g., ₹1,25,000 or ₹12,50,00,000), "
+    "rounding large figures sensibly.\n"
+    "- Format numbers and dates clearly.\n"
     "- If data is unavailable or a tool call fails, say so in one plain sentence — "
     "never invent values.\n"
     "- When creating or updating a record, only use information the user actually "
@@ -35,7 +38,6 @@ DEFAULT_SYSTEM_PROMPT = (
     "ID, phone number, email, or amount.\n"
     "- Keep a professional, courteous tone at all times."
 )
-
 
 class LLM:
 
