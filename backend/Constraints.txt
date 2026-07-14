@@ -9,4 +9,6 @@
 #
 # This constraint is picked up automatically for both the main install
 # and each package's isolated build environment.
+
 setuptools<81
+

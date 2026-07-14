@@ -1,5 +1,6 @@
 """
-download_models.py
+ModelDownload.py
+>>>>>>> origin/development
 
 Pre-downloads/caches the models used by this project so that later runs
 don't have to fetch them on first use:
@@ -11,7 +12,9 @@ don't have to fetch them on first use:
 Each model is downloaded into its own separate directory (see defaults below).
 
 Requirements:
-    pip install openai-whisper huggingface_hub
+
+    pip install openai-whisper huggingface-hub sentence-transformers
+
 
 Usage:
     python download_models.py
@@ -35,10 +38,13 @@ DEFAULT_TOOL_RAG_DIR = "./ERP/models/all-MiniLM-L6-v2"
 
 
 def download_whisper_model(model_size: str = "base", download_dir: str = DEFAULT_WHISPER_DIR):
+
+    """Download and cache the Whisper model in a specific local directory."""
+    print(f"[Whisper] Downloading size '{model_size}' to '{download_dir}'...")
     os.makedirs(download_dir, exist_ok=True)
-    print(f"[Whisper] Downloading '{model_size}' model to '{download_dir}'...")
     whisper.load_model(model_size, download_root=download_dir)
-    print(f"[Whisper] '{model_size}' model ready at: {download_dir}\n")
+    print("[Whisper] Model downloaded successfully.\n")
+
     return download_dir
 
 
@@ -54,11 +60,11 @@ def download_kokoro_model(local_dir: str = DEFAULT_KOKORO_DIR):
 
 
 def download_tool_rag_model(local_dir: str = DEFAULT_TOOL_RAG_DIR):
-    """Download the sentence-transformers embedding model used by
-    ERP/tool_rag.py for ERP tool retrieval, into its own directory so it
-    loads from disk instead of hitting the Hub on every run."""
-    os.makedirs(local_dir, exist_ok=True)
+
+    """Download the tool RAG embedding model into its own directory."""
     print(f"[ToolRAG] Downloading '{TOOL_RAG_REPO_ID}' to '{local_dir}'...")
+    os.makedirs(local_dir, exist_ok=True)
+
     path = snapshot_download(repo_id=TOOL_RAG_REPO_ID, local_dir=local_dir)
     print(f"[ToolRAG] Model downloaded to: {path}\n")
     return path
@@ -69,8 +75,8 @@ def main():
     parser.add_argument(
         "--whisper-model",
         default="base",
-        choices=["tiny", "base", "small", "medium", "large"],
-        help="Which Whisper model size to download (default: base).",
+
+        help=f"Size of the Whisper model to download (default: base).",
     )
     parser.add_argument(
         "--whisper-dir",
@@ -101,7 +107,6 @@ def main():
     if not args.skip_tool_rag:
         download_tool_rag_model(args.tool_rag_dir)
 
-    print("All requested models are downloaded and ready.")
 
 
 if __name__ == "__main__":
