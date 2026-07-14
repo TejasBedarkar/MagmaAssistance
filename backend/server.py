@@ -40,7 +40,7 @@ assistant = VoiceAssistant(
     speak_replies=False,
 )
 text_chain = assistant.prompt | assistant.llm.model | StrOutputParser()
-TOOL_RAG_TOP_K = int(os.environ.get("TOOL_RAG_TOP_K", "3"))
+TOOL_RAG_TOP_K = int(os.environ.get("TOOL_RAG_TOP_K", "1"))
 TOOL_RAG_MIN_SCORE = float(os.environ.get("TOOL_RAG_MIN_SCORE", "0.25"))
 
 tool_rag = None
@@ -51,6 +51,25 @@ if ALL_TOOLS:
     tool_map = {tool.name: tool for tool in ALL_TOOLS}
 else:
     logger.info("No ERP tools registered yet — running LLM-only.")
+
+
+def _sanitize_tool_args(args: dict) -> dict:
+    raw = dict(args or {})
+    cleaned = {}
+    stray = {}
+    for key, value in raw.items():
+        if isinstance(value, dict):
+            if set(value.keys()) == {"value"}:
+                cleaned[key] = value["value"]
+            else:
+                logger.warning(...)
+                stray.update(value)
+        else:
+            cleaned[key] = value
+    for key, value in stray.items():
+        if key not in cleaned and value not in (None, ""):
+            cleaned[key] = value
+    return cleaned
 
 def generate_reply(text: str) -> str:
     """Returns the assistant's reply text for a user message."""
@@ -82,7 +101,8 @@ def generate_reply(text: str) -> str:
             result = f"Tool '{tool_call['name']}' is not available."
         else:
             try:
-                result = tool.invoke(tool_call.get("args") or {})
+                args = _sanitize_tool_args(tool_call.get("args"))
+                result = tool.invoke(args)
             except Exception:
                 logger.exception("Tool '%s' failed", tool_call["name"])
                 result = f"'{tool_call['name']}' failed to fetch ERP data right now."
