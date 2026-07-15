@@ -1,8 +1,10 @@
 import base64
 import os
+import re
 import shutil
 import logging
 import json
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -13,22 +15,12 @@ from Main import VoiceAssistant
 from ERP.tool_rag import ToolRAG
 
 from ERP.tools import ALL_TOOLS, ALL_REQUIRED_FIELDS, ALL_FIELD_PARSERS
+from ERP.tools.mcp_tools import mcp_tool_source
 
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent-server")
-
-app = FastAPI(title="MagmaAssistance Backend")
-
-# Allow CORS requests from frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.2")
@@ -47,37 +39,65 @@ text_chain = assistant.prompt | assistant.llm.model | StrOutputParser()
 TOOL_RAG_TOP_K = int(os.environ.get("TOOL_RAG_TOP_K", "3"))
 TOOL_RAG_MIN_SCORE = float(os.environ.get("TOOL_RAG_MIN_SCORE", "0.25"))
 
+# Local ERP/tools/*.py tools are indexed synchronously at import time, same
+# as before. MCP-sourced tools (ERP/mcp_server.py) can only be loaded async,
+# so they're added on top of this in the lifespan startup handler below —
+# tool_rag/tool_map are declared here and mutated (not replaced) there.
 tool_rag = None
 tool_map = {}
 if ALL_TOOLS:
-    logger.info("Indexing %d ERP tool(s) for retrieval...", len(ALL_TOOLS))
+    logger.info("Indexing %d local ERP tool(s) for retrieval...", len(ALL_TOOLS))
     tool_rag = ToolRAG(ALL_TOOLS, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
     tool_map = {tool.name: tool for tool in ALL_TOOLS}
 else:
-    logger.info("No ERP tools registered yet — running LLM-only.")
+    logger.info("No local ERP tools registered — continuing with MCP tools only, if any.")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Runs once at server startup and once at shutdown (FastAPI lifespan
+    protocol). On startup: spawns ERP/mcp_server.py as a subprocess over
+    MCP's stdio transport (via mcp_tool_source, see ERP/tools/mcp_tools.py)
+    and merges its tools into the same tool_rag/tool_map the local
+    ERP/tools/*.py tools already use — so ToolRAG retrieval and
+    _execute_tool work identically regardless of which source a tool came
+    from. On shutdown: cleanly terminates that subprocess.
+    """
+    global tool_rag, tool_map
 
-def _sanitize_tool_args(args: dict) -> dict:
-    raw = dict(args or {})
-    cleaned = {}
-    stray = {}
-    for key, value in raw.items():
-        if isinstance(value, dict):
-            if set(value.keys()) == {"value"}:
-                cleaned[key] = value["value"]
+    try:
+        mcp_tools = await mcp_tool_source.start()
+        if mcp_tools:
+            logger.info("Loaded %d MCP tool(s) from ERP/mcp_server.py", len(mcp_tools))
+            if tool_rag:
+                tool_rag.add_tools(mcp_tools)
             else:
-                logger.warning(...)
-                stray.update(value)
+                tool_rag = ToolRAG(mcp_tools, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
+            tool_map.update({tool.name: tool for tool in mcp_tools})
         else:
-            cleaned[key] = value
-    for key, value in stray.items():
-        if key not in cleaned and value not in (None, ""):
-            cleaned[key] = value
-    return cleaned
+            logger.warning("ERP MCP server started but reported zero tools.")
+    except Exception:
+        # Don't let a broken/missing MCP server take the whole API down —
+        # fall back to whatever local ERP/tools/*.py tools are registered.
+        logger.exception("Failed to start ERP MCP server — continuing with local tools only.")
 
-def generate_reply(text: str) -> str:
-    """Returns the assistant's reply text for a user message."""
+    yield
+
+    await mcp_tool_source.stop()
+
+
+app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
+
+# Allow CORS requests from frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 
 # ---------------------------------------------------------------------
 # Slot-filling: in-memory per-session state
@@ -136,11 +156,6 @@ def _flatten_scalar(value):
 
 
 def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
-    """Unwraps any dict-wrapped scalar in `args` for fields that the
-    tool's schema expects to be a plain str/int/float/bool, using the
-    tool's own pydantic args_schema to know which fields are scalar vs.
-    genuinely list/dict (e.g. a quotation's `items`, which should stay a
-    list of dicts and is left untouched)."""
     if not args:
         return args
 
@@ -151,37 +166,108 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
         return args
 
     cleaned = dict(args)
+
     for field_name, field_info in fields.items():
         if field_name not in cleaned:
             continue
+
         value = cleaned[field_name]
-        if not isinstance(value, dict):
-            continue
 
         annotation = field_info.annotation
         inner_types = [
-            t for t in getattr(annotation, "__args__", [annotation]) if t is not type(None)
+            t for t in getattr(annotation, "__args__", [annotation])
+            if t is not type(None)
         ]
-        expects_scalar = any(t in (str, int, float, bool) for t in inner_types)
 
-        if expects_scalar:
-            cleaned[field_name] = _flatten_scalar(value)
+        expects_scalar = any(
+            t in (str, int, float, bool)
+            for t in inner_types
+        )
+
+        # Existing dict unwrapping
+        if isinstance(value, dict) and expects_scalar:
+            value = _flatten_scalar(value)
+            cleaned[field_name] = value
+
+        # NEW: remove empty strings for numeric fields
+        if value == "":
+            if int in inner_types or float in inner_types:
+                cleaned.pop(field_name, None)
 
     return cleaned
 
 
-def _execute_tool(tool_name: str, args: dict):
+async def _execute_tool(tool_name: str, args: dict):
+    """Async because MCP-sourced tools (ERP/mcp_server.py, loaded via
+    ERP/tools/mcp_tools.py) only implement `.ainvoke()`, not the sync
+    `.invoke()`. This works transparently for the existing local
+    ERP/tools/*.py tools too — LangChain's BaseTool.ainvoke() runs a sync
+    tool's normal invoke() under the hood when no native async
+    implementation exists, so no other tool code needed to change."""
     tool = tool_map.get(tool_name)
     if tool is None:
         return f"Tool '{tool_name}' is not available."
     try:
-        return tool.invoke(_sanitize_tool_args(tool_name, args) or {})
+        return await tool.ainvoke(_sanitize_tool_args(tool_name, args) or {})
     except Exception:
         logger.exception("Tool '%s' failed", tool_name)
         return f"'{tool_name}' failed to fetch ERP data right now."
 
 
-def generate_reply(text: str, session_id: str = "default") -> str:
+_FAKE_NAME_RE = re.compile(r'"name"\s*:\s*"(?P<name>[a-zA-Z_][\w\-.]*)"')
+_FAKE_KV_STR_RE = re.compile(r'"(?P<key>[a-zA-Z_]\w*)"\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"')
+_FAKE_KV_NUM_RE = re.compile(r'"(?P<key>[a-zA-Z_]\w*)"\s*:\s*(?P<value>-?\d+(?:\.\d+)?)\b')
+
+
+def _extract_fake_tool_call(content: str):
+    """Some local models via Ollama (llama3.2 and similar) occasionally
+    reply with a plain-text approximation of a tool call instead of using
+    the real function-calling protocol, e.g.:
+        {"name":"create_customer","parameters={"lead_id":"","customer_name":"Sujay"}}
+    This is often broken well beyond a single typo — note the missing
+    colon/closing quote around "parameters" above, which means the
+    "parameters" value isn't even a validly nested object, so a strict
+    brace-matching parse won't survive it either. Rather than trying to
+    fully parse the structure, this pulls out the tool name, then scrapes
+    any "key":"value" or "key":123 pairs found anywhere after it — good
+    enough to recover the user's actual intent from what is essentially
+    a hallucinated shape. Returns None if `content` doesn't look like an
+    attempted tool call, or names a tool that doesn't exist.
+    """
+    text = (content or "").strip()
+    if not text.startswith("{") or '"name"' not in text or "parameters" not in text.lower():
+        return None
+
+    name_match = _FAKE_NAME_RE.search(text)
+    if not name_match:
+        return None
+
+    name = name_match.group("name")
+    if name not in tool_map:
+        return None
+
+    # Only look at text after "parameters" so we don't re-capture "name"
+    # itself as if it were an argument.
+    params_idx = text.lower().find("parameters")
+    tail = text[params_idx:] if params_idx != -1 else text
+
+    args = {}
+    for m in _FAKE_KV_STR_RE.finditer(tail):
+        args.setdefault(m.group("key"), m.group("value"))
+    for m in _FAKE_KV_NUM_RE.finditer(tail):
+        key = m.group("key")
+        if key in args:
+            continue
+        value = m.group("value")
+        args[key] = float(value) if "." in value else int(value)
+
+    if not args:
+        return None
+
+    return {"name": name, "args": args, "id": "fake-tool-call-0"}
+
+
+async def generate_reply(text: str, session_id: str = "default") -> str:
     """Returns the assistant's reply text for a user message.
 
     If this session has an open slot-filling flow (a create/update call
@@ -208,7 +294,8 @@ def generate_reply(text: str, session_id: str = "default") -> str:
         args = pending["args"]
         del _pending_actions[session_id]
 
-        result = _execute_tool(tool_name, args)
+        result = await _execute_tool(tool_name, args)
+        logger.info("Tool '%s' raw result: %s", tool_name, result)
         summary_prompt = (
             f"The '{tool_name}' tool was just called with {args} and returned: {result}\n"
             "Give the user a short, professional confirmation (1-2 sentences)."
@@ -233,29 +320,23 @@ def generate_reply(text: str, session_id: str = "default") -> str:
 
     response = llm_with_tools.invoke(messages)
 
-    if not response.tool_calls:
-        return response.content
-
+    tool_calls = response.tool_calls
+    if not tool_calls:
+        recovered = _extract_fake_tool_call(response.content)
+        if not recovered:
+            return response.content
+        logger.warning(
+            "Model returned a text-shaped fake tool call instead of a real "
+            "one; recovered '%s' from it: %s", recovered["name"], recovered["args"]
+        )
+        tool_calls = [recovered]
 
     messages.append(response)
-
-    for tool_call in response.tool_calls:
-        tool = tool_map.get(tool_call["name"])
-        if tool is None:
-            result = f"Tool '{tool_call['name']}' is not available."
-        else:
-            try:
-                args = _sanitize_tool_args(tool_call.get("args"))
-                result = tool.invoke(args)
-            except Exception:
-                logger.exception("Tool '%s' failed", tool_call["name"])
-                result = f"'{tool_call['name']}' failed to fetch ERP data right now."
-
 
     # --- If a write-tool call is missing required info, ask instead of
     # calling it or letting the model guess a value. Only one form-filling
     # flow runs at a time, so the first offending call wins. ---
-    for tool_call in response.tool_calls:
+    for tool_call in tool_calls:
         tool_name = tool_call["name"]
         if tool_name in ALL_REQUIRED_FIELDS:
             args = _sanitize_tool_args(tool_name, tool_call.get("args") or {})
@@ -263,15 +344,29 @@ def generate_reply(text: str, session_id: str = "default") -> str:
             if missing:
                 return _start_pending_action(session_id, tool_name, args, missing)
 
-    messages.append(response)
+    results = []
+    for tool_call in tool_calls:
+        result = await _execute_tool(tool_call["name"], tool_call.get("args") or {})
+        logger.info("Tool '%s' raw result: %s", tool_call["name"], result)
+        results.append((tool_call, result))
 
-    for tool_call in response.tool_calls:
-        result = _execute_tool(tool_call["name"], tool_call.get("args") or {})
+    if response.tool_calls:
+        # Real tool calls: thread the results back in as ToolMessages and
+        # let the model compose the final reply, as normal.
+        for tool_call, result in results:
+            messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
+        final_response = llm_with_tools.invoke(messages)
+        return final_response.content
 
-        messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
-
-    final_response = llm_with_tools.invoke(messages)
-    return final_response.content
+    # Recovered fake tool call: there's no real AIMessage.tool_calls entry
+    # to attach a ToolMessage to, so continuing this message list risks
+    # confusing the model further. Summarize the result directly instead
+    # — same approach used to close out a slot-filling flow.
+    summary_prompt = "\n".join(
+        f"The '{tc['name']}' tool was just called with {tc.get('args')} and returned: {result}"
+        for tc, result in results
+    ) + "\nGive the user a short, professional confirmation (1-2 sentences)."
+    return text_chain.invoke({"input": summary_prompt})
 
 def _get_tts_audio(text: str):
     """Synthesizes `text` to a WAV file and returns its raw bytes, or None
@@ -303,7 +398,7 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="message is required")
 
     try:
-        reply = generate_reply(text, req.session_id)
+        reply = await generate_reply(text, req.session_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent failed to process message: %s", text)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -357,7 +452,7 @@ async def handle_query(
 
     # 2. Get response from MagmaAssistance agent
     logger.info(f"Processing query: '{query_text}'")
-    response_text = generate_reply(query_text, session_id)
+    response_text = await generate_reply(query_text, session_id)
 
     # 3. Synthesize the reply to speech too, same as /api/chat, so the
     # frontend has something to play regardless of which endpoint it uses.

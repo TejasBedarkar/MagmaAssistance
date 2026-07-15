@@ -1,6 +1,5 @@
 """
 ModelDownload.py
->>>>>>> origin/development
 
 Pre-downloads/caches the models used by this project so that later runs
 don't have to fetch them on first use:
