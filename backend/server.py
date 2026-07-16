@@ -8,8 +8,137 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage, BaseMessage
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.outputs import ChatResult, ChatGeneration
+from typing import List, Optional, Any, Sequence, Dict, Union, Callable
+import requests
+
+from LLM.LLM import LLM
+
+# Helper function to convert messages to dictionary format for OpenRouter API
+def convert_message_to_dict(message):
+    if isinstance(message, SystemMessage):
+        return {"role": "system", "content": message.content}
+    elif isinstance(message, HumanMessage):
+        return {"role": "user", "content": message.content}
+    elif isinstance(message, ToolMessage):
+        return {"role": "tool", "tool_call_id": message.tool_call_id, "content": message.content}
+    elif isinstance(message, AIMessage):
+        d = {"role": "assistant", "content": message.content or ""}
+        if message.tool_calls:
+            d["tool_calls"] = []
+            for tc in message.tool_calls:
+                d["tool_calls"].append({
+                    "id": tc.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("name"),
+                        "arguments": json.dumps(tc.get("args") or {})
+                    }
+                })
+        elif hasattr(message, "additional_kwargs") and "tool_calls" in message.additional_kwargs:
+            d["tool_calls"] = message.additional_kwargs["tool_calls"]
+        return d
+    elif isinstance(message, dict):
+        return message
+    else:
+        role = getattr(message, "type", "user")
+        if role == "ai":
+            role = "assistant"
+        return {"role": role, "content": getattr(message, "content", str(message))}
+
+class OpenRouterChatModel(BaseChatModel):
+    model_name: str
+    temperature: float
+    api_key: str
+    base_url: str
+    bound_tools: Optional[List[Any]] = None
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        api_messages = [convert_message_to_dict(msg) for msg in messages]
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/GoogleCloudPlatform",
+            "X-Title": "MagmaAssistance",
+        }
+        
+        # Translate default model name to free OpenRouter model
+        model_to_use = self.model_name
+        if model_to_use == "llama3.2":
+            model_to_use = "nvidia/nemotron-3-ultra-550b-a55b:free"
+            
+        data = {
+            "model": model_to_use,
+            "messages": api_messages,
+            "temperature": self.temperature,
+        }
+        
+        if self.bound_tools:
+            data["tools"] = self.bound_tools
+            
+        response = requests.post(self.base_url, json=data, headers=headers)
+        response.raise_for_status()
+        res_json = response.json()
+        
+        choice = res_json["choices"][0]
+        message_data = choice["message"]
+        
+        content = message_data.get("content") or ""
+        tool_calls = []
+        if "tool_calls" in message_data:
+            for tc in message_data["tool_calls"]:
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                except Exception:
+                    args = {}
+                tool_calls.append({
+                    "name": tc["function"]["name"],
+                    "args": args,
+                    "id": tc.get("id"),
+                })
+        
+        ai_message = AIMessage(content=content, tool_calls=tool_calls)
+        return ChatResult(generations=[ChatGeneration(message=ai_message)])
+
+    def _llm_type(self) -> str:
+        return "openrouter-chat-model"
+
+    def bind_tools(
+        self,
+        tools: Sequence[Union[Dict[str, Any], type[BaseModel], Callable, Any]],
+        **kwargs: Any,
+    ) -> "OpenRouterChatModel":
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+        formatted_tools = [convert_to_openai_tool(t) for t in tools]
+        return OpenRouterChatModel(
+            model_name=self.model_name,
+            temperature=self.temperature,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            bound_tools=formatted_tools,
+        )
+
+# Add model property to LLM class before importing Main/VoiceAssistant
+@property
+def get_model(self):
+    return OpenRouterChatModel(
+        model_name=self.model_name,
+        temperature=self.temperature,
+        api_key=self.api_key,
+        base_url=self.base_url
+    )
+
+LLM.model = get_model
 
 from Main import VoiceAssistant
 from ERP.tool_rag import ToolRAG
