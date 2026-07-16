@@ -33,6 +33,8 @@ backend/WhisperSTT/model/
 backend/KokoroTTS/models/
 backend/ERP/models/
 backend/models/
+backend/Downloads/
+
 
 
 # Generated audio / temp files

@@ -17,6 +17,17 @@ Same conventions as sales_tools.py:
     function body (see _default in sales_tools.py) so small local models
     passing explicit `null` don't trip Pydantic validation.
 
+Slot-filling metadata:
+  REQUIRED_FIELDS below lists, per tool, the fields that matter enough to
+  actively ask the user for if they're missing — rather than letting the
+  LLM guess/fabricate a name, phone number, or ID, or silently create a
+  half-empty record. ERP/server.py reads this dict: if a tool call comes
+  back missing any of these, the agent asks for them one at a time across
+  turns instead of calling the tool right away. This is intentionally a
+  short, high-value subset of each tool's full argument list (e.g.
+  `create_lead` also accepts email/industry/notes/etc., but only
+  name/phone/company are worth interrupting the conversation for).
+
 Add this list to ERP/tools/__init__.py:
     from .sales_write_tools import SALES_WRITE_TOOLS
     ALL_TOOLS = [*SALES_TOOLS, *SALES_WRITE_TOOLS]
@@ -468,3 +479,115 @@ SALES_WRITE_TOOLS = [
     create_sales_order,
     update_sales_order,
 ]
+
+
+# ---------------------------------------------------------------------
+# Slot-filling metadata (consumed by ERP/server.py)
+# ---------------------------------------------------------------------
+#
+# Each entry: tool_name -> ordered list of (field_name, question) pairs.
+# When the agent decides to call one of these tools but the LLM's own
+# extracted args are missing one of these fields, server.py holds off on
+# calling the tool and instead asks the user for the missing fields one
+# at a time, in order, across turns — merging each answer back into the
+# args until the record is complete. Every write tool has an entry here
+# so none of them can be called with a guessed name, ID, or amount.
+# Fields not listed stay fully optional and are just omitted if the user
+# never mentions them.
+REQUIRED_FIELDS = {
+    "create_lead": [
+        ("name", "What's the lead's name?"),
+        ("phone", "What's their phone number?"),
+        ("company", "Which company are they with?"),
+    ],
+    "update_lead": [
+        ("lead_id", "Which lead should I update? (e.g. LEAD-00001)"),
+    ],
+    "create_customer": [
+        ("customer_name", "What's the customer or company name?"),
+        ("mobile_no", "What's their mobile number?"),
+        ("territory", "Which territory should this customer be in?"),
+    ],
+    "update_customer": [
+        ("customer_id", "Which customer should I update? (e.g. CUST-0001)"),
+    ],
+    "create_opportunity": [
+        ("opportunity_name", "What should this opportunity be called?"),
+        ("expected_revenue", "What's the expected revenue for this opportunity?"),
+        ("close_date", "What's the expected close date? (YYYY-MM-DD)"),
+    ],
+    "update_opportunity": [
+        ("opportunity_id", "Which opportunity should I update? (e.g. OPP-00001)"),
+    ],
+    "create_quotation": [
+        ("customer", "Which customer is this quotation for? (customer ID, e.g. CUST-0001)"),
+        (
+            "items",
+            "What items should be on the quotation? Give each as "
+            "'item code, quantity, rate' — separate multiple items with a "
+            "semicolon, e.g. 'ITEM-001, 50, 1200; ITEM-002, 10, 500'.",
+        ),
+    ],
+    "update_quotation": [
+        ("quotation_id", "Which quotation should I update? (e.g. QTN-00001)"),
+    ],
+    "create_sales_order": [
+        ("customer", "Which customer is this sales order for? (customer ID, e.g. CUST-0001)"),
+        (
+            "items",
+            "What items should be on the order? Give each as "
+            "'item code, quantity, rate' — separate multiple items with a "
+            "semicolon, e.g. 'ITEM-001, 50, 1200; ITEM-002, 10, 500'.",
+        ),
+    ],
+    "update_sales_order": [
+        ("sales_order_id", "Which sales order should I update? (e.g. SO-00001)"),
+    ],
+}
+
+
+def _parse_items_answer(text: str) -> list:
+    """Parses a free-text answer to an 'items' slot-filling question into
+    the list-of-dicts shape create_quotation/create_sales_order expect.
+
+    Expected format per item: 'item code, quantity, rate' (rate optional),
+    multiple items separated by semicolons, e.g.
+    'ITEM-001, 50, 1200; ITEM-002, 10, 500'. Falls back to leaving a value
+    as a plain string if it isn't numeric, rather than dropping it, so a
+    malformed number doesn't silently disappear.
+    """
+
+    def _num(value):
+        value = value.strip()
+        try:
+            return float(value) if "." in value else int(value)
+        except ValueError:
+            return value
+
+    items = []
+    for chunk in text.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split(",") if p.strip()]
+        if not parts:
+            continue
+
+        entry = {"item_code": parts[0]}
+        if len(parts) >= 2:
+            entry["qty"] = _num(parts[1])
+        if len(parts) >= 3:
+            entry["rate"] = _num(parts[2])
+        items.append(entry)
+
+    return items
+
+
+# Per-(tool, field) parsers for slot-filling answers that need to become
+# something other than a plain string before being passed to the tool
+# (e.g. `items` must be a list of dicts, not raw text). Any (tool, field)
+# pair not listed here is stored as the user's raw, trimmed text.
+FIELD_PARSERS = {
+    ("create_quotation", "items"): _parse_items_answer,
+    ("create_sales_order", "items"): _parse_items_answer,
+}
