@@ -159,7 +159,7 @@ start "Voice Assistant - Frontend" cmd /k "cd /d "%FRONTEND_DIR%" && set "VITE_A
 echo.
 echo Backend and frontend are starting up in their own windows.
 echo   Backend:  http://localhost:%BACKEND_PORT%
-echo   Frontend: http://localhost:5173
+echo   Frontend: http://localhost:5174
 echo WARNING: if installed torch is cpu version so inference of TTS is slow, consider installing torch with GPU support for better performance.
 echo.
 pause

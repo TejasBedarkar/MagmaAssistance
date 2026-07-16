@@ -1,0 +1,74 @@
+.portal-spinner {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--module-accent, var(--accent));
+  line-height: 0;
+  flex-shrink: 0;
+}
+
+.portal-spinner__arc {
+  transform-origin: center;
+  animation: portal-arc-spin 0.85s linear infinite;
+}
+
+@keyframes portal-arc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.portal-page-loader {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px 16px;
+  min-height: 100px;
+}
+
+.portal-page-loader__message {
+  margin: 0;
+  font-size: var(--text-body);
+  font-weight: 500;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+}
+
+.portal-spinner--in-btn {
+  color: currentColor;
+}
+
+.pm-user-act__spinner {
+  color: currentColor;
+}
+
+.pm-user-act--loading:disabled {
+  opacity: 1;
+  cursor: wait;
+}
+
+.pm-kanban-card__spinner {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: inherit;
+  background: rgba(10, 15, 26, 0.45);
+  pointer-events: none;
+}
+
+.portal-loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: inherit;
+  background: rgba(10, 15, 26, 0.55);
+  backdrop-filter: blur(2px);
+}

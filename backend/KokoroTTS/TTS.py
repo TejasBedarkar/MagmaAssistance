@@ -97,4 +97,6 @@ class KokoroTTS:
 
 if __name__ == "__main__":
     tts = KokoroTTS(voice="af_heart")
+
     tts.speak("Hello, this is a test of the Kokoro text to speech system.")
+

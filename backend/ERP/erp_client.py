@@ -178,7 +178,20 @@ class ERPClient:
             raise RuntimeError("ERP_URL is not configured.")
 
         url = f"{self.base_url}/api/method/{method}"
-        response = self.session.post(url, json=(data or {}), timeout=DEFAULT_TIMEOUT_SECONDS)
+        # requests/http.client can send an "Expect: 100-continue" header on
+        # POST bodies of certain sizes. Werkzeug's development server (what
+        # a local `bench start` / dev site runs on) doesn't implement that
+        # handshake and rejects the request outright with
+        # "417 Expectation Failed" before your ERP code ever sees it — even
+        # though the same request works fine from curl (which doesn't send
+        # Expect for small bodies) or against a production server behind
+        # gunicorn/nginx. Explicitly blanking the header here disables it.
+        response = self.session.post(
+            url,
+            json=(data or {}),
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+            headers={"Expect": ""},
+        )
         response.raise_for_status()
         payload = response.json()
 
@@ -195,11 +208,12 @@ class ERPClient:
             raise RuntimeError("ERP_URL is not configured.")
 
         url = f"{self.base_url}/api/resource/{doctype}"
-        response = self.session.post(url, json=data, timeout=DEFAULT_TIMEOUT_SECONDS)
+        response = self.session.post(
+            url, json=data, timeout=DEFAULT_TIMEOUT_SECONDS, headers={"Expect": ""}
+        )
         response.raise_for_status()
         return response.json().get("data", {})
 
-    
-
 
 erp_client = ERPClient()
+

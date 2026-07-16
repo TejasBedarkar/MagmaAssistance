@@ -3,6 +3,14 @@ fastapi
 uvicorn[standard]
 python-multipart
 
+# ERP client (ERP/erp_client.py) -- not previously listed here
+requests
+python-dotenv
+
+# MCP: server side (ERP/mcp_server.py) + client side (ERP/tools/mcp_tools.py)
+fastmcp
+langchain-mcp-adapters
+
 # Agent pipeline (from Main.py)
 langchain-ollama
 langchain-core
@@ -43,3 +51,4 @@ sentence-transformers
 #            https://github.com/espeak-ng/espeak-ng/releases)
 #   Linux:   sudo apt-get install espeak-ng
 #   macOS:   brew install espeak-ng
+

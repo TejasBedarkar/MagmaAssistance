@@ -1,0 +1,36 @@
+@import "./scm-components.css";
+@import "./scm-dashboard.css";
+@import "./scm-pages.css";
+
+/* Supply Chain module shell */
+.scm-module-root {
+  font-family: var(--font);
+  font-size: var(--text-body);
+  color: var(--text);
+  min-height: 100%;
+}
+
+/* Portal typography parity — SCM tables and controls */
+.scm-module-root table {
+  font-size: var(--text-body);
+}
+
+.scm-module-root table th {
+  font-size: var(--text-table-head);
+}
+
+.scm-module-root input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
+.scm-module-root select,
+.scm-module-root textarea,
+.scm-module-root button {
+  font-size: inherit;
+}
+
+.scm-module-root label {
+  font-size: var(--text-label);
+}
+
+.scm-module-root .recharts-cartesian-grid-horizontal line,
+.scm-module-root .recharts-cartesian-grid-vertical line {
+  stroke: rgba(148, 163, 184, 0.12);
+}
