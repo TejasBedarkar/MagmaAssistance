@@ -433,19 +433,26 @@ SALES_WRITE_TOOLS = [
 # optional and is simply omitted if the user never mentions it.
 REQUIRED_FIELDS = {
     "create_lead": [
-        ("name", "What's the lead's name?"),
+        ("name", "What is the lead's name?"),
+        ("phone", "What is the lead's phone number?"),
+        ("company", "Which company does the lead belong to?"),
+        ("product_interested", "Which product is the customer interested in?")
     ],
     "update_lead": [
         ("lead_id", "Which lead should I update? (its ID/docname)"),
     ],
     "create_customer": [
-        ("customer_name", "What's the customer or company name?"),
+        ("customer_name", "What is the customer name?"),
+        ("mobile_no", "What is the customer's mobile number?"),
+        ("territory", "Which territory does the customer belong to?"),
     ],
     "update_customer": [
         ("customer_id", "Which customer should I update?"),
     ],
     "create_opportunity": [
-        ("party_name", "Which Lead or Customer is this opportunity for?"),
+        ("opportunity_name", "What should be the opportunity name?"),
+        ("expected_revenue", "What is the expected revenue?"),
+        ("close_date", "What is the expected close date?")
     ],
     "update_opportunity": [
         ("opportunity_id", "Which opportunity should I update? (e.g. OPTY-00001)"),
