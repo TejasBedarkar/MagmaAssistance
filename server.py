@@ -546,7 +546,9 @@ _CLASSIFY_SYSTEM = (
     "supplying info the assistant just asked for, is the SAME task.\n"
     "- A greeting, thanks, or closing remark right after a task is finished "
     "does NOT start a new task; keep same_task=true with the same label.\n"
-    "- A request about a different customer/record/action/topic is a NEW task."
+    "- A request about a different customer/record/action/topic is a NEW task.\n"
+    "- INVOICE RULE: When user says 'Yes' to create/submit invoice after PO creation, DO NOT ask for invoice details if metadata was extracted from document.\n"
+    "- BUYING RULE: NEVER create an 'Opportunity' for a Supplier or Purchase Order."
 )
 
 
@@ -637,7 +639,16 @@ async def agent_node(state: ChatState) -> dict:
         return {"messages": [AIMessage(content=reply)]}
 
     retrieval_query = f"{task_context}. {last_user_msg}" if task_context else last_user_msg
-    candidate_tools = tool_rag.retrieve(retrieval_query)
+    candidate_tools = tool_rag.retrieve(retrieval_query) or []
+
+    # --- FIX: Force include critical invoice tools when context contains invoice/PO ---
+    candidate_names = {t.name for t in candidate_tools}
+    query_lower = retrieval_query.lower()
+
+    if any(k in query_lower for k in ["invoice", "purchase order", "po", "pur-ord"]):
+        if "create_purchase_invoice" in tool_map and "create_purchase_invoice" not in candidate_names:
+            candidate_tools.append(tool_map["create_purchase_invoice"])
+
     if not candidate_tools:
         reply = text_chain.invoke({"input": last_user_msg})
         return {"messages": [AIMessage(content=reply)]}
