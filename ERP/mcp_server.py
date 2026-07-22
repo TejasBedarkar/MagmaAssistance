@@ -38,6 +38,13 @@ Install:
 import sys
 from datetime import date, timedelta
 from typing import Optional
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Subprocess me root .env file ko explicitly load karne ke liye
+env_file = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=env_file)
+load_dotenv()  # Fallback
 
 from fastmcp import FastMCP
 
