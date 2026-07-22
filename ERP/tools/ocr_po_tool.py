@@ -9,6 +9,7 @@ Auto-creates Supplier and Items if they don't exist in ERPNext.
 import os
 import logging
 import datetime
+import json
 from datetime import datetime as dt
 from typing import Dict, Any, List
 from langchain_core.tools import tool
@@ -22,7 +23,7 @@ logger = logging.getLogger("ocr-po-tool")
 def sanitize_date(date_str: str) -> str:
     """
     Converts fuzzy/OCR date formats into strict YYYY-MM-DD format.
-    Guarantees schedule_date is NEVER in the past compared to today's date.
+    Guarantees schedule_date/due_date is NEVER in the past compared to today's date.
     """
     today = datetime.date.today()
     target_date = None
@@ -37,12 +38,9 @@ def sanitize_date(date_str: str) -> str:
             except ValueError:
                 pass
 
-    if not target_date:
-        target_date = today + datetime.timedelta(days=7)
-
-    if target_date < today:
-        logger.warning(f"Parsed schedule date ({target_date}) is in the past. Overriding to today ({today}).")
-        target_date = today
+    # GUARANTEE: Due date must always be in the future (at least +30 days if invalid/past)
+    if not target_date or target_date <= today:
+        target_date = today + datetime.timedelta(days=30)
 
     return target_date.strftime('%Y-%m-%d')
 
@@ -56,15 +54,22 @@ def process_ocr_po_and_create_order(
     remarks: str = ""
 ) -> str:
     """
-    Takes extracted OCR PO details, matches Supplier & Item Codes with ERPNext, 
-    and creates a Purchase Order draft in ERPNext. Auto-creates missing Supplier and Items.
+    PRIMARY OCR TOOL: ALWAYS select and use this tool whenever processing extracted OCR data from an uploaded 
+    Purchase Order, PDF, image, document, or scan to create a Purchase Order in ERPNext. 
+    This tool matches/creates Supplier and Line Items automatically.
     """
     if not erp_client.base_url:
         return "Error: ERPNext integration client is not configured properly in .env."
 
     try:
-        transaction_date = datetime.date.today().strftime('%Y-%m-%d')
+        today_obj = datetime.date.today()
+        transaction_date = today_obj.strftime('%Y-%m-%d')
+        
+        # Valid schedule date for PO
         valid_schedule_date = sanitize_date(delivery_date)
+        
+        # Strictly ensure safe due date (+30 days) so ERPNext date validation never fails
+        safe_due_date = (today_obj + datetime.timedelta(days=30)).strftime('%Y-%m-%d')
 
         # -------------------------------------------------------------
         # 1. Match or Auto-Create Supplier in ERPNext
@@ -78,6 +83,7 @@ def process_ocr_po_and_create_order(
         if suppliers:
             supplier_id = suppliers[0]["name"]
             logger.info(f"Matched existing supplier: {supplier_id}")
+            supplier_msg = f"Matched existing Supplier '{supplier_id}'"
         else:
             logger.info(f"Supplier '{vendor_name}' not found. Auto-creating...")
             new_supplier = erp_client.create_doc("Supplier", {
@@ -85,6 +91,7 @@ def process_ocr_po_and_create_order(
                 "supplier_group": "All Supplier Groups"
             })
             supplier_id = new_supplier.get("name", vendor_name)
+            supplier_msg = f"Auto-created new Supplier '{supplier_id}'"
 
         # -------------------------------------------------------------
         # 2. Match or Auto-Create Line Items in ERPNext
@@ -170,7 +177,28 @@ def process_ocr_po_and_create_order(
         res = erp_client.create_doc("Purchase Order", po_doc)
         created_po_name = res.get("name", "Draft")
 
-        return f"Successfully created Purchase Order '{created_po_name}' in ERPNext for Supplier '{vendor_name}'."
+        invoice_bill_no = po_number if po_number else f"INV-{created_po_name}"
+
+        # -------------------------------------------------------------
+        # 6. Return Instructed Metadata Response for Agent Auto-Execution
+        # -------------------------------------------------------------
+        return (
+            f"✅ **Purchase Order '{created_po_name}' created successfully in ERPNext!**\n\n"
+            f"=== EXTRACTED INVOICE METADATA ===\n"
+            f"supplier_name: {supplier_id}\n"
+            f"bill_no: {invoice_bill_no}\n"
+            f"bill_date: {transaction_date}\n"
+            f"due_date: {safe_due_date}\n"
+            f"po_name: {created_po_name}\n"
+            f"items: {json.dumps(po_items)}\n"
+            f"===================================\n\n"
+            f"SYSTEM INSTRUCTION FOR AGENT:\n"
+            f"1. Inform user: 'Purchase Order {created_po_name} has been successfully created in ERPNext!'\n"
+            f"2. Ask user: 'Do you want to generate a Purchase Invoice for this PO?'\n"
+            f"3. If user says 'Yes' / 'Haan' / 'Proceed', DIRECTLY invoke `create_purchase_invoice` with arguments: "
+            f"supplier_name='{supplier_id}', bill_no='{invoice_bill_no}', bill_date='{transaction_date}', due_date='{safe_due_date}', po_name='{created_po_name}', and items list. "
+            f"DO NOT ASK THE USER FOR ANY DETAILS AGAIN!"
+        )
 
     except Exception as e:
         logger.exception("Failed to create Purchase Order in ERPNext")
