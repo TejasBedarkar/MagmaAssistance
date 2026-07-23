@@ -27,6 +27,16 @@ uses lead_name/email_id/mobile_no, Customer contact info lives on a
 linked Contact, Opportunity uses opportunity_from/party_name/
 sales_stage/expected_closing, etc.).
 
+Required-field note: the live ERP API rejects create calls missing
+certain fields, discovered via auto-discovery / manual testing and
+recorded here and in ERP/tools/sales_write_tools.py:
+  - create_lead: name, product_interested, quantity
+  - create_opportunity: party_name, product_code, quantity, company
+  - create_quotation: customer, date, order_type, item_code, quantity, rate, company
+  - create_sales_order: customer, item_code, delivery_date, company, warehouse
+Kept in sync 1:1 with ERP/tools/sales_write_tools.py — if the API's
+required fields change again, update both places.
+
 Run standalone:
     python -m ERP.mcp_server            # stdio (same-host client)
     python -m ERP.mcp_server --http      # streamable HTTP on :8100
@@ -58,6 +68,30 @@ def _safe_call(label, fn):
 
 def _payload(**kwargs):
     return {k: v for k, v in kwargs.items() if v is not None}
+
+
+def _resolve_link(doctype, value):
+    """Resolve a possibly-partial Link field value (e.g. 'Magna') to the
+    exact docname ERPNext has on file (e.g. 'Magna Data Pvt Ltd'), since
+    Frappe's Link fields require an exact match and otherwise raise
+    LinkValidationError. Falls back to the original value unchanged if
+    no match is found. Mirrors ERP/tools/sales_write_tools.py."""
+    if not value:
+        return value
+    try:
+        if erp_client.get_doc(doctype, value):
+            return value
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        matches = erp_client.get_list(
+            doctype, fields=["name"], filters=[["name", "like", f"%{value}%"]], limit=1,
+        )
+        if matches:
+            return matches[0]["name"]
+    except Exception:  # noqa: BLE001
+        pass
+    return value
 
 
 # ---------------------------------------------------------------------
@@ -231,6 +265,8 @@ def get_lead_count(status: Optional[str] = None) -> str:
 @mcp.tool()
 def create_lead(
     name: str,
+    product_interested: str,
+    quantity: str,
     email: Optional[str] = None,
     phone: Optional[str] = None,
     company: Optional[str] = None,
@@ -238,11 +274,15 @@ def create_lead(
     source: Optional[str] = None,
     territory: Optional[str] = None,
 ) -> str:
-    """Create a new sales Lead. `name` is the lead/contact person's name
-    (required — maps to ERPNext's `lead_name` field)."""
+    """Create a new sales Lead. `name` (the lead/contact person's name),
+    `product_interested` (the product/item they want), and `quantity`
+    are all REQUIRED by the ERP Lead-creation API — the call fails
+    without them, so always ask the user for these three before calling
+    this tool if they weren't already given."""
     def run():
-        data = _payload(lead_name=name, email_id=email, mobile_no=phone,
-                         company_name=company, status=status, source=source, territory=territory)
+        data = _payload(lead_name=name, product_interested=product_interested, quantity=quantity,
+                         email_id=email, mobile_no=phone, company_name=company,
+                         status=status, source=source, territory=territory)
         return str(erp_client.create_doc("Lead", data))
     return _safe_call(f"create lead '{name}'", run)
 
@@ -277,9 +317,10 @@ def create_customer(
     lead_id: Optional[str] = None,
 ) -> str:
     """Create a new Customer. `customer_name` is required (e.g. 'ABC
-    Industries'). If `email_id`/`mobile_no` is given, a linked Contact is
-    also created, since ERPNext stores contact details on Contact rather
-    than on Customer itself."""
+    Industries') — this is the only field the ERP API strictly requires.
+    If `email_id`/`mobile_no` is given, a linked Contact is also
+    created, since ERPNext stores contact details on Contact rather than
+    on Customer itself."""
     def run():
         customer_data = _payload(customer_name=customer_name, customer_type=customer_type,
                                   customer_group=customer_group, territory=territory, lead_name=lead_id)
@@ -325,6 +366,9 @@ def update_customer(
 @mcp.tool()
 def create_opportunity(
     party_name: str,
+    product_code: str,
+    quantity: float,
+    company: str,
     opportunity_from: Optional[str] = None,
     opportunity_amount: Optional[float] = None,
     sales_stage: Optional[str] = None,
@@ -333,11 +377,20 @@ def create_opportunity(
     source: Optional[str] = None,
 ) -> str:
     """Create a new Opportunity, typically linked to an existing Lead or
-    Customer. `party_name` is that Lead's or Customer's ID (required).
+    Customer. `party_name` is that Lead's or Customer's ID.
+    `product_code`, `quantity`, and `company` are REQUIRED by the ERP
+    Opportunity-creation API — the call fails without them, so always
+    ask the user for these three before calling this tool if they
+    weren't already given. `company` must be the exact ERP Company
+    record (e.g. 'Magna Data Pvt Ltd', not just 'Magna') — if you're
+    unsure of the exact name, pass whatever the user gave you and this
+    tool will try to resolve it to the closest match on file.
     `opportunity_from` should be 'Lead' or 'Customer' (defaults to
     'Customer')."""
     def run():
-        data = _payload(party_name=party_name, opportunity_from=opportunity_from or "Customer",
+        data = _payload(party_name=party_name, product_code=product_code, quantity=quantity,
+                         company=_resolve_link("Company", company),
+                         opportunity_from=opportunity_from or "Customer",
                          opportunity_amount=opportunity_amount, sales_stage=sales_stage,
                          expected_closing=expected_closing, probability=probability, source=source)
         return str(erp_client.create_doc("Opportunity", data))
@@ -362,12 +415,34 @@ def update_opportunity(
 
 
 @mcp.tool()
-def create_quotation(customer: str, items: list, valid_till: Optional[str] = None) -> str:
-    """Create a Quotation. `customer` is the customer ID (e.g. 'ABC Industries').
-    `items` is a list of {item_code, qty, rate} dicts."""
+def create_quotation(
+    customer: str,
+    date: str,
+    order_type: str,
+    item_code: str,
+    quantity: float,
+    rate: float,
+    company: str,
+    extra_items: Optional[list] = None,
+    valid_till: Optional[str] = None,
+) -> str:
+    """Create a Quotation. `customer`, `date` (the quotation date,
+    YYYY-MM-DD), `order_type` (e.g. 'Sales' or 'Maintenance'),
+    `item_code`, `quantity`, `rate`, and `company` are all REQUIRED by
+    the ERP Quotation-creation API — the call fails without them, so
+    always ask the user for all seven before calling this tool if they
+    weren't already given. `company` is the company this quotation
+    belongs to (e.g. 'Magna Data Pvt Ltd') — ERPNext needs it to resolve
+    item pricing. `extra_items` lets you add further line items beyond
+    the first — a list of {item_code, qty, rate} dicts — use this
+    whenever the user mentions more than one product."""
     def run():
+        items = [{"item_code": item_code, "qty": quantity, "rate": rate}]
+        if extra_items:
+            items.extend(extra_items)
         data = _payload(quotation_to="Customer", party_name=customer,
-                         transaction_date=date.today().isoformat(), items=items, valid_till=valid_till)
+                         transaction_date=date, items=items, valid_till=valid_till,
+                         order_type=order_type, company=company)
         return str(erp_client.create_doc("Quotation", data))
     return _safe_call(f"create quotation for {customer}", run)
 
@@ -386,17 +461,40 @@ def update_quotation(quotation_id: str, items: Optional[list] = None, status: Op
 @mcp.tool()
 def create_sales_order(
     customer: str,
-    items: list,
-    delivery_date: Optional[str] = None,
+    item_code: str,
+    delivery_date: str,
+    company: str,
+    warehouse: str,
+    quantity: Optional[float] = None,
+    rate: Optional[float] = None,
+    extra_items: Optional[list] = None,
     submit: bool = False,
 ) -> str:
-    """Create a Sales Order. `customer` is the customer ID (e.g. 'ABC Industries').
-    `items` is a list of {item_code, qty, rate, uom, warehouse} dicts.
-    Set `submit` true to submit it immediately via ERPNext's core
-    frappe.client.submit rather than leave it as a draft."""
+    """Create a Sales Order. `customer`, `item_code`, `delivery_date`,
+    `company`, and `warehouse` are REQUIRED by the ERP
+    Sales-Order-creation API — the call fails without them, so always
+    ask the user for these five before calling this tool if they
+    weren't already given. `company` is the company this order belongs
+    to (e.g. 'Magna Data Pvt Ltd') — ERPNext needs it to resolve item
+    pricing. `warehouse` is the source (delivering) warehouse for the
+    item (e.g. 'Stores - CO') — ERPNext requires this for any stock
+    item. `quantity` and `rate` are optional but should be passed
+    whenever the user mentions them. `extra_items` lets you add further
+    line items beyond the first — a list of {item_code, qty, rate, uom,
+    warehouse} dicts. Set `submit` true to submit it immediately via
+    ERPNext's core frappe.client.submit rather than leave it as a
+    draft."""
     def run():
+        item = {"item_code": item_code, "warehouse": warehouse}
+        if quantity is not None:
+            item["qty"] = quantity
+        if rate is not None:
+            item["rate"] = rate
+        items = [item]
+        if extra_items:
+            items.extend(extra_items)
         data = _payload(customer=customer, transaction_date=date.today().isoformat(),
-                         delivery_date=delivery_date or date.today().isoformat(), items=items)
+                         delivery_date=delivery_date, items=items, company=company)
         result = erp_client.create_doc("Sales Order", data)
         if submit:
             order_id = result.get("name")
