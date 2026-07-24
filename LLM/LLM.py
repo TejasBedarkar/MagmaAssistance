@@ -19,6 +19,19 @@ import logging
 from dotenv import load_dotenv
 import fitz  # PyMuPDF: For converting PDF pages to PNG images
 
+try:
+    from langsmith import traceable
+except ImportError:
+    # LangSmith is optional -- fall back to a no-op decorator so this
+    # module still works with tracing simply turned off, instead of
+    # requiring the package.
+    def traceable(*t_args, **t_kwargs):
+        def decorator(fn):
+            return fn
+        if t_args and callable(t_args[0]) and not t_kwargs:
+            return t_args[0]
+        return decorator
+
 load_dotenv()
 
 logger = logging.getLogger("llm-ocr")
@@ -70,6 +83,7 @@ class LLM:
         else:
             self.history[0] = {"role": "system", "content": self.system_prompt}
 
+    @traceable(name="LLM.chat", run_type="llm")
     def chat(self, user_input: str, remember: bool = True):
         messages = self.history + [{"role": "user", "content": user_input}]
 
@@ -99,11 +113,16 @@ class LLM:
     # =====================================================================
     # MULTI-FORMAT OCR VISION METHOD (PDF + IMAGE SUPPORT)
     # =====================================================================
-    def extract_po_data_from_document(self, file_bytes: bytes, mime_type: str) -> dict:
+    @traceable(name="LLM._extract_strict_po", run_type="llm")
+    def _extract_strict_po(self, file_bytes: bytes, mime_type: str) -> dict:
         """
         Extracts structured Purchase Order details from Image OR PDF bytes
         using GPT-4o Multi-modal Vision API.
         Converts PDF pages into PNG images before sending to OpenAI Vision.
+
+        Internal helper -- raises RuntimeError if the document doesn't
+        look like a PO. Call extract_po_data_from_document() instead,
+        which wraps this with a general-text fallback.
         """
         try:
             image_content_payloads = []
@@ -236,6 +255,23 @@ class LLM:
                 )
 
             parsed_data = self._parse_json_response(raw_content)
+
+            # The model can also "succeed" in the sense of returning
+            # well-formed JSON that matches the schema, but with every
+            # field blank/zero/N-A and no line items -- e.g. when it's
+            # handed a document that plainly isn't a PO but still obeys
+            # response_format=json_object rather than refusing. That's
+            # not a usable extraction either, so treat it the same as a
+            # refusal: let the caller fall back to general text reading.
+            vendor = str(parsed_data.get("vendor_name") or "").strip()
+            items = parsed_data.get("items") or []
+            if not vendor or vendor.upper() in ("N/A", "NA", "NONE", "UNKNOWN") or not items:
+                raise RuntimeError(
+                    "The model returned an empty template (no vendor and/or "
+                    "no line items) -- this document doesn't look like a "
+                    "recognizable Purchase Order."
+                )
+
             logger.info("Successfully extracted document data via OCR Vision.")
             return parsed_data
 
@@ -271,9 +307,59 @@ class LLM:
                 return json.loads(text[start:end + 1])
             raise
 
+    @traceable(name="LLM.extract_po_data_from_document", run_type="chain")
+    def extract_po_data_from_document(self, file_bytes: bytes, mime_type: str) -> dict:
+        """
+        Public entry point: tries strict Purchase Order extraction first.
+        If the document doesn't look like a PO -- refusal, no content, or
+        a blank/empty-template extraction -- this falls back to general
+        text extraction (extract_document_text) instead of failing
+        outright, so callers always get *something* useful back.
+
+        Returns a dict that always has an "is_po" key:
+          - is_po=True  -> normal strict PO fields (vendor_name, items,
+            po_number, grand_total, etc.) -- safe to hand to the
+            auto-create-Purchase-Order-in-ERPNext flow.
+          - is_po=False -> {"is_po": False, "note": str, "raw_text": str,
+            "page_count": int, "pages_read": int, "method": str}.
+
+        Only raises if BOTH the strict extraction AND the general-text
+        fallback fail (e.g. a genuinely corrupted/unreadable file).
+        """
+        try:
+            parsed_data = self._extract_strict_po(file_bytes, mime_type)
+            parsed_data["is_po"] = True
+            return parsed_data
+        except RuntimeError as strict_err:
+            logger.warning(
+                "Strict PO extraction failed (%s); falling back to general "
+                "text extraction.", strict_err
+            )
+            try:
+                fallback = self.extract_document_text(file_bytes, mime_type)
+            except Exception as fallback_err:
+                raise RuntimeError(
+                    f"Could not extract Purchase Order data ({strict_err}); "
+                    f"general document reading also failed ({fallback_err})."
+                )
+
+            return {
+                "is_po": False,
+                "note": (
+                    "This document doesn't look like a Purchase Order "
+                    f"({strict_err}). Returning the extracted context "
+                    "instead so you can review it manually."
+                ),
+                "raw_text": fallback["text"],
+                "page_count": fallback["page_count"],
+                "pages_read": fallback["pages_read"],
+                "method": fallback["method"],
+            }
+
     # =====================================================================
     # GENERAL-PURPOSE DOCUMENT READER (ANY PDF / IMAGE, NOT JUST POs)
     # =====================================================================
+    @traceable(name="LLM._vision_transcribe_image", run_type="llm")
     def _vision_transcribe_image(self, data_url: str) -> str:
         """Helper: sends one image to GPT-4o Vision and returns a plain
         transcription of everything visible on it (tables rendered as
@@ -314,6 +400,7 @@ class LLM:
             return f"[Could not read this page: {refusal or 'no content returned'}]"
         return content.strip()
 
+    @traceable(name="LLM.extract_document_text", run_type="chain")
     def extract_document_text(self, file_bytes: bytes, mime_type: str, max_pages: int = 20) -> dict:
         """
         Reads ANY PDF or image and returns its full text content, so the
@@ -403,6 +490,7 @@ class LLM:
             logger.exception("Error extracting general document text")
             raise RuntimeError(f"Document text extraction failed: {str(e)}")
 
+    @traceable(name="LLM.ask_about_document", run_type="llm")
     def ask_about_document(self, document_text: str, question: str, max_chars: int = 40000) -> str:
         """One-shot Q&A over already-extracted document text. Does NOT
         touch self.history, so it never pollutes normal chat memory --
