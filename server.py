@@ -452,6 +452,74 @@ async def upload_purchase_order_file(
         raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
 
 
+# =====================================================================
+# GENERAL-PURPOSE DOCUMENT UPLOAD (ANY PDF/IMAGE, NOT JUST POs)
+# =====================================================================
+# Separate from /api/upload-po above -- that endpoint's strict Purchase
+# Order JSON extraction / auto-create-in-ERPNext flow is untouched.
+# This lets a user upload any PDF/image and then just ask questions
+# about it in normal chat (/api/chat, /query); the extracted text is
+# stashed here per session_id and injected into the conversation once
+# by generate_reply() below.
+document_store: Dict[str, Dict[str, Any]] = {}  # session_id -> {filename, text, injected}
+
+
+class GeneralDocumentUploadResponse(BaseModel):
+    status: str
+    filename: str
+    message: str
+    page_count: int
+    extraction_method: str
+
+
+@app.post("/api/upload-document", response_model=GeneralDocumentUploadResponse)
+async def upload_general_document(
+    file: UploadFile = File(...),
+    session_id: str = Form("default"),
+):
+    """Reads ANY PDF or image (not just Purchase Orders), extracts its
+    full text, and stores it against session_id so the user can ask
+    follow-up questions about it in normal chat."""
+    allowed_types = ["image/jpeg", "image/png", "application/pdf", "image/jpg"]
+
+    if file.content_type.lower() not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format '{file.content_type}'. Please upload JPEG, PNG, or PDF."
+        )
+
+    try:
+        file_bytes = await file.read()
+        if len(file_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File size exceeds the 10MB limit.")
+
+        logger.info(f"File '{file.filename}' uploaded for session '{session_id}'. Extracting document text...")
+        extraction = llm_ocr_engine.extract_document_text(file_bytes=file_bytes, mime_type=file.content_type)
+
+        document_store[session_id] = {
+            "filename": file.filename,
+            "text": extraction["text"],
+            "injected": False,
+        }
+
+        return GeneralDocumentUploadResponse(
+            status="success",
+            filename=file.filename,
+            message=(
+                f"Document read successfully ({extraction['pages_read']}/{extraction['page_count']} "
+                f"page(s), method={extraction['method']}). You can now ask questions about it in chat."
+            ),
+            page_count=extraction["page_count"],
+            extraction_method=extraction["method"],
+        )
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.exception("Error handling document upload in /api/upload-document")
+        raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
+
+
 async def _execute_tool(tool_name: str, args: dict, session_id: Optional[str] = None):
     """Async because MCP-sourced tools (ERP/mcp_server.py, loaded via
     ERP/tools/mcp_tools.py) only implement `.ainvoke()`, not the sync
@@ -775,9 +843,26 @@ async def generate_reply(text: str, session_id: str = "default") -> str:
     """
     audit_log.log_turn(session_id, "user", text)
 
+    initial_messages = [HumanMessage(content=text)]
+
+    doc = document_store.get(session_id)
+    if doc and not doc["injected"]:
+        # Fires once, on the first chat turn after an /api/upload-document
+        # call for this session -- after that it stays in the LangGraph
+        # checkpointer's message history like any other turn, so it isn't
+        # re-sent (and re-billed) on every subsequent message.
+        doc_context = (
+            f"[System note: the user uploaded a document named "
+            f"'{doc['filename']}'. Its full extracted content is below -- "
+            f"use it to answer any questions they ask about it.]\n\n"
+            f"{doc['text'][:40000]}"
+        )
+        initial_messages = [SystemMessage(content=doc_context)] + initial_messages
+        doc["injected"] = True
+
     config = {"configurable": {"thread_id": session_id}}
     result = await agent_graph.ainvoke(
-        {"messages": [HumanMessage(content=text)], "session_id": session_id}, config
+        {"messages": initial_messages, "session_id": session_id}, config
     )
     reply = result["messages"][-1].content
 
