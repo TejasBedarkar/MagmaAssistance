@@ -15,9 +15,16 @@ langchain-mcp-adapters
 # NOTE: LLM/LLM.py talks to OpenRouter directly via `requests`, not
 # ChatOllama, so langchain-ollama is not actually imported anywhere --
 # only langchain-core (used for prompts/messages/output parsers) is needed.
+langchain
 langchain-core
-# langgraph is used for the agent pipeline's graph-based memory
+langchain-openai
+langchain-community
+
 langgraph
+langgraph-checkpoint
+langgraph-cli
+langgraph-sdk
+langsmith
 huggingface_hub
 sounddevice
 numpy>=2.1
@@ -36,6 +43,3 @@ soundfile
 sentence-transformers
 openai
 elevenlabs
-
-
-
