@@ -10,22 +10,7 @@ Reuses ERP/erp_client.py as-is — same .env (ERP_URL, ERP_API_KEY,
 ERP_API_SECRET), same caching, same auth. This file only adds the MCP
 transport layer on top; it does not duplicate any HTTP/auth logic.
 
-This is a 1:1 port of the tool set already in ERP/tools/sales_tools.py,
-ERP/tools/sales_write_tools.py, and ERP/tools/lead_tools.py — same
-actions, same docstrings-as-descriptions, same "never raise, return a
-string" convention — just exposed via @mcp.tool() instead of @tool so an
-MCP client can discover and call them.
-
-v16 note: the write tools below (create_lead, update_lead,
-create_customer, ... create_sales_order) were migrated off the old
-custom "sales_app" whitelisted-method API onto ERPNext's DEFAULT REST
-API (POST/PUT /api/resource/<Doctype>, plus core frappe.client.submit
-for submitting orders) via erp_client.create_doc()/update_doc()/
-submit_doc() — mirrors ERP/tools/sales_write_tools.py exactly. See that
-file's module docstring for the stock-v16 field-mapping notes (e.g. Lead
-uses lead_name/email_id/mobile_no, Customer contact info lives on a
-linked Contact, Opportunity uses opportunity_from/party_name/
-sales_stage/expected_closing, etc.).
+v16 note: the write tools below use standard REST API.
 
 Required-field note: the live ERP API rejects create calls missing
 certain fields, discovered via auto-discovery / manual testing and
@@ -46,13 +31,24 @@ Install:
 """
 
 import sys
+import os
+import logging
+import datetime
 from datetime import date, timedelta
-from typing import Optional
+from typing import Optional, List, Dict, Any
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Subprocess me root .env file ko explicitly load karne ke liye
+env_file = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=env_file)
+load_dotenv()  # Fallback
 
 from fastmcp import FastMCP
 
 from ERP.erp_client import erp_client
 
+logger = logging.getLogger("mcp-server")
 mcp = FastMCP(name="sales-app-erp")
 
 DEFAULT_LIST_LIMIT = 10
@@ -63,6 +59,7 @@ def _safe_call(label, fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001
+        logger.exception(f"Error executing {label}")
         return f"Could not {label} in ERPNext right now ({exc})."
 
 
@@ -156,6 +153,34 @@ def get_sales_summary(period_days: int = 30) -> str:
         return str({"period_days": period_days, "order_count": len(orders),
                      "total_value": total_value, "by_status": by_status})
     return _safe_call("fetch sales summary", run)
+
+
+# ---------------------------------------------------------------------
+# Purchase Orders (read) — NEWLY ADDED FOR FULL PO ACCESSIBILITY
+# ---------------------------------------------------------------------
+
+@mcp.tool()
+def get_purchase_orders(limit: int = DEFAULT_LIST_LIMIT) -> str:
+    """PRIMARY PO READ TOOL: Get the list of recent Purchase Orders (PO) from ERPNext, 
+    including supplier name, transaction_date, grand_total, and status. 
+    ALWAYS use this when user asks for purchase orders or buying records."""
+    def run():
+        orders = erp_client.get_list(
+            "Purchase Order",
+            fields=["name", "supplier", "transaction_date", "grand_total", "status"],
+            order_by="creation desc",
+            limit=limit,
+        )
+        return str(orders)
+    return _safe_call("fetch purchase orders", run)
+
+
+@mcp.tool()
+def get_purchase_order_details(purchase_order_id: str) -> str:
+    """Get full details of a specific Purchase Order by its ID (e.g. 'PUR-ORD-2026-00001')."""
+    def run():
+        return str(erp_client.get_doc("Purchase Order", purchase_order_id))
+    return _safe_call(f"fetch purchase order {purchase_order_id}", run)
 
 
 # ---------------------------------------------------------------------
@@ -256,10 +281,6 @@ def get_lead_count(status: Optional[str] = None) -> str:
 
 # ---------------------------------------------------------------------
 # Lead / Customer / Opportunity / Quotation / Sales Order — WRITE
-# (ERPNext v16 default REST API: POST/PUT /api/resource/<Doctype>, via
-# erp_client.create_doc()/update_doc()/submit_doc() — see this file's
-# module docstring and ERP/tools/sales_write_tools.py for field-mapping
-# notes.)
 # ---------------------------------------------------------------------
 
 @mcp.tool()
@@ -516,6 +537,89 @@ def update_sales_order(sales_order_id: str, items: Optional[list] = None, delive
         return str(erp_client.update_doc("Sales Order", sales_order_id, data))
     return _safe_call(f"update sales order {sales_order_id}", run)
 
+# ---------------------------------------------------------------------
+# Purchase Invoice — WRITE (SUPPLIER ALIAS & ITEM CLEANUP FIX)
+# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Purchase Invoice — WRITE (SUPPLIER ALIAS, SUBMIT PARAM, & ITEM CLEANUP)
+# ---------------------------------------------------------------------
+@mcp.tool()
+def create_purchase_invoice(
+    supplier: str = "",
+    supplier_name: str = "",
+    bill_no: str = "",
+    bill_date: str = "",
+    due_date: str = "",
+    items: list = None,
+    po_name: str = "",
+    submit: bool = False,
+) -> str:
+    """
+    Creates a Purchase Invoice in ERPNext automatically using parameters or extracted OCR metadata.
+    Supports supplier/supplier_name aliases and optional submit parameter.
+    """
+    if not erp_client.base_url:
+        return "Error: ERPNext integration client is not configured."
+
+    try:
+        # Pick supplier name from either argument
+        supplier_id = supplier or supplier_name
+        invoice_bill_no = bill_no or f"INV-{po_name}"
+
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        b_date = bill_date if bill_date else today
+
+        if not due_date or due_date <= b_date:
+            parsed_b = datetime.datetime.strptime(b_date, "%Y-%m-%d").date()
+            d_date = (parsed_b + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+        else:
+            d_date = due_date
+
+        company_name = getattr(erp_client, "company_name", None) or os.environ.get("ERPNEXT_COMPANY", "Magnadata PVT. LTD.")
+
+        formatted_items = []
+        if items:
+            for item in items:
+                raw_code = item.get("item_code") or item.get("item_name") or "Standard Item"
+                clean_item_code = str(raw_code).strip().replace(" ", "-")
+
+                formatted_item = {
+                    "item_code": clean_item_code,
+                    "qty": float(item.get("qty", 1)),
+                    "rate": float(item.get("rate", 0)),
+                    "uom": item.get("uom", "Nos"),
+                }
+                if po_name or item.get("purchase_order"):
+                    formatted_item["purchase_order"] = po_name or item.get("purchase_order")
+                
+                formatted_items.append(formatted_item)
+
+        payload = {
+            "doctype": "Purchase Invoice",
+            "supplier": supplier_id,
+            "bill_no": invoice_bill_no,
+            "bill_date": b_date,
+            "due_date": d_date,
+            "company": company_name,
+            "items": formatted_items,
+            "update_stock": 0
+        }
+
+        res = erp_client.create_doc("Purchase Invoice", payload)
+        doc_name = res.get("name", "Draft")
+
+        if submit:
+            try:
+                res = erp_client.submit_doc("Purchase Invoice", doc_name)
+                return f"🎉 Purchase Invoice '{doc_name}' created and submitted successfully in ERPNext for '{supplier_id}'!"
+            except Exception as sub_err:
+                return f"🎉 Purchase Invoice '{doc_name}' created as draft, but auto-submit failed: {str(sub_err)}"
+
+        return f"🎉 Purchase Invoice '{doc_name}' created successfully in ERPNext for '{supplier_id}'!"
+
+    except Exception as e:
+        logger.exception("Failed to create Purchase Invoice")
+        return f"Error creating purchase invoice: {str(e)}"
 
 if __name__ == "__main__":
     if "--http" in sys.argv:

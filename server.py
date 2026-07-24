@@ -54,6 +54,31 @@ def convert_message_to_dict(message):
             role = "assistant"
         return {"role": role, "content": getattr(message, "content", str(message))}
 
+def _clean_schema_for_openai(schema: dict) -> dict:
+    """Cleans up tool JSON schemas so OpenAI API does not throw 400 errors."""
+    if not isinstance(schema, dict):
+        return schema
+    
+    cleaned = schema.copy()
+    # Remove fields that cause OpenAI strict parameter 400 validation failures
+    cleaned.pop("additionalProperties", None)
+    cleaned.pop("title", None)
+
+    if "properties" in cleaned and isinstance(cleaned["properties"], dict):
+        new_props = {}
+        for prop_key, prop_val in cleaned["properties"].items():
+            if isinstance(prop_val, dict):
+                new_props[prop_key] = _clean_schema_for_openai(prop_val)
+            else:
+                new_props[prop_key] = prop_val
+        cleaned["properties"] = new_props
+
+    if "items" in cleaned and isinstance(cleaned["items"], dict):
+        cleaned["items"] = _clean_schema_for_openai(cleaned["items"])
+
+    return cleaned
+
+
 class OpenAIChatModel(BaseChatModel):
     model_name: str
     temperature: float
@@ -85,6 +110,10 @@ class OpenAIChatModel(BaseChatModel):
             data["tools"] = self.bound_tools
             
         response = requests.post(self.base_url, json=data, headers=headers)
+        
+        if not response.ok:
+            logger.error(f"OpenAI Rejected Request ({response.status_code}): {response.text}")
+
         response.raise_for_status()
         res_json = response.json()
         
@@ -117,7 +146,17 @@ class OpenAIChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> "OpenAIChatModel":
         from langchain_core.utils.function_calling import convert_to_openai_tool
-        formatted_tools = [convert_to_openai_tool(t) for t in tools]
+        
+        formatted_tools = []
+        for t in tools:
+            formatted = convert_to_openai_tool(t)
+            # Sanitize tool parameter schema to fix 400 Bad Request
+            if "function" in formatted and "parameters" in formatted["function"]:
+                formatted["function"]["parameters"] = _clean_schema_for_openai(
+                    formatted["function"]["parameters"]
+                )
+            formatted_tools.append(formatted)
+
         return OpenAIChatModel(
             model_name=self.model_name,
             temperature=self.temperature,
@@ -350,6 +389,68 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
 
     return cleaned
 
+# =====================================================================
+# STEP 1 & 2: PURCHASE ORDER DOCUMENT UPLOAD ENDPOINT (WITH OCR)
+# =====================================================================
+
+# Initialize LLM instance for OCR processing
+llm_ocr_engine = LLM()
+
+class DocumentUploadResponse(BaseModel):
+    status: str
+    filename: str
+    message: str
+    ocr_data: Optional[Dict[str, Any]] = None
+
+@app.post("/api/upload-po", response_model=DocumentUploadResponse)
+async def upload_purchase_order_file(
+    file: UploadFile = File(...),
+    session_id: str = Form("default")
+):
+    """
+    Handles PO Image / PDF file upload and runs Vision OCR extraction.
+    """
+    allowed_types = ["image/jpeg", "image/png", "application/pdf", "image/jpg"]
+    
+    # 1. Check file type
+    if file.content_type.lower() not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format '{file.content_type}'. Please upload JPEG, PNG, or PDF."
+        )
+
+    try:
+        # 2. Read file bytes
+        file_bytes = await file.read()
+        
+        # 3. Check file size (Max 10MB)
+        if len(file_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400, 
+                detail="File size exceeds the 10MB limit."
+            )
+
+        logger.info(f"File '{file.filename}' uploaded successfully for session '{session_id}'. Extracting OCR data...")
+
+        # 4. Trigger Vision OCR Extraction from LLM.py
+        ocr_result = llm_ocr_engine.extract_po_data_from_document(
+            file_bytes=file_bytes, 
+            mime_type=file.content_type
+        )
+
+        return DocumentUploadResponse(
+            status="success",
+            filename=file.filename,
+            message="Document processed and data extracted successfully via OCR.",
+            ocr_data=ocr_result
+        )
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.exception("Error handling document upload in /api/upload-po")
+        raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
+
 
 async def _execute_tool(tool_name: str, args: dict, session_id: Optional[str] = None):
     """Async because MCP-sourced tools (ERP/mcp_server.py, loaded via
@@ -445,7 +546,9 @@ _CLASSIFY_SYSTEM = (
     "supplying info the assistant just asked for, is the SAME task.\n"
     "- A greeting, thanks, or closing remark right after a task is finished "
     "does NOT start a new task; keep same_task=true with the same label.\n"
-    "- A request about a different customer/record/action/topic is a NEW task."
+    "- A request about a different customer/record/action/topic is a NEW task.\n"
+    "- INVOICE RULE: When user says 'Yes' to create/submit invoice after PO creation, DO NOT ask for invoice details if metadata was extracted from document.\n"
+    "- BUYING RULE: NEVER create an 'Opportunity' for a Supplier or Purchase Order."
 )
 
 
@@ -536,7 +639,16 @@ async def agent_node(state: ChatState) -> dict:
         return {"messages": [AIMessage(content=reply)]}
 
     retrieval_query = f"{task_context}. {last_user_msg}" if task_context else last_user_msg
-    candidate_tools = tool_rag.retrieve(retrieval_query)
+    candidate_tools = tool_rag.retrieve(retrieval_query) or []
+
+    # --- FIX: Force include critical invoice tools when context contains invoice/PO ---
+    candidate_names = {t.name for t in candidate_tools}
+    query_lower = retrieval_query.lower()
+
+    if any(k in query_lower for k in ["invoice", "purchase order", "po", "pur-ord"]):
+        if "create_purchase_invoice" in tool_map and "create_purchase_invoice" not in candidate_names:
+            candidate_tools.append(tool_map["create_purchase_invoice"])
+
     if not candidate_tools:
         reply = text_chain.invoke({"input": last_user_msg})
         return {"messages": [AIMessage(content=reply)]}

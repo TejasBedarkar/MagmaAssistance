@@ -45,6 +45,10 @@ from .purchase_write_tools import (
     FIELD_PARSERS as PURCHASE_FIELD_PARSERS,
 )
 from .capabilities_tools import CAPABILITY_TOOLS
+
+# NEW: Import OCR PO Tool
+from .ocr_po_tool import process_ocr_po_and_create_order
+
 ALL_TOOLS = [
     *SALES_WRITE_TOOLS,
     *INVENTORY_WRITE_TOOLS,
@@ -52,6 +56,7 @@ ALL_TOOLS = [
     *ACCOUNTS_WRITE_TOOLS,
     *PURCHASE_WRITE_TOOLS,
     *CAPABILITY_TOOLS,
+    process_ocr_po_and_create_order,  # Added OCR Tool here
 ]
 
 ALL_REQUIRED_FIELDS = {
@@ -69,13 +74,3 @@ ALL_FIELD_PARSERS = {
     **ACCOUNTS_FIELD_PARSERS,
     **PURCHASE_FIELD_PARSERS,
 }
-
-# Add more domains as you build them, e.g.:
-# from .support_tools import (
-#     SUPPORT_TOOLS,
-#     REQUIRED_FIELDS as SUPPORT_REQUIRED_FIELDS,
-#     FIELD_PARSERS as SUPPORT_FIELD_PARSERS,
-# )
-# ALL_TOOLS = [*ALL_TOOLS, *SUPPORT_TOOLS]
-# ALL_REQUIRED_FIELDS = {**ALL_REQUIRED_FIELDS, **SUPPORT_REQUIRED_FIELDS}
-# ALL_FIELD_PARSERS = {**ALL_FIELD_PARSERS, **SUPPORT_FIELD_PARSERS}
