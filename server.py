@@ -188,6 +188,45 @@ from ERP.tools.mcp_tools import mcp_tool_source
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent-server")
 
+# ---------------------------------------------------------------------
+# LangSmith tracing (optional -- no-op if LANGCHAIN_API_KEY isn't set)
+# ---------------------------------------------------------------------
+# LangChain/LangGraph runnables (assistant.llm.model, text_chain,
+# agent_graph) are auto-instrumented by LangSmith's callback handler the
+# moment LANGCHAIN_TRACING_V2=true and LANGCHAIN_API_KEY are present in
+# the environment -- no code changes needed for those. This block just:
+#   1. sets a sane default project name (so traces aren't dumped into
+#      LangSmith's "default" project) without clobbering one you already
+#      set in .env, and
+#   2. logs plainly at startup whether tracing is actually on, so a
+#      missing/typo'd key fails loud instead of silently not tracing.
+# LLM.py's raw `requests` calls to OpenAI Vision (extract_po_data_from_
+# document, extract_document_text, ask_about_document) do NOT go through
+# LangChain, so they are NOT auto-traced -- see the @traceable decorators
+# added on those functions instead, which report to the same project.
+#
+# Add to your .env to enable:
+#   LANGCHAIN_TRACING_V2=true
+#   LANGCHAIN_API_KEY=ls__...
+#   LANGCHAIN_PROJECT=magma-assistance      # optional, defaults below
+#   LANGCHAIN_ENDPOINT=https://api.smith.langchain.com   # optional
+os.environ.setdefault("LANGCHAIN_PROJECT", "magma-assistance")
+LANGSMITH_TRACING_ENABLED = (
+    os.environ.get("LANGCHAIN_TRACING_V2", "").lower() == "true"
+    and bool(os.environ.get("LANGCHAIN_API_KEY"))
+)
+if LANGSMITH_TRACING_ENABLED:
+    logger.info(
+        "LangSmith tracing ENABLED -- project='%s', endpoint='%s'",
+        os.environ.get("LANGCHAIN_PROJECT"),
+        os.environ.get("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com"),
+    )
+else:
+    logger.info(
+        "LangSmith tracing disabled (set LANGCHAIN_TRACING_V2=true and "
+        "LANGCHAIN_API_KEY in .env to enable)."
+    )
+
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
@@ -408,7 +447,25 @@ async def upload_purchase_order_file(
     session_id: str = Form("default")
 ):
     """
-    Handles PO Image / PDF file upload and runs Vision OCR extraction.
+    Handles PO Image / PDF file upload, runs Vision OCR extraction, and --
+    if the document actually looks like a Purchase Order -- creates it
+    directly in ERPNext right here via the OCR-aware auto-create tool
+    (process_ocr_po_and_create_order in ERP/tools/ocr_po_tool.py, which
+    matches-or-auto-creates the Supplier and Items).
+
+    This is deliberate: it does NOT hand the extracted data off to the
+    chat agent to decide which tool to call. That path is ambiguous --
+    the agent's tool-RAG retrieval can surface the generic
+    create_purchase_order tool (ERP/tools/purchase_write_tools.py)
+    instead, which requires an *already-existing* Supplier ID and Item
+    codes and fails outright ("supplier/item not found") rather than
+    auto-creating them like the OCR tool does. Calling the right tool
+    directly here removes that ambiguity entirely.
+
+    If the document doesn't look like a PO, nothing is created -- its
+    extracted text is stashed in document_store instead (same as
+    /api/upload-document), so the user can ask questions about it in
+    chat afterward.
     """
     allowed_types = ["image/jpeg", "image/png", "application/pdf", "image/jpg"]
     
@@ -432,16 +489,49 @@ async def upload_purchase_order_file(
 
         logger.info(f"File '{file.filename}' uploaded successfully for session '{session_id}'. Extracting OCR data...")
 
-        # 4. Trigger Vision OCR Extraction from LLM.py
+        # 4. Trigger Vision OCR Extraction from LLM.py. ocr_result["is_po"]
+        # tells us which branch this document fell into.
         ocr_result = llm_ocr_engine.extract_po_data_from_document(
             file_bytes=file_bytes, 
             mime_type=file.content_type
         )
 
+        if not ocr_result.get("is_po"):
+            # Not a recognizable PO -- store its text for chat Q&A
+            # instead of attempting (and failing) to create anything.
+            document_store[session_id] = {
+                "filename": file.filename,
+                "text": ocr_result.get("raw_text", ""),
+                "injected": False,
+            }
+            return DocumentUploadResponse(
+                status="not_a_po",
+                filename=file.filename,
+                message=ocr_result.get(
+                    "note", "This document doesn't look like a Purchase Order."
+                ) + " You can ask questions about it in chat.",
+                ocr_data=ocr_result
+            )
+
+        # 5. It IS a PO -- create it directly via the OCR-aware auto-create
+        # tool (matches/auto-creates Supplier + Items), bypassing the chat
+        # agent's tool selection for this flow.
+        create_args = {
+            "vendor_name": ocr_result.get("vendor_name", ""),
+            "items": ocr_result.get("items", []),
+            "po_number": ocr_result.get("po_number", ""),
+            "delivery_date": ocr_result.get("delivery_date", ""),
+            "remarks": ocr_result.get("payment_terms", ""),
+        }
+        creation_result = await _execute_tool(
+            "process_ocr_po_and_create_order", create_args, session_id=session_id
+        )
+        logger.info("PO auto-create result: %s", creation_result)
+
         return DocumentUploadResponse(
             status="success",
             filename=file.filename,
-            message="Document processed and data extracted successfully via OCR.",
+            message=str(creation_result),
             ocr_data=ocr_result
         )
 
@@ -450,6 +540,7 @@ async def upload_purchase_order_file(
     except Exception as e:
         logger.exception("Error handling document upload in /api/upload-po")
         raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
+
 
 
 # =====================================================================
@@ -683,6 +774,22 @@ def classify_task_node(state: ChatState) -> dict:
     return {"current_task": task_label}
 
 
+def _plain_reply(history, task_context: Optional[str] = None) -> str:
+    """Used when no ERP tool is needed for this turn (plain chat, or
+    Q&A about an uploaded document). Unlike text_chain.invoke(), which
+    only ever sees the single latest message, this sends the full
+    trimmed history -- including any injected '[System note: the user
+    uploaded a document...]' context from generate_reply() -- so a
+    follow-up like 'solve problem 3 from that PDF' actually has the
+    document content available instead of being answered blind."""
+    system_parts = [assistant.llm.system_prompt]
+    if task_context:
+        system_parts.append(f"\nCurrent task in progress: {task_context}.")
+    call_messages = [SystemMessage(content="\n".join(system_parts)), *history]
+    response = assistant.llm.model.invoke(call_messages)
+    return response.content
+
+
 async def agent_node(state: ChatState) -> dict:
     """Retrieve-tools -> call-LLM -> call-tool turn, same logic as the
     original generate_reply, now working off the trimmed short-term
@@ -701,13 +808,13 @@ async def agent_node(state: ChatState) -> dict:
     )
 
     if not tool_rag:
-        reply = text_chain.invoke({"input": last_user_msg})
+        reply = _plain_reply(history, task_context)
         return {"messages": [AIMessage(content=reply)]}
 
     retrieval_query = f"{task_context}. {last_user_msg}" if task_context else last_user_msg
     candidate_tools = tool_rag.retrieve(retrieval_query)
     if not candidate_tools:
-        reply = text_chain.invoke({"input": last_user_msg})
+        reply = _plain_reply(history, task_context)
         return {"messages": [AIMessage(content=reply)]}
 
     logger.info("Tools selected for query: %s", [t.name for t in candidate_tools])
@@ -804,7 +911,7 @@ async def execute_pending_node(state: ChatState) -> dict:
     }
 
 
-def build_agent_graph(checkpointer=None):
+def build_agent_graph(checkpointer=None, use_platform_persistence=False):
     graph = StateGraph(ChatState)
     graph.add_node("intake", intake_node)
     graph.add_node("classify_task", classify_task_node)
@@ -819,13 +926,19 @@ def build_agent_graph(checkpointer=None):
     graph.add_edge("agent", END)
     graph.add_edge("execute_pending", END)
 
+    if use_platform_persistence:
+        # LangGraph Studio / `langgraph dev` manage checkpointing
+        # themselves and error out if the graph already has one baked in.
+        return graph.compile()
     return graph.compile(checkpointer=checkpointer or MemorySaver())
 
 
-# Built once at import time; nodes read `tool_rag`/`tool_map` as globals at
-# call time, so they still pick up the MCP tools merged in during the
-# FastAPI lifespan startup handler above, without needing to rebuild this.
-agent_graph = build_agent_graph()
+agent_graph = build_agent_graph()  # used by your FastAPI server, unchanged
+
+
+def build_studio_graph():
+    """Entry point for langgraph.json / Studio only."""
+    return build_agent_graph(use_platform_persistence=True)
 
 
 async def generate_reply(text: str, session_id: str = "default") -> str:
@@ -860,7 +973,15 @@ async def generate_reply(text: str, session_id: str = "default") -> str:
         initial_messages = [SystemMessage(content=doc_context)] + initial_messages
         doc["injected"] = True
 
-    config = {"configurable": {"thread_id": session_id}}
+    config = {
+        "configurable": {"thread_id": session_id},
+        # Purely for LangSmith trace organization -- harmless no-op when
+        # tracing is disabled. Lets you filter/search runs by session in
+        # the LangSmith UI instead of scrolling through everything.
+        "run_name": "magma-agent-turn",
+        "tags": [f"session:{session_id}"],
+        "metadata": {"session_id": session_id},
+    }
     result = await agent_graph.ainvoke(
         {"messages": initial_messages, "session_id": session_id}, config
     )
