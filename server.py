@@ -20,7 +20,9 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 
 from LLM.LLM import LLM
-import audit_log
+import db.postgres_audit_log as audit_log
+from db.init_db import apply_schema
+from storage import s3_storage
 
 # Helper function to convert messages to dictionary format for the OpenAI API
 def convert_message_to_dict(message):
@@ -270,6 +272,21 @@ async def lifespan(app: FastAPI):
     """
     global tool_rag, tool_map
 
+    # Creates sessions / audit_log / file_uploads in Postgres if they
+    # don't exist yet (schema.sql is idempotent, so this is safe to run
+    # on every startup, not just the first). Doesn't crash the server if
+    # Postgres is misconfigured/unreachable -- it logs instead, so the
+    # rest of the app still comes up; audit logging just won't work
+    # until PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE are fixed in .env.
+    try:
+        apply_schema()
+        logger.info("Postgres audit-log schema ready.")
+    except Exception:
+        logger.exception(
+            "Could not apply Postgres schema -- check PGHOST/PGPORT/PGUSER/"
+            "PGPASSWORD/PGDATABASE in .env. Audit logging will fail until this is fixed."
+        )
+
     try:
         mcp_tools = await mcp_tool_source.start()
         if mcp_tools:
@@ -339,6 +356,7 @@ class ChatState(TypedDict):
     pending_tool: Optional[str]
     pending_missing: list  # ordered [(field, question), ...] still to collect
     session_id: str        # thread id, passed through so nodes can attribute audit_log entries
+    user_id: Optional[str] # who prompted this turn, passed through for the same reason
 
 
 def _missing_fields(tool_name: str, args: dict) -> list:
@@ -444,7 +462,8 @@ class DocumentUploadResponse(BaseModel):
 @app.post("/api/upload-po", response_model=DocumentUploadResponse)
 async def upload_purchase_order_file(
     file: UploadFile = File(...),
-    session_id: str = Form("default")
+    session_id: str = Form("default"),
+    user_id: str = Form("anonymous"),
 ):
     """
     Handles PO Image / PDF file upload, runs Vision OCR extraction, and --
@@ -489,6 +508,18 @@ async def upload_purchase_order_file(
 
         logger.info(f"File '{file.filename}' uploaded successfully for session '{session_id}'. Extracting OCR data...")
 
+        # 3.5. Store the original file in S3 and record who uploaded it
+        # and when -- independent of whether OCR later decides it's a PO
+        # or not, so the original document is never lost.
+        upload_meta = s3_storage.upload_file(
+            file_bytes=file_bytes,
+            original_filename=file.filename,
+            content_type=file.content_type,
+            upload_kind="purchase_order",
+            session_id=session_id,
+            user_id=user_id,
+        )
+
         # 4. Trigger Vision OCR Extraction from LLM.py. ocr_result["is_po"]
         # tells us which branch this document fell into.
         ocr_result = llm_ocr_engine.extract_po_data_from_document(
@@ -504,6 +535,9 @@ async def upload_purchase_order_file(
                 "text": ocr_result.get("raw_text", ""),
                 "injected": False,
             }
+            audit_log.record_file_upload(
+                **upload_meta, extracted_metadata=ocr_result, status="processed",
+            )
             return DocumentUploadResponse(
                 status="not_a_po",
                 filename=file.filename,
@@ -524,9 +558,14 @@ async def upload_purchase_order_file(
             "remarks": ocr_result.get("payment_terms", ""),
         }
         creation_result = await _execute_tool(
-            "process_ocr_po_and_create_order", create_args, session_id=session_id
+            "process_ocr_po_and_create_order", create_args, session_id=session_id,
+            user_id=user_id, prompt_text=f"[uploaded PO file '{file.filename}']",
         )
         logger.info("PO auto-create result: %s", creation_result)
+
+        audit_log.record_file_upload(
+            **upload_meta, extracted_metadata=ocr_result, status="processed",
+        )
 
         return DocumentUploadResponse(
             status="success",
@@ -567,6 +606,7 @@ class GeneralDocumentUploadResponse(BaseModel):
 async def upload_general_document(
     file: UploadFile = File(...),
     session_id: str = Form("default"),
+    user_id: str = Form("anonymous"),
 ):
     """Reads ANY PDF or image (not just Purchase Orders), extracts its
     full text, and stores it against session_id so the user can ask
@@ -585,6 +625,16 @@ async def upload_general_document(
             raise HTTPException(status_code=400, detail="File size exceeds the 10MB limit.")
 
         logger.info(f"File '{file.filename}' uploaded for session '{session_id}'. Extracting document text...")
+
+        upload_meta = s3_storage.upload_file(
+            file_bytes=file_bytes,
+            original_filename=file.filename,
+            content_type=file.content_type,
+            upload_kind="general_document",
+            session_id=session_id,
+            user_id=user_id,
+        )
+
         extraction = llm_ocr_engine.extract_document_text(file_bytes=file_bytes, mime_type=file.content_type)
 
         document_store[session_id] = {
@@ -592,6 +642,16 @@ async def upload_general_document(
             "text": extraction["text"],
             "injected": False,
         }
+
+        audit_log.record_file_upload(
+            **upload_meta,
+            extracted_metadata={
+                "page_count": extraction["page_count"],
+                "pages_read": extraction["pages_read"],
+                "method": extraction["method"],
+            },
+            status="processed",
+        )
 
         return GeneralDocumentUploadResponse(
             status="success",
@@ -611,7 +671,13 @@ async def upload_general_document(
         raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
 
 
-async def _execute_tool(tool_name: str, args: dict, session_id: Optional[str] = None):
+async def _execute_tool(
+    tool_name: str,
+    args: dict,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    prompt_text: Optional[str] = None,
+):
     """Async because MCP-sourced tools (ERP/mcp_server.py, loaded via
     ERP/tools/mcp_tools.py) only implement `.ainvoke()`, not the sync
     `.invoke()`. This works transparently for the existing local
@@ -619,26 +685,39 @@ async def _execute_tool(tool_name: str, args: dict, session_id: Optional[str] = 
     tool's normal invoke() under the hood when no native async
     implementation exists, so no other tool code needed to change.
 
-    Every call is written to the audit log (session_id, tool, args,
-    result) regardless of success — this is the one choke point all tool
-    execution passes through, so it's the cheapest place to record "what
-    actions did the agent actually take" for later review."""
+    Every call is written to the Postgres audit log (session_id, tool,
+    args, result, how long it took, and who prompted it) regardless of
+    success — this is the one choke point all tool execution passes
+    through, so it's the cheapest place to record "what actions did the
+    agent actually take" for later review."""
     tool = tool_map.get(tool_name)
     if tool is None:
         result = f"Tool '{tool_name}' is not available."
         if session_id:
-            audit_log.log_turn(session_id, "tool", result, tool_name=tool_name, tool_args=args)
+            audit_log.log_turn(
+                session_id, "tool", result, tool_name=tool_name, tool_args=args,
+                user_id=user_id, prompt_text=prompt_text, tool_status="not_found",
+            )
         return result
     try:
-        result = await tool.ainvoke(_sanitize_tool_args(tool_name, args) or {})
+        with audit_log.time_tool_call() as elapsed:
+            result = await tool.ainvoke(_sanitize_tool_args(tool_name, args) or {})
         if session_id:
-            audit_log.log_turn(session_id, "tool", str(result), tool_name=tool_name, tool_args=args)
+            audit_log.log_turn(
+                session_id, "tool", str(result), tool_name=tool_name, tool_args=args,
+                user_id=user_id, prompt_text=prompt_text, tool_status="success",
+                duration_ms=elapsed(),
+            )
         return result
-    except Exception:
+    except Exception as e:
         logger.exception("Tool '%s' failed", tool_name)
         failure = f"'{tool_name}' failed to fetch ERP data right now."
         if session_id:
-            audit_log.log_turn(session_id, "tool", failure, tool_name=tool_name, tool_args=args)
+            audit_log.log_turn(
+                session_id, "tool", failure, tool_name=tool_name, tool_args=args,
+                user_id=user_id, prompt_text=prompt_text, tool_status="error",
+                error_message=str(e),
+            )
         return failure
 
 
@@ -861,7 +940,11 @@ async def agent_node(state: ChatState) -> dict:
 
     results = []
     for tool_call in tool_calls:
-        result = await _execute_tool(tool_call["name"], tool_call.get("args") or {}, session_id=state.get("session_id"))
+        result = await _execute_tool(
+            tool_call["name"], tool_call.get("args") or {},
+            session_id=state.get("session_id"), user_id=state.get("user_id"),
+            prompt_text=last_user_msg,
+        )
         logger.info("Tool '%s' raw result: %s", tool_call["name"], result)
         results.append((tool_call, result))
 
@@ -894,7 +977,11 @@ async def execute_pending_node(state: ChatState) -> dict:
     tool_name = state["pending_tool"]
     args = state.get("task_slots") or {}
 
-    result = await _execute_tool(tool_name, args, session_id=state.get("session_id"))
+    result = await _execute_tool(
+        tool_name, args, session_id=state.get("session_id"),
+        user_id=state.get("user_id"),
+        prompt_text=_last_human_message(state["messages"]),
+    )
     logger.info("Tool '%s' raw result: %s", tool_name, result)
 
     summary_prompt = (
@@ -941,7 +1028,7 @@ def build_studio_graph():
     return build_agent_graph(use_platform_persistence=True)
 
 
-async def generate_reply(text: str, session_id: str = "default") -> str:
+async def generate_reply(text: str, session_id: str = "default", user_id: Optional[str] = None) -> str:
     """Returns the assistant's reply text for a user message.
 
     `session_id` is a LangGraph checkpointer thread_id: it carries the
@@ -949,12 +1036,17 @@ async def generate_reply(text: str, session_id: str = "default") -> str:
     any open slot-filling flow (task-context memory) across calls, in
     place of the old global `_pending_actions` dict.
 
+    `user_id` identifies who prompted this turn -- pass it from your
+    auth layer once you have one; defaults to "anonymous" so logging
+    still works without auth wired up yet.
+
     Separately, every user message, assistant reply, and tool action for
-    this session is written to `audit_log` (SQLite, durable across
-    restarts) so a company can pull up exactly what was discussed and
-    done in any session later — see /api/audit/sessions below.
+    this session is written to `audit_log` (Postgres, durable across
+    restarts), including how long each step took and who prompted it --
+    see /api/audit/sessions below.
     """
-    audit_log.log_turn(session_id, "user", text)
+    user_id = user_id or "anonymous"
+    audit_log.log_turn(session_id, "user", text, user_id=user_id, prompt_text=text)
 
     initial_messages = [HumanMessage(content=text)]
 
@@ -982,12 +1074,17 @@ async def generate_reply(text: str, session_id: str = "default") -> str:
         "tags": [f"session:{session_id}"],
         "metadata": {"session_id": session_id},
     }
-    result = await agent_graph.ainvoke(
-        {"messages": initial_messages, "session_id": session_id}, config
-    )
+    with audit_log.time_tool_call() as elapsed:
+        result = await agent_graph.ainvoke(
+            {"messages": initial_messages, "session_id": session_id, "user_id": user_id},
+            config,
+        )
     reply = result["messages"][-1].content
 
-    audit_log.log_turn(session_id, "assistant", reply)
+    audit_log.log_turn(
+        session_id, "assistant", reply, user_id=user_id, prompt_text=text,
+        duration_ms=elapsed(),
+    )
     return reply
 
 def _get_tts_audio(text: str):
@@ -1007,6 +1104,7 @@ class ChatRequest(BaseModel):
     message: str
 
     session_id: str = "default"
+    user_id: Optional[str] = None  # who's asking -- pass from auth/frontend once available
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
@@ -1020,7 +1118,7 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="message is required")
 
     try:
-        reply = await generate_reply(text, req.session_id)
+        reply = await generate_reply(text, req.session_id, user_id=req.user_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent failed to process message: %s", text)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -1041,6 +1139,7 @@ async def handle_query(
 
     file: UploadFile = File(None),
     session_id: str = Form("default"),
+    user_id: str = Form("anonymous"),
 
 ):
     """Exposes endpoint to query MagmaAssistance using either text or audio files."""
@@ -1074,7 +1173,7 @@ async def handle_query(
 
     # 2. Get response from MagmaAssistance agent
     logger.info(f"Processing query: '{query_text}'")
-    response_text = await generate_reply(query_text, session_id)
+    response_text = await generate_reply(query_text, session_id, user_id=user_id)
 
     # 3. Synthesize the reply to speech too, same as /api/chat, so the
     # frontend has something to play regardless of which endpoint it uses.
