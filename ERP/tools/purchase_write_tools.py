@@ -36,15 +36,6 @@ Add this list to ERP/tools/__init__.py:
     ALL_TOOLS = [*SALES_TOOLS, *SALES_WRITE_TOOLS, *LEAD_TOOLS, *PURCHASE_WRITE_TOOLS]
 """
 
-# Add at Line 1 of ERP/tools/purchase_write_tools.py
-import os
-from pathlib import Path
-from dotenv import load_dotenv
-
-env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-load_dotenv(dotenv_path=env_path)
-load_dotenv()
-
 from datetime import date
 from typing import Optional
 
@@ -83,19 +74,18 @@ def create_supplier(
     email_id: Optional[str] = None,
     mobile_no: Optional[str] = None,
 ):
-    """Create a new Supplier in ERPNext manually. `supplier_name` is required (e.g. 'Global
-    Steel Supplies'). `supplier_group` falls back to 'All Supplier Groups' if not provided or invalid.
-    `supplier_type` should be 'Company' or 'Individual'. If `email_id` or `mobile_no` is given,
-    a linked Contact is created automatically."""
+    """Create a new Supplier. `supplier_name` is required (e.g. 'Global
+    Steel Supplies'). `supplier_group` falls back to your ERPNext site's
+    configured default if not given. `supplier_type` should be 'Company'
+    or 'Individual'. If `email_id` or `mobile_no` is given, a linked
+    Contact is also created, since ERPNext stores contact details on
+    Contact rather than on Supplier itself."""
 
     def run():
-        # Fallback for supplier_group to avoid ERPNext 417 Expectation Failed
-        final_supplier_group = supplier_group or "All Supplier Groups"
-
         supplier_data = _payload(
             supplier_name=supplier_name,
-            supplier_group=final_supplier_group,
-            supplier_type=supplier_type or "Company",
+            supplier_group=supplier_group,
+            supplier_type=supplier_type,
             country=country,
         )
         supplier = erp_client.create_doc("Supplier", supplier_data)
@@ -158,10 +148,13 @@ def create_purchase_order(
     schedule_date: Optional[str] = None,
     submit: bool = False,
 ):
-    """MANUAL TOOL: Create a new Purchase Order for an existing supplier from user prompt arguments.
-    `supplier` is the Supplier ID/Name. `items` is a list of line items dict like
-    {"item_code": "ITEM-001", "qty": 50, "rate": 1200}. `schedule_date` defaults to today (YYYY-MM-DD).
-    NOTE: Do NOT use this tool for processing uploaded PDF/Image documents (use process_ocr_po_and_create_order instead)."""
+    """Create a new Purchase Order for a supplier. `supplier` is the
+    Supplier ID. `items` is a list of line items, each a dict like
+    {"item_code": "ITEM-001", "qty": 50, "rate": 1200} — at least one
+    item is required. `schedule_date` should be YYYY-MM-DD, defaults to
+    today. Set `submit` true to submit it immediately rather than leave
+    it as a draft. Use for requests like 'raise a purchase order with
+    Global Steel Supplies for 50 units of ITEM-001 at 1200 each'."""
 
     def run():
         data = _payload(
@@ -220,14 +213,17 @@ def create_purchase_invoice(
     """Create a new Purchase Invoice (a supplier's bill) for a supplier.
     `supplier` is the Supplier ID. `items` is a list of line items, each
     a dict like {"item_code": "ITEM-001", "qty": 50, "rate": 1200} — at
-    least one item is required. `due_date` should be YYYY-MM-DD (defaults to today if missing).
-    Set `submit` true to submit it immediately rather than leave it as a draft."""
+    least one item is required. `due_date` should be YYYY-MM-DD. Set
+    `submit` true to submit it immediately rather than leave it as a
+    draft — an unsubmitted bill won't show up as outstanding/payable.
+    Use for requests like 'record a purchase invoice from Global Steel
+    Supplies for 50 units of ITEM-001 at 1200 each'."""
 
     def run():
         data = _payload(
             supplier=supplier,
             posting_date=date.today().isoformat(),
-            due_date=due_date or date.today().isoformat(),
+            due_date=due_date,
             items=items,
         )
         result = erp_client.create_doc("Purchase Invoice", data)

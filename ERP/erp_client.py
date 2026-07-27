@@ -26,14 +26,12 @@ import logging
 import os
 import time
 
-from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-# Project root folder se exact .env file locate karke load karein
-env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(dotenv_path=env_path)
-load_dotenv()  # Fallback current directory
+load_dotenv()
+
+logger = logging.getLogger("erp-client")
 
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_CACHE_TTL_SECONDS = 45
@@ -41,36 +39,19 @@ DEFAULT_CACHE_TTL_SECONDS = 45
 
 class ERPClient:
     def __init__(self, cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS):
-        # Multi-variable Fallback Support
-        self.base_url = (
-            os.getenv("ERP_URL") 
-            or os.getenv("ERPNEXT_URL") 
-            or os.getenv("FRAPPE_URL") 
-            or ""
-        ).rstrip("/")
-
-        self.api_key = (
-            os.getenv("ERP_API_KEY") 
-            or os.getenv("ERPNEXT_API_KEY") 
-            or os.getenv("FRAPPE_API_KEY")
-        )
-
-        self.api_secret = (
-            os.getenv("ERP_API_SECRET") 
-            or os.getenv("ERPNEXT_API_SECRET") 
-            or os.getenv("FRAPPE_API_SECRET")
-        )
-
+        self.base_url = (os.getenv("ERP_URL") or "").rstrip("/")
+        self.api_key = os.getenv("ERP_API_KEY")
+        self.api_secret = os.getenv("ERP_API_SECRET")
         self.cache_ttl_seconds = cache_ttl_seconds
 
         if not self.base_url:
-            logging.warning("ERP_URL is not set — ERP tools will fail until it's configured in .env")
+            logger.warning("ERP_URL is not set — ERP tools will fail until it's configured in .env")
 
         self.session = requests.Session()
         if self.api_key and self.api_secret:
             self.session.headers.update({"Authorization": f"token {self.api_key}:{self.api_secret}"})
         else:
-            logging.warning(
+            logger.warning(
                 "ERP_API_KEY / ERP_API_SECRET not set — ERP requests will be "
                 "unauthenticated and will likely fail with a 403."
             )
@@ -234,25 +215,7 @@ class ERPClient:
         response = self.session.post(
             url, json=data, timeout=DEFAULT_TIMEOUT_SECONDS, headers={"Expect": ""}
         )
-        
-        # Detailed Error Reporting for ERPNext Validation Rules
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            error_details = ""
-            try:
-                err_json = response.json()
-                if "_server_messages" in err_json:
-                    messages = json.loads(err_json["_server_messages"])
-                    error_details = " | ERPNext Rule Failure: " + " ".join([json.loads(m).get("message", "") for m in messages])
-                elif "exception" in err_json:
-                    error_details = f" | Exception: {err_json['exception']}"
-                elif "message" in err_json:
-                    error_details = f" | Message: {err_json['message']}"
-            except Exception:
-                error_details = f" | Raw Response: {response.text}"
-            
-            raise requests.exceptions.HTTPError(f"{e}{error_details}", response=response)
+        response.raise_for_status()
 
         # A create can affect list reads (e.g. a new Lead should show up
         # in a subsequent get_list("Lead", ...)) so clear the read cache,
@@ -279,23 +242,7 @@ class ERPClient:
         response = self.session.put(
             url, json=data, timeout=DEFAULT_TIMEOUT_SECONDS, headers={"Expect": ""}
         )
-        
-        # Detailed Error Reporting for ERPNext Validation Rules
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            error_details = ""
-            try:
-                err_json = response.json()
-                if "_server_messages" in err_json:
-                    messages = json.loads(err_json["_server_messages"])
-                    error_details = " | ERPNext Rule Failure: " + " ".join([json.loads(m).get("message", "") for m in messages])
-                elif "exception" in err_json:
-                    error_details = f" | Exception: {err_json['exception']}"
-            except Exception:
-                error_details = f" | Raw Response: {response.text}"
-            
-            raise requests.exceptions.HTTPError(f"{e}{error_details}", response=response)
+        response.raise_for_status()
 
         self._cache.clear()
 

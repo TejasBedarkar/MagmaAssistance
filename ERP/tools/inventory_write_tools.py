@@ -193,6 +193,7 @@ def update_material_request(
 
 @tool
 def create_stock_entry(
+    company: str,
     items: list,
     stock_entry_type: Optional[str] = None,
     from_warehouse: Optional[str] = None,
@@ -201,18 +202,23 @@ def create_stock_entry(
 ):
     """Create a new Stock Entry — an actual movement of stock, e.g.
     transferring items between warehouses, issuing material out, or
-    receiving material in. `items` is a list of line items, each a dict
-    like {"item_code": "ITEM-001", "qty": 20} — at least one item is
-    required. `stock_entry_type` should be one of 'Material Transfer',
-    'Material Issue', 'Material Receipt', or 'Manufacture' (defaults to
-    'Material Transfer'). `from_warehouse`/`to_warehouse` are required
-    depending on the type (Transfer needs both, Issue needs from,
-    Receipt needs to). Set `submit` true to submit it immediately rather
-    than leave it as a draft. Use for requests like 'move 20 units of
-    ITEM-001 from Stores to Finished Goods warehouse'."""
+    receiving material in. `company` and `items` are required — `items`
+    is a list of line items, each a dict like {"item_code": "ITEM-001",
+    "qty": 20}, at least one required. `stock_entry_type` should be one
+    of 'Material Transfer', 'Material Issue', 'Material Receipt', or
+    'Manufacture' (defaults to 'Material Transfer'). `from_warehouse`/
+    `to_warehouse` are required depending on the type (Transfer needs
+    both, Issue needs from, Receipt needs to). Set `submit` true to
+    submit it immediately rather than leave it as a draft. Use for
+    requests like 'move 20 units of ITEM-001 from Stores to Finished
+    Goods warehouse'. For manufacturing-specific movements (material
+    transfer into WIP, or finished-goods receipt out of a Work Order),
+    use create_manufacture_stock_entry instead, which links the entry to
+    the Work Order."""
 
     def run():
         data = _payload(
+            company=company,
             stock_entry_type=stock_entry_type or "Material Transfer",
             from_warehouse=from_warehouse,
             to_warehouse=to_warehouse,
@@ -263,6 +269,7 @@ REQUIRED_FIELDS = {
         ("material_request_id", "Which material request should I update? (e.g. MAT-MR-2026-00001)"),
     ],
     "create_stock_entry": [
+        ("company", "Which company is this stock entry for?"),
         (
             "items",
             "What items are moving? Give each as 'item code, quantity' — "
