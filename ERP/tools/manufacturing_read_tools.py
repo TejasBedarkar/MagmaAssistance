@@ -284,6 +284,169 @@ def get_stock_balance(item_code: str, warehouse: Optional[str] = None):
     return _safe_call(f"look up stock balance for {item_code}", run)
 
 
+# ---------------------------------------------------------------------
+# Item Lead Time
+# ---------------------------------------------------------------------
+
+@tool
+def get_item_lead_time(item_lead_time_id: str):
+    """Look up a single Item Lead Time record by its ID — returns the
+    item, shift time, number of shifts, number of workstations, and
+    manufacturing time. Use for requests like 'what's the lead time
+    setup for ITEM-FG-001?' (if you don't have the record ID, use
+    list_item_lead_times with an item_code filter instead)."""
+
+    def run():
+        doc = erp_client.get_doc("Item Lead Time", item_lead_time_id)
+        return str(doc)
+
+    return _safe_call(f"look up item lead time {item_lead_time_id}", run)
+
+
+@tool
+def list_item_lead_times(item_code: Optional[str] = None, limit: int = 20):
+    """List Item Lead Time records, optionally filtered by `item_code`.
+    Returns the most recent `limit` matches (default 20). Use for
+    requests like 'show me the lead time records for ITEM-FG-001' or
+    'list all item lead times'."""
+
+    def run():
+        # Field names on this doctype (shift/workstation/manufacturing
+        # time columns) are still unconfirmed on your instance — a prior
+        # guess (shift_hours) came back "Field not permitted in query",
+        # so this fetches every field (fields=["*"]) instead of naming
+        # them, to avoid guessing wrong again. Once you confirm the real
+        # column names (e.g. via `frappe.get_meta("Item Lead Time")` in
+        # bench console), swap this back to an explicit fields list.
+        records = erp_client.get_list(
+            "Item Lead Time",
+            fields=["*"],
+            filters=_filters(item_code=item_code),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No item lead time records found matching that criteria.")
+
+    return _safe_call("list item lead times", run)
+
+
+# ---------------------------------------------------------------------
+# Master Production Schedule
+# ---------------------------------------------------------------------
+
+@tool
+def get_master_production_schedule(master_production_schedule_id: str):
+    """Look up a single Master Production Schedule by its ID — returns
+    its company, from/to dates, and status. Use for requests like
+    'what's on master production schedule MPS-00001?'."""
+
+    def run():
+        doc = erp_client.get_doc("Master Production Schedule", master_production_schedule_id)
+        return str(doc)
+
+    return _safe_call(f"look up master production schedule {master_production_schedule_id}", run)
+
+
+@tool
+def list_master_production_schedules(company: Optional[str] = None, limit: int = 20):
+    """List Master Production Schedules, optionally filtered by
+    `company`. Returns the most recent `limit` matches (default 20).
+    Use for requests like 'show me production schedules for Acme
+    Corp'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Master Production Schedule",
+            fields=["name", "company", "from_date", "to_date", "docstatus"],
+            filters=_filters(company=company),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(
+            records, "No master production schedules found matching that criteria."
+        )
+
+    return _safe_call("list master production schedules", run)
+
+
+# ---------------------------------------------------------------------
+# Downtime Entry
+# ---------------------------------------------------------------------
+
+@tool
+def get_downtime_entry(downtime_entry_id: str):
+    """Look up a single Downtime Entry by its ID — returns the
+    workstation, operator, start/end time, stop reason, and total
+    downtime. Use for requests like 'what caused downtime entry
+    DT-00001?'."""
+
+    def run():
+        doc = erp_client.get_doc("Downtime Entry", downtime_entry_id)
+        return str(doc)
+
+    return _safe_call(f"look up downtime entry {downtime_entry_id}", run)
+
+
+@tool
+def list_downtime_entries(
+    workstation: Optional[str] = None,
+    operator: Optional[str] = None,
+    limit: int = 20,
+):
+    """List Downtime Entries, optionally filtered by `workstation`
+    and/or `operator` (an Employee ID). Returns the most recent `limit`
+    matches (default 20). Use for requests like 'show me downtime on
+    Assembly Line 1' or 'how much downtime has HR-EMP-00007 logged?'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Downtime Entry",
+            fields=["name", "workstation", "operator", "from_time", "to_time", "stop_reason"],
+            filters=_filters(workstation=workstation, operator=operator),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No downtime entries found matching that criteria.")
+
+    return _safe_call("list downtime entries", run)
+
+
+# ---------------------------------------------------------------------
+# Sales Forecast
+# ---------------------------------------------------------------------
+
+@tool
+def get_sales_forecast(sales_forecast_id: str):
+    """Look up a single Sales Forecast by its ID — returns the forecast
+    items, demand quantities, and parent warehouse. Use for requests
+    like 'what's on sales forecast SF-00001?'."""
+
+    def run():
+        doc = erp_client.get_doc("Sales Forecast", sales_forecast_id)
+        return str(doc)
+
+    return _safe_call(f"look up sales forecast {sales_forecast_id}", run)
+
+
+@tool
+def list_sales_forecasts(parent_warehouse: Optional[str] = None, limit: int = 20):
+    """List Sales Forecasts, optionally filtered by `parent_warehouse`.
+    Returns the most recent `limit` matches (default 20). Use for
+    requests like 'show me sales forecasts for the Main Warehouse'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Sales Forecast",
+            fields=["name", "parent_warehouse", "docstatus"],
+            filters=_filters(parent_warehouse=parent_warehouse),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No sales forecasts found matching that criteria.")
+
+    return _safe_call("list sales forecasts", run)
+
+
 MANUFACTURING_READ_TOOLS = [
     get_work_order,
     list_work_orders,
@@ -293,6 +456,14 @@ MANUFACTURING_READ_TOOLS = [
     list_job_cards,
     list_manufacture_stock_entries,
     get_stock_balance,
+    get_item_lead_time,
+    list_item_lead_times,
+    get_master_production_schedule,
+    list_master_production_schedules,
+    get_downtime_entry,
+    list_downtime_entries,
+    get_sales_forecast,
+    list_sales_forecasts,
 ]
 
 
@@ -314,6 +485,18 @@ REQUIRED_FIELDS = {
     ],
     "get_stock_balance": [
         ("item_code", "Which item's stock balance do you want to check?"),
+    ],
+    "get_item_lead_time": [
+        ("item_lead_time_id", "Which item lead time record? (its ID)"),
+    ],
+    "get_master_production_schedule": [
+        ("master_production_schedule_id", "Which master production schedule? (its ID)"),
+    ],
+    "get_downtime_entry": [
+        ("downtime_entry_id", "Which downtime entry? (its ID)"),
+    ],
+    "get_sales_forecast": [
+        ("sales_forecast_id", "Which sales forecast? (its ID)"),
     ],
 }
 
