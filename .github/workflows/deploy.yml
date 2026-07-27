@@ -1,0 +1,39 @@
+name: Deploy MagmaAssistance Backend
+
+on:
+  push:
+    branches:
+      - Development
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.2.2
+
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+
+          script: |
+            set -e
+
+            cd /home/ubuntu/MagmaAssistance
+
+            git fetch origin
+            git checkout Development
+            git pull origin Development
+
+            source venv/bin/activate
+
+            pip install -r requirements.txt
+
+            sudo systemctl restart magmaassistance.service
+
+            sudo systemctl status magmaassistance.service --no-pager
+
+            echo "Deployment completed successfully."
