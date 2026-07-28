@@ -71,16 +71,15 @@ def _payload(**kwargs):
 @tool
 def create_item(
     item_code: str,
+    item_group: str,
+    stock_uom: str,
     item_name: Optional[str] = None,
-    item_group: Optional[str] = None,
-    stock_uom: Optional[str] = None,
     is_stock_item: bool = True,
     description: Optional[str] = None,
 ):
-    """Create a new Item (product/SKU). `item_code` is required and must
-    be unique (e.g. 'ITEM-001'). `item_group` and `stock_uom` fall back
-    to your ERPNext site's configured defaults if not given. Use for
-    requests like 'add a new item ITEM-100, name Steel Bolt, group Raw
+    """Create a new Item (product/SKU). `item_code` (unique ID), `item_group`,
+    and `stock_uom` (default unit of measure) are all REQUIRED essentials.
+    Use for requests like 'create a new item with code ITEM-100, group Raw
     Material, UOM Nos'."""
 
     def run():
@@ -105,10 +104,14 @@ def update_item(
     item_group: Optional[str] = None,
     description: Optional[str] = None,
     disabled: Optional[bool] = None,
+    is_stock_item: Optional[bool] = None,
+    is_fixed_asset: Optional[bool] = None,
+    asset_category: Optional[str] = None,
 ):
     """Update an existing Item identified by its item_code. Only the
     fields provided are changed. Use for requests like 'rename ITEM-001
-    to Hex Bolt 10mm' or 'disable ITEM-050'."""
+    to Hex Bolt 10mm', 'disable ITEM-050', 'set is_fixed_asset to True
+    on ITEM-100', or 'change Maintain Stock to False'."""
 
     def run():
         data = _payload(
@@ -116,6 +119,9 @@ def update_item(
             item_group=item_group,
             description=description,
             disabled=(1 if disabled else 0) if disabled is not None else None,
+            is_stock_item=(1 if is_stock_item else 0) if is_stock_item is not None else None,
+            is_fixed_asset=(1 if is_fixed_asset else 0) if is_fixed_asset is not None else None,
+            asset_category=asset_category,
         )
         if not data:
             return "Nothing to update — no fields were provided."
@@ -253,6 +259,8 @@ INVENTORY_WRITE_TOOLS = [
 REQUIRED_FIELDS = {
     "create_item": [
         ("item_code", "What's the item code?"),
+        ("item_group", "What's the item group?"),
+        ("stock_uom", "What's the default unit of measure (stock UOM)?"),
     ],
     "update_item": [
         ("item_code", "Which item should I update? (its item code)"),

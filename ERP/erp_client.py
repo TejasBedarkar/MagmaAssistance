@@ -89,6 +89,9 @@ class ERPClient:
         if not self.base_url:
             raise RuntimeError("ERP_URL is not configured.")
 
+        if filters:
+            filters = self._resolve_filters(doctype, filters)
+
         cache_key = ("list", doctype, json.dumps(fields), json.dumps(filters), order_by, limit)
         if use_cache:
             cached = self._cache_get(cache_key)
@@ -117,6 +120,8 @@ class ERPClient:
         """Fetch a single document by name: GET /api/resource/<Doctype>/<name>"""
         if not self.base_url:
             raise RuntimeError("ERP_URL is not configured.")
+
+        name = self._resolve_id(doctype, name)
 
         cache_key = ("doc", doctype, name)
         if use_cache:
@@ -211,6 +216,8 @@ class ERPClient:
         if not self.base_url:
             raise RuntimeError("ERP_URL is not configured.")
 
+        data = self._resolve_parties_in_data(doctype, data)
+
         url = f"{self.base_url}/api/resource/{doctype}"
         response = self.session.post(
             url, json=data, timeout=DEFAULT_TIMEOUT_SECONDS, headers={"Expect": ""}
@@ -236,6 +243,9 @@ class ERPClient:
         if not self.base_url:
             raise RuntimeError("ERP_URL is not configured.")
 
+        name = self._resolve_id(doctype, name)
+        data = self._resolve_parties_in_data(doctype, data)
+
         url = f"{self.base_url}/api/resource/{doctype}/{name}"
         # Same "Expect: 100-continue" workaround as call_method_post/
         # create_doc — see the comment on call_method_post for why.
@@ -247,6 +257,249 @@ class ERPClient:
         self._cache.clear()
 
         return response.json().get("data", {})
+
+    # ---------------------------------------------------------------
+    # Name-to-ID Resolvers
+    # ---------------------------------------------------------------
+
+    def _resolve_item_code(self, item_ref: str) -> str:
+        """Resolve an item code from name or code."""
+        if not item_ref:
+            return item_ref
+        # 1. Exact match on name/code
+        try:
+            res = self.get_list("Item", fields=["name"], filters=[["name", "=", item_ref]], limit=1)
+            if res:
+                return item_ref
+        except Exception:
+            pass
+        # 2. Match on item_name exactly
+        try:
+            res = self.get_list("Item", fields=["name"], filters=[["item_name", "=", item_ref]], limit=1)
+            if res:
+                return res[0]["name"]
+        except Exception:
+            pass
+        # 3. Match on item_name partially
+        try:
+            res = self.get_list("Item", fields=["name"], filters=[["item_name", "like", f"%{item_ref}%"]], limit=1)
+            if res:
+                return res[0]["name"]
+        except Exception:
+            pass
+        return item_ref
+
+    def _resolve_lead_id(self, lead_ref: str) -> str:
+        """Resolve a Lead ID from name or ID."""
+        if not lead_ref:
+            return lead_ref
+        try:
+            res = self.get_list("Lead", fields=["name"], filters=[["name", "=", lead_ref]], limit=1)
+            if res:
+                return lead_ref
+        except Exception:
+            pass
+        try:
+            res = self.get_list("Lead", fields=["name"], filters=[["lead_name", "=", lead_ref]], limit=1)
+            if res:
+                return res[0]["name"]
+        except Exception:
+            pass
+        try:
+            res = self.get_list("Lead", fields=["name"], filters=[["lead_name", "like", f"%{lead_ref}%"]], limit=1)
+            if res:
+                return res[0]["name"]
+        except Exception:
+            pass
+        return lead_ref
+
+    def _resolve_customer_id(self, customer_ref: str) -> str:
+        """Resolve a Customer ID from name or ID."""
+        if not customer_ref:
+            return customer_ref
+        try:
+            res = self.get_list("Customer", fields=["name"], filters=[["name", "=", customer_ref]], limit=1)
+            if res:
+                return customer_ref
+        except Exception:
+            pass
+        try:
+            res = self.get_list("Customer", fields=["name"], filters=[["customer_name", "=", customer_ref]], limit=1)
+            if res:
+                return res[0]["name"]
+        except Exception:
+            pass
+        try:
+            res = self.get_list("Customer", fields=["name"], filters=[["customer_name", "like", f"%{customer_ref}%"]], limit=1)
+            if res:
+                return res[0]["name"]
+        except Exception:
+            pass
+        return customer_ref
+
+    def _resolve_supplier_id(self, supplier_ref: str) -> str:
+        """Resolve a Supplier ID from name or ID."""
+        if not supplier_ref:
+            return supplier_ref
+        try:
+            res = self.get_list("Supplier", fields=["name"], filters=[["name", "=", supplier_ref]], limit=1)
+            if res:
+                return supplier_ref
+        except Exception:
+            pass
+        try:
+            res = self.get_list("Supplier", fields=["name"], filters=[["supplier_name", "=", supplier_ref]], limit=1)
+            if res:
+                return res[0]["name"]
+        except Exception:
+            pass
+        try:
+            res = self.get_list("Supplier", fields=["name"], filters=[["supplier_name", "like", f"%{supplier_ref}%"]], limit=1)
+            if res:
+                return res[0]["name"]
+        except Exception:
+            pass
+        return supplier_ref
+
+    def _resolve_link_id(self, doctype: str, value: str) -> str:
+        """Resolve any link field value by checking if it exists as an ID, 
+        or finding the first ID that matches partially."""
+        if not value:
+            return value
+        # 1. Check if it already exists as an exact ID
+        try:
+            res = self.get_list(doctype, fields=["name"], filters=[["name", "=", value]], limit=1)
+            if res:
+                return value
+        except Exception:
+            pass
+        # 2. Check if any ID contains the value (partial match)
+        try:
+            res = self.get_list(doctype, fields=["name"], filters=[["name", "like", f"%{value}%"]], limit=1)
+            if res:
+                return res[0]["name"]
+        except Exception:
+            pass
+        return value
+
+    def _resolve_id(self, doctype: str, name: str) -> str:
+        """Helper to resolve a possibly-friendly name to its true ID for a given doctype."""
+        if doctype == "Item" and name != "Item":
+            return self._resolve_item_code(name)
+        elif doctype == "Lead" and name != "Lead":
+            return self._resolve_lead_id(name)
+        elif doctype == "Customer" and name != "Customer":
+            return self._resolve_customer_id(name)
+        elif doctype == "Supplier" and name != "Supplier":
+            return self._resolve_supplier_id(name)
+        elif doctype in ("Company", "Warehouse", "Workstation", "Operation", "Employee", "Work Order", "Production Plan", "Job Card", "Stock Entry", "BOM"):
+            return self._resolve_link_id(doctype, name)
+        return name
+
+    def _resolve_items_in_data(self, data: dict) -> dict:
+        """Resolve item_code for all items in the items child table of a document data dict."""
+        if not data or not isinstance(data, dict):
+            return data
+        items = data.get("items")
+        if items and isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and "item_code" in item:
+                    item["item_code"] = self._resolve_item_code(item["item_code"])
+        return data
+
+    def _resolve_parties_in_data(self, doctype: str, data: dict) -> dict:
+        """Resolve name-to-ID for common customer/lead/supplier/item/warehouse/company references in document data."""
+        if not data or not isinstance(data, dict):
+            return data
+        
+        # 1. Resolve top-level fields
+        if "customer" in data:
+            data["customer"] = self._resolve_customer_id(data["customer"])
+        if "lead" in data:
+            data["lead"] = self._resolve_lead_id(data["lead"])
+        if "supplier" in data:
+            data["supplier"] = self._resolve_supplier_id(data["supplier"])
+        if "item_code" in data:
+            data["item_code"] = self._resolve_item_code(data["item_code"])
+        if "production_item" in data:
+            data["production_item"] = self._resolve_item_code(data["production_item"])
+        
+        # Resolve company
+        if "company" in data:
+            data["company"] = self._resolve_link_id("Company", data["company"])
+        # Resolve warehouses
+        for wh_field in ("warehouse", "fg_warehouse", "wip_warehouse", "source_warehouse", "from_warehouse", "to_warehouse"):
+            if wh_field in data:
+                data[wh_field] = self._resolve_link_id("Warehouse", data[wh_field])
+        
+        # Resolve other manufacturing fields
+        if "workstation" in data:
+            data["workstation"] = self._resolve_link_id("Workstation", data["workstation"])
+        if "operation" in data:
+            data["operation"] = self._resolve_link_id("Operation", data["operation"])
+        if "employee" in data:
+            if isinstance(data["employee"], str):
+                data["employee"] = self._resolve_link_id("Employee", data["employee"])
+            elif isinstance(data["employee"], list):
+                for emp_row in data["employee"]:
+                    if isinstance(emp_row, dict) and "employee" in emp_row:
+                        emp_row["employee"] = self._resolve_link_id("Employee", emp_row["employee"])
+        if "work_order" in data:
+            data["work_order"] = self._resolve_link_id("Work Order", data["work_order"])
+        if "bom_no" in data:
+            data["bom_no"] = self._resolve_link_id("BOM", data["bom_no"])
+
+        # Opportunity party fields
+        if doctype == "Opportunity":
+            party_type = data.get("opportunity_from")
+            party_name = data.get("party_name")
+            if party_type and party_name:
+                if party_type == "Lead":
+                    data["party_name"] = self._resolve_lead_id(party_name)
+                elif party_type == "Customer":
+                    data["party_name"] = self._resolve_customer_id(party_name)
+
+        # 2. Resolve items table if present
+        data = self._resolve_items_in_data(data)
+        
+        # Also resolve production plan items (po_items)
+        po_items = data.get("po_items")
+        if po_items and isinstance(po_items, list):
+            for item in po_items:
+                if isinstance(item, dict):
+                    if "item_code" in item:
+                        item["item_code"] = self._resolve_item_code(item["item_code"])
+                    if "bom_no" in item:
+                        item["bom_no"] = self._resolve_link_id("BOM", item["bom_no"])
+
+        return data
+
+    def _resolve_filters(self, doctype: str, filters: list) -> list:
+        """Best-effort resolve filters that query on lead, customer, supplier, or item fields."""
+        if not filters or not isinstance(filters, list):
+            return filters
+        
+        resolved = []
+        for f in filters:
+            if isinstance(f, list) and len(f) >= 3:
+                field, op, val = f[0], f[1], f[2]
+                if isinstance(val, str):
+                    if field == "customer":
+                        val = self._resolve_customer_id(val)
+                    elif field == "lead":
+                        val = self._resolve_lead_id(val)
+                    elif field == "supplier":
+                        val = self._resolve_supplier_id(val)
+                    elif field == "item_code":
+                        val = self._resolve_item_code(val)
+                    elif field == "production_item":
+                        val = self._resolve_item_code(val)
+                    elif field in ("company", "warehouse", "fg_warehouse", "wip_warehouse", "source_warehouse", "from_warehouse", "to_warehouse", "workstation", "operation", "employee", "work_order", "bom_no"):
+                        val = self._resolve_link_id(field.replace("fg_warehouse", "Warehouse").replace("wip_warehouse", "Warehouse").replace("source_warehouse", "Warehouse").replace("from_warehouse", "Warehouse").replace("to_warehouse", "Warehouse").replace("production_item", "Item").capitalize(), val)
+                resolved.append([field, op, val])
+            else:
+                resolved.append(f)
+        return resolved
 
     def submit_doc(self, doctype, name):
         """Submit a submittable document (docstatus 0 -> 1), e.g. finalizing

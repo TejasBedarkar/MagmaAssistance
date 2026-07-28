@@ -71,12 +71,26 @@ class OpenAIChatModel(BaseChatModel):
         api_messages = [convert_message_to_dict(msg) for msg in messages]
         
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        
+        # If OpenRouter is configured in .env, route there; otherwise use standard OpenAI
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+        if openrouter_key:
+            headers["Authorization"] = f"Bearer {openrouter_key}"
+            headers["HTTP-Referer"] = "http://localhost:8050"
+            headers["X-Title"] = "MagmaAssistance"
+            base_url = "https://openrouter.ai/api/v1/chat/completions"
+            model_name = self.model_name
+            if "/" not in model_name:
+                model_name = f"openai/{model_name}"
+        else:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            base_url = self.base_url
+            model_name = self.model_name
 
         data = {
-            "model": self.model_name,
+            "model": model_name,
             "messages": api_messages,
             "temperature": self.temperature,
         }
@@ -84,7 +98,7 @@ class OpenAIChatModel(BaseChatModel):
         if self.bound_tools:
             data["tools"] = self.bound_tools
             
-        response = requests.post(self.base_url, json=data, headers=headers)
+        response = requests.post(base_url, json=data, headers=headers)
         response.raise_for_status()
         res_json = response.json()
         
