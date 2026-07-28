@@ -92,6 +92,92 @@ def _format_records(records, empty_message):
 
 
 # ---------------------------------------------------------------------
+# Item (look up by ID/name, or list with filters)
+# ---------------------------------------------------------------------
+
+@tool
+def get_item(item_ref: str):
+    """Look up a single Item by its Item Code (ID) or Item Name — returns
+    its item code, item name, item group, stock UOM, standard selling
+    rate, valuation rate, description, default BOM, and manufacturing /
+    stock flags. The `item_ref` can be either the Item Code (e.g.
+    'SKU001') or the Item Name (e.g. 'Laptop', 'T-shirt') — the backend
+    resolver will find the correct item automatically. Use for requests
+    like 'show me item SKU001', 'what is the rate of Laptop?', or 'get
+    details of T-shirt'."""
+
+    def run():
+        doc = erp_client.get_doc("Item", item_ref)
+        # Return only the most useful fields instead of the full 100+ field doc
+        useful = {
+            "item_code": doc.get("name"),
+            "item_name": doc.get("item_name"),
+            "item_group": doc.get("item_group"),
+            "description": doc.get("description"),
+            "stock_uom": doc.get("stock_uom"),
+            "standard_rate": doc.get("standard_rate"),
+            "valuation_rate": doc.get("valuation_rate"),
+            "is_stock_item": doc.get("is_stock_item"),
+            "include_item_in_manufacturing": doc.get("include_item_in_manufacturing"),
+            "default_bom": doc.get("default_bom"),
+            "brand": doc.get("brand"),
+            "has_serial_no": doc.get("has_serial_no"),
+            "has_batch_no": doc.get("has_batch_no"),
+            "lead_time_days": doc.get("lead_time_days"),
+            "safety_stock": doc.get("safety_stock"),
+            "disabled": doc.get("disabled"),
+        }
+        return str(useful)
+
+    return _safe_call(f"look up item '{item_ref}'", run)
+
+
+@tool
+def list_items(
+    item_group: Optional[str] = None,
+    is_stock_item: Optional[int] = None,
+    include_item_in_manufacturing: Optional[int] = None,
+    brand: Optional[str] = None,
+    limit: int = 20,
+):
+    """List Items in the ERP system, optionally filtered by `item_group`
+    (e.g. 'Raw Material', 'Products', 'Consulting Services'),
+    `is_stock_item` (1 for stock items, 0 for non-stock/service items),
+    `include_item_in_manufacturing` (1 for items used in manufacturing),
+    or `brand`. Returns the most recent `limit` matches (default 20) with
+    item code, item name, item group, UOM, standard rate, and stock flag.
+    Use for requests like 'list all items', 'show me stock items', 'what
+    items are in the Raw Material group?', or 'show me manufacturing
+    items'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Item",
+            fields=[
+                "name",
+                "item_name",
+                "item_group",
+                "stock_uom",
+                "standard_rate",
+                "is_stock_item",
+                "include_item_in_manufacturing",
+                "default_bom",
+            ],
+            filters=_filters(
+                item_group=item_group,
+                is_stock_item=is_stock_item,
+                include_item_in_manufacturing=include_item_in_manufacturing,
+                brand=brand,
+            ),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No items found matching that criteria.")
+
+    return _safe_call("list items", run)
+
+
+# ---------------------------------------------------------------------
 # Work Order
 # ---------------------------------------------------------------------
 
@@ -448,6 +534,8 @@ def list_sales_forecasts(parent_warehouse: Optional[str] = None, limit: int = 20
 
 
 MANUFACTURING_READ_TOOLS = [
+    get_item,
+    list_items,
     get_work_order,
     list_work_orders,
     get_production_plan,
@@ -474,6 +562,9 @@ MANUFACTURING_READ_TOOLS = [
 # an entry here — every list_* tool works fine unfiltered, so none of
 # them are listed.
 REQUIRED_FIELDS = {
+    "get_item": [
+        ("item_ref", "Which item? (its Item Code e.g. SKU001, or Item Name e.g. Laptop)"),
+    ],
     "get_work_order": [
         ("work_order_id", "Which work order? (its ID, e.g. WO-00001)"),
     ],
