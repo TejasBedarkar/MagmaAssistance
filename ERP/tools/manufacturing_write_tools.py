@@ -157,7 +157,7 @@ def create_work_order(
     `planned_start_date` should be YYYY-MM-DD. Set `submit` true to
     submit it immediately (which triggers Job Card creation for each
     routing operation) rather than leave it as a draft. Use for requests
-    like 'create a work order to manufacture 100 units of ITEM-FG-001'."""
+    like 'create a work order to manufacture 100 units of ITEM-FG-001'. Do not ask the user for an ID — ERPNext auto-generates the document name/ID on creation."""
 
     def run():
         resolved_bom = bom_no or _get_default_bom(production_item)
@@ -246,7 +246,7 @@ def create_production_plan(
     Production Plan does not automatically create Work Orders — those
     still need to be created separately per item. Use for requests like
     'create a production plan to manufacture 100 units of ITEM-FG-001
-    and 50 units of ITEM-FG-002'."""
+    and 50 units of ITEM-FG-002'. Do not ask the user for an ID — ERPNext auto-generates the document name/ID on creation."""
 
     def run():
         resolved_items = []
@@ -337,7 +337,7 @@ def create_job_card(
     per routing operation when a Work Order is submitted, so this is
     mainly for adding an extra/manual card. Use for requests like
     'create a job card for WO-00001, operation Assembly, workstation
-    Assembly Line 1, quantity 50'."""
+    Assembly Line 1, quantity 50'. Do not ask the user for an ID — ERPNext auto-generates the document name/ID on creation."""
 
     def run():
         data = _payload(
@@ -410,7 +410,7 @@ def create_manufacture_stock_entry(
     track how much material has been issued/received against that
     order. Set `submit` true to submit it immediately rather than leave
     it as a draft. Use for requests like 'transfer materials for work
-    order WO-00001 to the WIP warehouse'."""
+    order WO-00001 to the WIP warehouse'. Do not ask the user for an ID — ERPNext auto-generates the document name/ID on creation."""
 
     def run():
         data = _payload(
@@ -435,6 +435,287 @@ def create_manufacture_stock_entry(
     return _safe_call("create manufacturing stock entry", run)
 
 
+# ---------------------------------------------------------------------
+# Item Lead Time
+# ---------------------------------------------------------------------
+# NOTE ON DOCTYPE NAME: "Item Lead Time" is not a stock ERPNext doctype
+# (unlike Work Order/Production Plan/Job Card/Stock Entry above), so
+# some field names are custom to this instance. CONFIRMED via
+# `frappe.get_meta("Item Lead Time")` in bench console: item_code,
+# shift_time_in_hours, no_of_shift (singular), no_of_workstations,
+# total_workstation_time (= shift_time_in_hours * no_of_shift *
+# no_of_workstations — computed here in Python since the desk UI's
+# live JS calc doesn't run over the REST API), manufacturing_time_in_mins
+# (note: minutes, not an unspecified unit as originally guessed).
+
+@tool
+def create_item_lead_time(
+    item_code: str,
+    shift_hours: int,
+    no_of_shifts: int,
+    no_of_workstations: int,
+    manufacturing_time: int,
+):
+    """Create an Item Lead Time record — capacity-planning data used to
+    estimate how long an item takes to manufacture. All fields are
+    required: `item_code`, `shift_hours` (shift time in hours/day),
+    `no_of_shifts` (number of shifts), `no_of_workstations` (number of
+    workstations available), and `manufacturing_time` (in MINUTES).
+    `total_workstation_time` is not asked from the user — it's computed
+    automatically as shift_hours * no_of_shifts * no_of_workstations,
+    the same calculation ERPNext's desk UI does live as you type into
+    the form (which doesn't run when creating via this API, so it's
+    computed here instead). Use for requests like 'set up lead time for
+    ITEM-FG-001: 8 hour shifts, 2 shifts, 3 workstations, manufacturing
+    time 40 minutes'. Do not ask the user for an ID — ERPNext auto-generates the document name/ID on creation."""
+
+    def run():
+        data = _payload(
+            item_code=item_code,
+            shift_time_in_hours=shift_hours,
+            no_of_shift=no_of_shifts,
+            no_of_workstations=no_of_workstations,
+            manufacturing_time_in_mins=manufacturing_time,
+            total_workstation_time=shift_hours * no_of_shifts * no_of_workstations,
+        )
+        result = erp_client.create_doc("Item Lead Time", data)
+        return str(result)
+
+    return _safe_call(f"create item lead time for {item_code}", run)
+
+
+@tool
+def update_item_lead_time(
+    item_lead_time_id: str,
+    shift_hours: Optional[int] = None,
+    no_of_shifts: Optional[int] = None,
+    no_of_workstations: Optional[int] = None,
+    manufacturing_time: Optional[int] = None,
+):
+    """Update an existing Item Lead Time record identified by its ID.
+    Only the fields provided are changed. `manufacturing_time` is in
+    MINUTES. total_workstation_time is only recalculated automatically
+    if `shift_hours`, `no_of_shifts`, AND `no_of_workstations` are all
+    given in this same call — if only some of the three are being
+    changed, total_workstation_time is left as-is (recompute it
+    yourself by re-sending all three if needed)."""
+
+    def run():
+        data = _payload(
+            shift_time_in_hours=shift_hours,
+            no_of_shift=no_of_shifts,
+            no_of_workstations=no_of_workstations,
+            manufacturing_time_in_mins=manufacturing_time,
+        )
+        if shift_hours is not None and no_of_shifts is not None and no_of_workstations is not None:
+            data["total_workstation_time"] = shift_hours * no_of_shifts * no_of_workstations
+        if not data:
+            return "Nothing to update — no fields were provided."
+        result = erp_client.update_doc("Item Lead Time", item_lead_time_id, data)
+        return str(result)
+
+    return _safe_call(f"update item lead time {item_lead_time_id}", run)
+
+
+# ---------------------------------------------------------------------
+# Master Production Schedule
+# ---------------------------------------------------------------------
+# NOTE ON DOCTYPE NAME: same caveat as Item Lead Time above — "Master
+# Production Schedule" isn't a stock ERPNext doctype, so verify the
+# doctype/field names against your actual instance.
+
+@tool
+def create_master_production_schedule(
+    company: str,
+    from_date: str,
+    to_date: Optional[str] = None,
+    submit: bool = False,
+):
+    """Create a Master Production Schedule. `company` and `from_date`
+    (YYYY-MM-DD) are required. `to_date` (YYYY-MM-DD) is optional if
+    your instance uses a schedule window. Set `submit` true to submit it
+    immediately rather than leave it as a draft. Use for requests like
+    'create a master production schedule for Acme Corp starting next
+    Monday'. Do not ask the user for an ID — ERPNext auto-generates the document name/ID on creation."""
+
+    def run():
+        data = _payload(company=company, from_date=from_date, to_date=to_date)
+        result = erp_client.create_doc("Master Production Schedule", data)
+
+        if submit:
+            schedule_id = result.get("name")
+            try:
+                result = erp_client.submit_doc("Master Production Schedule", schedule_id)
+            except Exception as exc:  # noqa: BLE001
+                return str(result) + f" (created as draft; submit failed: {exc})"
+
+        return str(result)
+
+    return _safe_call("create master production schedule", run)
+
+
+@tool
+def update_master_production_schedule(
+    master_production_schedule_id: str,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+):
+    """Update an existing DRAFT Master Production Schedule identified by
+    its ID. Only the fields provided are changed."""
+
+    def run():
+        data = _payload(from_date=from_date, to_date=to_date)
+        if not data:
+            return "Nothing to update — no fields were provided."
+        result = erp_client.update_doc(
+            "Master Production Schedule", master_production_schedule_id, data
+        )
+        return str(result)
+
+    return _safe_call(f"update master production schedule {master_production_schedule_id}", run)
+
+
+# ---------------------------------------------------------------------
+# Downtime Entry
+# ---------------------------------------------------------------------
+# This one IS a real stock ERPNext doctype (Manufacturing module), so
+# these field names should be accurate as-is: workstation, operator,
+# from_time, to_time, stop_reason.
+
+@tool
+def create_downtime_entry(
+    workstation: str,
+    operator: str,
+    from_time: str,
+    to_time: str,
+    stop_reason: str,
+    submit: bool = False,
+):
+    """Log a Downtime Entry — records a workstation being out of action.
+    All fields are required: `workstation`, `operator` (an Employee ID),
+    `from_time`/`to_time` (as 'YYYY-MM-DD HH:MM:SS'), and `stop_reason`.
+    `stop_reason` MUST be exactly one of (case-sensitive): 'Excessive
+    machine set up time', 'Unplanned machine maintenance', 'On-machine
+    press checks', 'Machine operator errors', 'Machine malfunction',
+    'Electricity down', 'Other'. If the user describes a reason that
+    doesn't match one of these exactly, pick the closest match from
+    this list rather than sending their wording verbatim — sending
+    anything else raises a ValidationError. Set `submit` true to submit
+    it immediately rather than leave it as a draft. Use for requests
+    like 'log downtime on Assembly Line 1 from 2pm to 3:30pm today,
+    machine malfunction, operator HR-EMP-00007'. Do not ask the user for an ID — ERPNext auto-generates the document name/ID on creation."""
+
+    def run():
+        data = _payload(
+            workstation=workstation,
+            operator=operator,
+            from_time=from_time,
+            to_time=to_time,
+            stop_reason=stop_reason,
+        )
+        result = erp_client.create_doc("Downtime Entry", data)
+
+        if submit:
+            entry_id = result.get("name")
+            try:
+                result = erp_client.submit_doc("Downtime Entry", entry_id)
+            except Exception as exc:  # noqa: BLE001
+                return str(result) + f" (created as draft; submit failed: {exc})"
+
+        return str(result)
+
+    return _safe_call(f"log downtime entry for {workstation}", run)
+
+
+@tool
+def update_downtime_entry(
+    downtime_entry_id: str,
+    from_time: Optional[str] = None,
+    to_time: Optional[str] = None,
+    stop_reason: Optional[str] = None,
+):
+    """Update an existing Downtime Entry identified by its ID. Only the
+    fields provided are changed."""
+
+    def run():
+        data = _payload(from_time=from_time, to_time=to_time, stop_reason=stop_reason)
+        if not data:
+            return "Nothing to update — no fields were provided."
+        result = erp_client.update_doc("Downtime Entry", downtime_entry_id, data)
+        return str(result)
+
+    return _safe_call(f"update downtime entry {downtime_entry_id}", run)
+
+
+# ---------------------------------------------------------------------
+# Sales Forecast
+# ---------------------------------------------------------------------
+# NOTE ON DOCTYPE/CHILD-TABLE NAME: "Sales Forecast" isn't a stock
+# ERPNext doctype either. `items` below is a guess at the child-table
+# fieldname — Production Plan turned out to use `po_items` instead of
+# the obvious `items`, so treat this the same way: if the first test
+# throws MandatoryError: <something>, that's the real field name, swap
+# it in.
+
+@tool
+def create_sales_forecast(
+    company: str,
+    items: list,
+    parent_warehouse: str,
+    submit: bool = False,
+):
+    """Create a Sales Forecast — expected demand for one or more items
+    out of a warehouse. `company`, `items`, and `parent_warehouse` are
+    all required. `items` is a list of line items, each a dict like
+    {"item_code": "ITEM-FG-001", "demand_qty": 100} — one or more items
+    required (an item can be selected once or several at a time). Set
+    `submit` true to submit it immediately rather than leave it as a
+    draft. Use for requests like 'forecast demand for 100 units of
+    ITEM-FG-001 and 50 units of ITEM-FG-002 out of the Main Warehouse'. Do not ask the user for an ID — ERPNext auto-generates the document name/ID on creation."""
+
+    def run():
+        data = _payload(
+            company=company,
+            selected_items=items,
+            parent_warehouse=parent_warehouse,
+        )
+        result = erp_client.create_doc("Sales Forecast", data)
+
+        if submit:
+            forecast_id = result.get("name")
+            try:
+                result = erp_client.submit_doc("Sales Forecast", forecast_id)
+            except Exception as exc:  # noqa: BLE001
+                return str(result) + f" (created as draft; submit failed: {exc})"
+
+        return str(result)
+
+    return _safe_call("create sales forecast", run)
+
+
+@tool
+def update_sales_forecast(
+    sales_forecast_id: str,
+    company: Optional[str] = None,
+    items: Optional[list] = None,
+    parent_warehouse: Optional[str] = None,
+):
+    """Update an existing DRAFT Sales Forecast identified by its ID.
+    Only the fields provided are changed — passing `items` replaces the
+    existing item set rather than merging with it."""
+
+    def run():
+        data = _payload(company=company, parent_warehouse=parent_warehouse)
+        if items is not None:
+            data["selected_items"] = items
+        if not data:
+            return "Nothing to update — no fields were provided."
+        result = erp_client.update_doc("Sales Forecast", sales_forecast_id, data)
+        return str(result)
+
+    return _safe_call(f"update sales forecast {sales_forecast_id}", run)
+
+
 MANUFACTURING_WRITE_TOOLS = [
     create_work_order,
     update_work_order,
@@ -443,6 +724,14 @@ MANUFACTURING_WRITE_TOOLS = [
     create_job_card,
     update_job_card,
     create_manufacture_stock_entry,
+    create_item_lead_time,
+    update_item_lead_time,
+    create_master_production_schedule,
+    update_master_production_schedule,
+    create_downtime_entry,
+    update_downtime_entry,
+    create_sales_forecast,
+    update_sales_forecast,
 ]
 
 
@@ -497,6 +786,55 @@ REQUIRED_FIELDS = {
             "'ITEM-001, 50; ITEM-002, 10'.",
         ),
     ],
+    "create_item_lead_time": [
+        ("item_code", "Which item is this lead time record for?"),
+        ("shift_hours", "What's the shift time, in hours per day?"),
+        ("no_of_shifts", "How many shifts run per day?"),
+        ("no_of_workstations", "How many workstations are available?"),
+        ("manufacturing_time", "What's the manufacturing time for this item, in minutes?"),
+    ],
+    "update_item_lead_time": [
+        ("item_lead_time_id", "Which item lead time record should I update? (its ID)"),
+    ],
+    "create_master_production_schedule": [
+        ("company", "Which company is this schedule for?"),
+        ("from_date", "What's the start date for this schedule? (YYYY-MM-DD)"),
+    ],
+    "update_master_production_schedule": [
+        (
+            "master_production_schedule_id",
+            "Which master production schedule should I update? (its ID)",
+        ),
+    ],
+    "create_downtime_entry": [
+        ("workstation", "Which workstation was down?"),
+        ("operator", "Which employee (Employee ID) was operating it?"),
+        ("from_time", "When did the downtime start? (YYYY-MM-DD HH:MM:SS)"),
+        ("to_time", "When did the downtime end? (YYYY-MM-DD HH:MM:SS)"),
+        (
+            "stop_reason",
+            "What caused the downtime? Must be one of: 'Excessive machine "
+            "set up time', 'Unplanned machine maintenance', 'On-machine "
+            "press checks', 'Machine operator errors', 'Machine "
+            "malfunction', 'Electricity down', or 'Other'.",
+        ),
+    ],
+    "update_downtime_entry": [
+        ("downtime_entry_id", "Which downtime entry should I update? (its ID)"),
+    ],
+    "create_sales_forecast": [
+        ("company", "Which company is this forecast for?"),
+        (
+            "items",
+            "Which items, and how much demand for each? Give each as "
+            "'item code, demand quantity' — separate multiple items "
+            "with a semicolon, e.g. 'ITEM-FG-001, 100; ITEM-FG-002, 50'.",
+        ),
+        ("parent_warehouse", "Which warehouse is this forecast for?"),
+    ],
+    "update_sales_forecast": [
+        ("sales_forecast_id", "Which sales forecast should I update? (its ID)"),
+    ],
 }
 
 # Reuses the same 'item code, qty[, rate]' free-text parser as
@@ -522,3 +860,17 @@ def _parse_production_plan_items_answer(text: str) -> list:
 
 
 FIELD_PARSERS[("create_production_plan", "items")] = _parse_production_plan_items_answer
+
+
+def _parse_sales_forecast_items_answer(text: str) -> list:
+    """Same free-text format as _parse_items_answer ('item code, qty'),
+    but Sales Forecast's line items use `demand_qty`, not `qty`, so this
+    re-keys after parsing rather than duplicating the parsing logic."""
+    parsed = _parse_items_answer(text)
+    for row in parsed:
+        if "qty" in row:
+            row["demand_qty"] = row.pop("qty")
+    return parsed
+
+
+FIELD_PARSERS[("create_sales_forecast", "items")] = _parse_sales_forecast_items_answer
