@@ -397,16 +397,17 @@ def list_item_lead_times(item_code: Optional[str] = None, limit: int = 20):
     'list all item lead times'."""
 
     def run():
-        # Field names on this doctype (shift/workstation/manufacturing
-        # time columns) are still unconfirmed on your instance — a prior
-        # guess (shift_hours) came back "Field not permitted in query",
-        # so this fetches every field (fields=["*"]) instead of naming
-        # them, to avoid guessing wrong again. Once you confirm the real
-        # column names (e.g. via `frappe.get_meta("Item Lead Time")` in
-        # bench console), swap this back to an explicit fields list.
         records = erp_client.get_list(
             "Item Lead Time",
-            fields=["*"],
+            fields=[
+                "name",
+                "item_code",
+                "shift_time_in_hours",
+                "no_of_shift",
+                "no_of_workstations",
+                "total_workstation_time",
+                "manufacturing_time_in_mins",
+            ],
             filters=_filters(item_code=item_code),
             order_by="modified desc",
             limit=limit,
