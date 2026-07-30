@@ -533,6 +533,187 @@ def list_sales_forecasts(parent_warehouse: Optional[str] = None, limit: int = 20
     return _safe_call("list sales forecasts", run)
 
 
+# ---------------------------------------------------------------------
+# BOM (Bill of Materials)
+# ---------------------------------------------------------------------
+
+@tool
+def get_bom(bom_id: str):
+    """Look up a single Bill of Materials (BOM) by its ID — returns the item
+    to manufacture, operations list, raw materials list, operating cost,
+    raw material cost, and total cost. Use for requests like 'show details
+    for BOM BOM-ITEM-FG-001-001'."""
+
+    def run():
+        doc = erp_client.get_doc("BOM", bom_id)
+        return str(doc)
+
+    return _safe_call(f"look up BOM {bom_id}", run)
+
+
+@tool
+def list_boms(item_code: Optional[str] = None, is_active: Optional[bool] = None, is_default: Optional[bool] = None, limit: int = 20):
+    """List Bills of Materials (BOMs), optionally filtered by `item_code`,
+    `is_active`, or `is_default`. Returns the most recent `limit` matches
+    (default 20). Use for requests like 'show all active BOMs' or 'list BOMs
+    for item SKU002'."""
+
+    def run():
+        # Convert bools to integers (Check fields in Frappe are 0 or 1)
+        active_val = (1 if is_active else 0) if is_active is not None else None
+        default_val = (1 if is_default else 0) if is_default is not None else None
+        
+        records = erp_client.get_list(
+            "BOM",
+            fields=["name", "item", "item_name", "is_active", "is_default", "total_cost"],
+            filters=_filters(item=item_code, is_active=active_val, is_default=default_val),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No BOMs found matching that criteria.")
+
+    return _safe_call("list BOMs", run)
+
+
+# ---------------------------------------------------------------------
+# Workstation Type
+# ---------------------------------------------------------------------
+
+@tool
+def get_workstation_type(workstation_type_id: str):
+    """Look up a single Workstation Type by its ID/Name — returns its hourly
+    rate, description, and operating costs. Use for requests like 'what is
+    the workstation type Assembly?'."""
+
+    def run():
+        doc = erp_client.get_doc("Workstation Type", workstation_type_id)
+        return str(doc)
+
+    return _safe_call(f"look up workstation type {workstation_type_id}", run)
+
+
+@tool
+def list_workstation_types(limit: int = 20):
+    """List Workstation Types. Returns the most recent `limit` matches
+    (default 20). Use for requests like 'show all workstation types'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Workstation Type",
+            fields=["name", "hour_rate"],
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No workstation types found.")
+
+    return _safe_call("list workstation types", run)
+
+
+# ---------------------------------------------------------------------
+# Workstation
+# ---------------------------------------------------------------------
+
+@tool
+def get_workstation(workstation_id: str):
+    """Look up a single Workstation by its name (ID) — returns its hourly
+    rate, workstation type, production capacity, status, and warehouse.
+    Use for requests like 'show details for workstation Workstation-001'."""
+
+    def run():
+        doc = erp_client.get_doc("Workstation", workstation_id)
+        return str(doc)
+
+    return _safe_call(f"look up workstation {workstation_id}", run)
+
+
+@tool
+def list_workstations(workstation_type: Optional[str] = None, limit: int = 20):
+    """List Workstations, optionally filtered by `workstation_type`.
+    Returns the most recent `limit` matches (default 20). Use for
+    requests like 'list all workstations' or 'show workstations of type
+    Assembly'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Workstation",
+            fields=["name", "workstation_type", "hour_rate", "status"],
+            filters=_filters(workstation_type=workstation_type),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No workstations found matching that criteria.")
+
+    return _safe_call("list workstations", run)
+
+
+# ---------------------------------------------------------------------
+# Operation
+# ---------------------------------------------------------------------
+
+@tool
+def get_operation(operation_id: str):
+    """Look up a single Operation by its name (ID) — returns its default
+    workstation, description, batch size, and other settings. Use for
+    requests like 'show details for operation Cutting'."""
+
+    def run():
+        doc = erp_client.get_doc("Operation", operation_id)
+        return str(doc)
+
+    return _safe_call(f"look up operation {operation_id}", run)
+
+
+@tool
+def list_operations(limit: int = 20):
+    """List Operations. Returns the most recent `limit` matches (default
+    20). Use for requests like 'show me all operations'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Operation",
+            fields=["name", "workstation"],
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No operations found.")
+
+    return _safe_call("list operations", run)
+
+
+# ---------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------
+
+@tool
+def get_routing(routing_id: str):
+    """Look up a single Routing by its name (ID) — returns the routing operations
+    and default workstation settings. Use for requests like 'show details
+    for routing ROUT-00001'."""
+
+    def run():
+        doc = erp_client.get_doc("Routing", routing_id)
+        return str(doc)
+
+    return _safe_call(f"look up routing {routing_id}", run)
+
+
+@tool
+def list_routings(limit: int = 20):
+    """List Routings. Returns the most recent `limit` matches (default 20).
+    Use for requests like 'show all routings'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Routing",
+            fields=["name", "routing_name", "disabled"],
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No routings found.")
+
+    return _safe_call("list routings", run)
+
+
 MANUFACTURING_READ_TOOLS = [
     get_item,
     list_items,
@@ -552,15 +733,22 @@ MANUFACTURING_READ_TOOLS = [
     list_downtime_entries,
     get_sales_forecast,
     list_sales_forecasts,
+    get_bom,
+    list_boms,
+    get_workstation_type,
+    list_workstation_types,
+    get_workstation,
+    list_workstations,
+    get_operation,
+    list_operations,
+    get_routing,
+    list_routings,
 ]
 
 
 # ---------------------------------------------------------------------
 # Slot-filling metadata (consumed by ERP/server.py)
 # ---------------------------------------------------------------------
-# Only the tools where the lookup is meaningless without an ID/code need
-# an entry here — every list_* tool works fine unfiltered, so none of
-# them are listed.
 REQUIRED_FIELDS = {
     "get_item": [
         ("item_ref", "Which item? (its Item Code e.g. SKU001, or Item Name e.g. Laptop)"),
@@ -588,6 +776,21 @@ REQUIRED_FIELDS = {
     ],
     "get_sales_forecast": [
         ("sales_forecast_id", "Which sales forecast? (its ID)"),
+    ],
+    "get_bom": [
+        ("bom_id", "Which BOM? (its ID, e.g. BOM-ITEM-001)"),
+    ],
+    "get_workstation_type": [
+        ("workstation_type_id", "Which workstation type? (its ID/Name)"),
+    ],
+    "get_workstation": [
+        ("workstation_id", "Which workstation? (its ID/Name)"),
+    ],
+    "get_operation": [
+        ("operation_id", "Which operation? (its ID/Name)"),
+    ],
+    "get_routing": [
+        ("routing_id", "Which routing? (its ID/Name)"),
     ],
 }
 
