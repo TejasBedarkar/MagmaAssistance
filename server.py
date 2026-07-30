@@ -70,6 +70,19 @@ class OpenAIChatModel(BaseChatModel):
     ) -> ChatResult:
         api_messages = [convert_message_to_dict(msg) for msg in messages]
         
+        # Clean up orphaned tool calls to prevent API 400 Bad Request
+        tool_response_ids = {msg["tool_call_id"] for msg in api_messages if msg.get("role") == "tool"}
+        for msg in api_messages:
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                # Only keep tool calls that have a corresponding response in the payload
+                valid_calls = [tc for tc in msg["tool_calls"] if tc.get("id") in tool_response_ids]
+                if valid_calls:
+                    msg["tool_calls"] = valid_calls
+                else:
+                    msg.pop("tool_calls", None)
+                    if not msg.get("content"):
+                        msg["content"] = "Creating chart..."
+
         headers = {
             "Content-Type": "application/json",
         }
@@ -554,6 +567,31 @@ async def agent_node(state: ChatState) -> dict:
 
     retrieval_query = f"{task_context}. {last_user_msg}" if task_context else last_user_msg
     candidate_tools = tool_rag.retrieve(retrieval_query)
+    
+    # Force charting and relevant read/list tools if query is chart-related to guarantee they are available to the LLM
+    query_lower = retrieval_query.lower() if retrieval_query else ""
+    if any(word in query_lower for word in ["chart", "graph", "plot", "bar", "pie", "line"]):
+        # Always inject chart tools
+        for t_name in ["create_bar_chart", "create_line_chart", "create_pie_chart"]:
+            if t_name in tool_map and tool_map[t_name] not in candidate_tools:
+                candidate_tools.append(tool_map[t_name])
+        
+        # Inject relevant read tools based on query context to allow the LLM to query the database first
+        if any(word in query_lower for word in ["sales", "revenue", "cost", "income", "value"]):
+            for t_name in ["get_sales_orders", "get_sales_summary", "get_pending_sales_orders"]:
+                if t_name in tool_map and tool_map[t_name] not in candidate_tools:
+                    candidate_tools.append(tool_map[t_name])
+                    
+        if any(word in query_lower for word in ["subcontract", "raw", "transfer", "received"]):
+            for t_name in ["get_subcontract_order_summary", "list_subcontracted_raw_materials_to_be_transferred", "list_subcontracted_items_to_be_received"]:
+                if t_name in tool_map and tool_map[t_name] not in candidate_tools:
+                    candidate_tools.append(tool_map[t_name])
+                    
+        if any(word in query_lower for word in ["work order", "job card", "production"]):
+            for t_name in ["list_work_orders", "get_work_order", "list_job_cards"]:
+                if t_name in tool_map and tool_map[t_name] not in candidate_tools:
+                    candidate_tools.append(tool_map[t_name])
+
     if not candidate_tools:
         reply = text_chain.invoke({"input": last_user_msg})
         return {"messages": [AIMessage(content=reply)]}
@@ -570,7 +608,16 @@ async def agent_node(state: ChatState) -> dict:
     logger.info("Tools selected for query: %s", [t.name for t in candidate_tools])
 
     llm_with_tools = assistant.llm.model.bind_tools(candidate_tools)
-    system_parts = [assistant.llm.system_prompt]
+    system_parts = [
+        assistant.llm.system_prompt,
+        "\nIMPORTANT CHARTING RULES:",
+        "- If the user asks for a chart or graph, and you do not have the complete list of individual data points (labels and numeric values) in the recent chat history, you MUST query the database first using the list/read tools.",
+        "- For sales charts (like line charts or bar charts of sales), query individual records using `get_sales_orders` to get multiple data points (dates and order values) rather than `get_sales_summary`. When plotting sales orders, you MUST use the Customer names (not the order ID) as the labels on the X-axis (e.g., 'Grant Plastics Ltd' or 'Tech' instead of 'SAL-ORD-2026-00001').",
+        "- For subcontracting charts, query `get_subcontract_order_summary` or `list_subcontracted_items_to_be_received` to fetch raw records.",
+        "- After you receive the raw records from the database, call the appropriate chart tool (`create_bar_chart`, `create_line_chart`, or `create_pie_chart`) in the next step using the retrieved data.",
+        "- Extract raw numbers only (e.g., pass 11800 instead of '₹11,800' or '11.8k').",
+        "- Do NOT output plain-text markdown links or images like `![...](chart)`. You MUST call the chart tools to generate the graph."
+    ]
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
     call_messages = [SystemMessage(content="\n".join(system_parts)), *history]
@@ -617,14 +664,33 @@ async def agent_node(state: ChatState) -> dict:
 
     if not is_recovered:
         # Real tool calls: thread the results back in as ToolMessages and
-        # let the model compose the final reply. Only the final text is
-        # persisted to short-term memory -- the intermediate tool-call
-        # message isn't, so a later trimmed window never ships an
-        # orphaned tool_call without its ToolMessage alongside it.
-        for tool_call, result in results:
-            call_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
-        final_response = llm_with_tools.invoke(call_messages)
-        return {"messages": [final_response]}
+        # let the model compose the final reply. We loop recursively inside agent_node
+        # if the model wants to call more tools (e.g. read tools first, then chart tools).
+        current_response = response
+        is_first_iteration = True
+        while current_response.tool_calls:
+            current_results = []
+            for tc in current_response.tool_calls:
+                res = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=state.get("session_id"))
+                logger.info("Tool '%s' raw result: %s", tc["name"], res)
+                current_results.append((tc, res))
+            
+            if not is_first_iteration:
+                call_messages.append(current_response)
+                
+            for tc, res in current_results:
+                call_messages.append(ToolMessage(content=str(res), tool_call_id=tc["id"]))
+            
+            current_response = llm_with_tools.invoke(call_messages)
+            is_first_iteration = False
+            
+            # Auto-append chart spec if one of the tools was a chart tool and not present in final response
+            for tc, res in current_results:
+                if tc["name"] in ["create_bar_chart", "create_line_chart", "create_pie_chart"]:
+                    if "```chart" in str(res) and "```chart" not in current_response.content:
+                        current_response.content = current_response.content + "\n" + str(res)
+                        
+        return {"messages": [current_response]}
 
     # Recovered fake tool call: there's no real AIMessage.tool_calls entry
     # to attach a ToolMessage to. Summarize the result directly instead —
@@ -634,6 +700,13 @@ async def agent_node(state: ChatState) -> dict:
         for tc, result in results
     ) + "\nGive the user a short, professional confirmation (1-2 sentences)."
     summary = text_chain.invoke({"input": summary_prompt})
+    
+    # Auto-append chart spec if not present in summary
+    for tool_call, result in results:
+        if tool_call["name"] in ["create_bar_chart", "create_line_chart", "create_pie_chart"]:
+            if "```chart" in str(result) and "```chart" not in summary:
+                summary = summary + "\n" + str(result)
+                
     return {"messages": [AIMessage(content=summary)]}
 
 
