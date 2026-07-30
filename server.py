@@ -99,6 +99,9 @@ class OpenAIChatModel(BaseChatModel):
             data["tools"] = self.bound_tools
             
         response = requests.post(base_url, json=data, headers=headers)
+        if response.status_code >= 400:
+            logging.error(f"OpenRouter Error Status {response.status_code}: {response.text}")
+            logging.error(f"Payload sent: {json.dumps(data, indent=2)}")
         response.raise_for_status()
         res_json = response.json()
         
@@ -554,6 +557,15 @@ async def agent_node(state: ChatState) -> dict:
     if not candidate_tools:
         reply = text_chain.invoke({"input": last_user_msg})
         return {"messages": [AIMessage(content=reply)]}
+
+    # Deduplicate tools by name to prevent OpenAI/OpenRouter 400 Bad Request
+    seen = set()
+    unique_tools = []
+    for t in candidate_tools:
+        if t.name not in seen:
+            seen.add(t.name)
+            unique_tools.append(t)
+    candidate_tools = unique_tools
 
     logger.info("Tools selected for query: %s", [t.name for t in candidate_tools])
 
