@@ -354,12 +354,29 @@ class ChatState(TypedDict):
     user_id: Optional[str] # who prompted this turn, passed through for the same reason
 
 
+# Values a model sometimes invents in place of a real answer when it
+# doesn't actually know one, instead of leaving the field blank so
+# slot-filling can ask. Treated as "still missing" so a required field
+# (e.g. company, warehouse) can't be silently satisfied by a guess.
+_PLACEHOLDER_VALUES = {
+    "default", "n/a", "na", "none", "null", "unknown",
+    "not specified", "not sure", "unspecified", "todo", "tbd", "-",
+}
+
+
 def _missing_fields(tool_name: str, args: dict) -> list:
     """Ordered (field, question) pairs required for `tool_name` that are
-    absent or empty in `args`."""
+    absent, empty, or filled with a placeholder-like guess in `args`."""
     required = ALL_REQUIRED_FIELDS.get(tool_name, [])
     args = args or {}
-    return [(field, question) for field, question in required if not args.get(field)]
+    missing = []
+    for field, question in required:
+        value = args.get(field)
+        if not value:
+            missing.append((field, question))
+        elif isinstance(value, str) and value.strip().lower() in _PLACEHOLDER_VALUES:
+            missing.append((field, question))
+    return missing
 
 
 def _last_human_message(messages) -> Optional[str]:
