@@ -11,6 +11,7 @@ from typing import List, Union
 from langchain_core.tools import tool
 
 
+
 @tool
 def create_bar_chart(
     title: str,

@@ -99,13 +99,27 @@ def _resolve_link(doctype, value):
 # ---------------------------------------------------------------------
 
 @mcp.tool()
-def get_sales_orders(limit: int = DEFAULT_LIST_LIMIT) -> str:
-    """Get the most recent sales orders, including customer, date, total
-    value, and status."""
+def get_sales_orders(
+    customer: Optional[str] = None,
+    period_days: Optional[int] = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+) -> str:
+    """Get sales orders. You can filter by `customer` (name of the customer,
+    e.g. 'Grant Plastics Ltd.') and/or `period_days` (e.g., pass 30 to get orders
+    from the last 30 days / last month, 7 for last week, 365 for last year).
+    Returns the most recent matches up to the limit (default 20)."""
     def run():
+        filters = []
+        if customer:
+            filters.append(["customer", "=", customer])
+        if period_days is not None:
+            since = (date.today() - timedelta(days=period_days)).isoformat()
+            filters.append(["transaction_date", ">=", since])
+            
         orders = erp_client.get_list(
             "Sales Order",
             fields=["name", "customer", "transaction_date", "grand_total", "status"],
+            filters=filters if filters else None,
             order_by="transaction_date desc",
             limit=limit,
         )

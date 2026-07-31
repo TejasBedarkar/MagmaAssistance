@@ -96,7 +96,14 @@ class ToolRAG:
                 model_name,
                 DEFAULT_MODEL_NAME,
             )
-            self.model = SentenceTransformer(DEFAULT_MODEL_NAME)
+            try:
+                self.model = SentenceTransformer(DEFAULT_MODEL_NAME)
+            except Exception as exc:
+                logger.warning(
+                    "Network request to Hugging Face Hub failed (%s); attempting to load from local cache...",
+                    exc,
+                )
+                self.model = SentenceTransformer(DEFAULT_MODEL_NAME, local_files_only=True)
 
         self._index_tools()
 

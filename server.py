@@ -293,12 +293,29 @@ class ChatState(TypedDict):
     session_id: str        # thread id, passed through so nodes can attribute audit_log entries
 
 
+# Values a model sometimes invents in place of a real answer when it
+# doesn't actually know one, instead of leaving the field blank so
+# slot-filling can ask. Treated as "still missing" so a required field
+# (e.g. company, warehouse) can't be silently satisfied by a guess.
+_PLACEHOLDER_VALUES = {
+    "default", "n/a", "na", "none", "null", "unknown",
+    "not specified", "not sure", "unspecified", "todo", "tbd", "-",
+}
+
+
 def _missing_fields(tool_name: str, args: dict) -> list:
     """Ordered (field, question) pairs required for `tool_name` that are
-    absent or empty in `args`."""
+    absent, empty, or filled with a placeholder-like guess in `args`."""
     required = ALL_REQUIRED_FIELDS.get(tool_name, [])
     args = args or {}
-    return [(field, question) for field, question in required if not args.get(field)]
+    missing = []
+    for field, question in required:
+        value = args.get(field)
+        if not value:
+            missing.append((field, question))
+        elif isinstance(value, str) and value.strip().lower() in _PLACEHOLDER_VALUES:
+            missing.append((field, question))
+    return missing
 
 
 def _last_human_message(messages) -> Optional[str]:
@@ -568,26 +585,45 @@ async def agent_node(state: ChatState) -> dict:
     retrieval_query = f"{task_context}. {last_user_msg}" if task_context else last_user_msg
     candidate_tools = tool_rag.retrieve(retrieval_query)
     
-    # Force charting and relevant read/list tools if query is chart-related to guarantee they are available to the LLM
+    # Force charting and relevant read/list tools if query is chart-related or a summary/details list query
     query_lower = retrieval_query.lower() if retrieval_query else ""
-    if any(word in query_lower for word in ["chart", "graph", "plot", "bar", "pie", "line"]):
+    task_lower = task_context.lower() if task_context else ""
+    
+    # Check if this is a query for a single specific record (which should NOT have a chart)
+    is_single_record_query = any(word in query_lower for word in ["so-", "qtn-", "lead-", "wc-", "job-", "bom-", "customer_name", "lead_id", "order_id", "by its id", "by id", "specific"]) or ("details of" in query_lower and not any(x in query_lower for x in ["all", "recent", "list"]))
+    
+    # Active domains in query or task context
+    is_sales_context = any(x in query_lower or x in task_lower for x in ["sales", "revenue", "cost", "income", "value"])
+    is_subcontract_context = any(x in query_lower or x in task_lower for x in ["subcontract", "raw", "transfer", "received"])
+    is_mfg_context = any(x in query_lower or x in task_lower for x in ["work order", "job card", "production"])
+    
+    chart_keywords = ["chart", "graph", "plot", "bar", "pie", "line"]
+    list_keywords = ["details", "orders", "summary", "materials", "items", "list", "outstanding", "work orders", "job cards", "sales"]
+    
+    is_chart_related = any(word in query_lower for word in chart_keywords)
+    is_list_related = (
+        any(word in query_lower for word in list_keywords) or
+        (any(word in query_lower for word in ["all", "show", "list", "give", "display"]) and (is_sales_context or is_subcontract_context or is_mfg_context))
+    ) and not is_single_record_query
+    
+    if is_chart_related or is_list_related:
         # Always inject chart tools
         for t_name in ["create_bar_chart", "create_line_chart", "create_pie_chart"]:
             if t_name in tool_map and tool_map[t_name] not in candidate_tools:
                 candidate_tools.append(tool_map[t_name])
         
         # Inject relevant read tools based on query context to allow the LLM to query the database first
-        if any(word in query_lower for word in ["sales", "revenue", "cost", "income", "value"]):
+        if is_sales_context:
             for t_name in ["get_sales_orders", "get_sales_summary", "get_pending_sales_orders"]:
                 if t_name in tool_map and tool_map[t_name] not in candidate_tools:
                     candidate_tools.append(tool_map[t_name])
                     
-        if any(word in query_lower for word in ["subcontract", "raw", "transfer", "received"]):
+        if is_subcontract_context:
             for t_name in ["get_subcontract_order_summary", "list_subcontracted_raw_materials_to_be_transferred", "list_subcontracted_items_to_be_received"]:
                 if t_name in tool_map and tool_map[t_name] not in candidate_tools:
                     candidate_tools.append(tool_map[t_name])
                     
-        if any(word in query_lower for word in ["work order", "job card", "production"]):
+        if is_mfg_context:
             for t_name in ["list_work_orders", "get_work_order", "list_job_cards"]:
                 if t_name in tool_map and tool_map[t_name] not in candidate_tools:
                     candidate_tools.append(tool_map[t_name])
@@ -611,10 +647,13 @@ async def agent_node(state: ChatState) -> dict:
     system_parts = [
         assistant.llm.system_prompt,
         "\nIMPORTANT CHARTING RULES:",
-        "- If the user asks for a chart or graph, and you do not have the complete list of individual data points (labels and numeric values) in the recent chat history, you MUST query the database first using the list/read tools.",
-        "- For sales charts (like line charts or bar charts of sales), query individual records using `get_sales_orders` to get multiple data points (dates and order values) rather than `get_sales_summary`. When plotting sales orders, you MUST use the Customer names (not the order ID) as the labels on the X-axis (e.g., 'Grant Plastics Ltd' or 'Tech' instead of 'SAL-ORD-2026-00001').",
-        "- For subcontracting charts, query `get_subcontract_order_summary` or `list_subcontracted_items_to_be_received` to fetch raw records.",
-        "- After you receive the raw records from the database, call the appropriate chart tool (`create_bar_chart`, `create_line_chart`, or `create_pie_chart`) in the next step using the retrieved data.",
+        "- Automatically generate and display a chart ONLY when it is meaningful and necessary to visualize the data. This includes comparing numeric totals (such as sales/order values per customer, planned vs. completed quantities), tracking trends over time, or displaying status breakdowns.",
+        "- Do NOT generate a chart for simple listings of recent documents or text-only fields where a visual comparison does not add value (such as 'latest quotations list', 'recent leads', 'item descriptions', or 'address details'). In these cases, return ONLY the text/markdown table.",
+        "- Do NOT output intermediate messages telling the user to wait or that you are loading/fetching/generating the chart. Perform all database queries and chart tool calls silently and return the final text + chart block response directly.",
+        "- If you do not have the database records in the message history, you MUST query the database first using the list/read tools (e.g. `get_sales_orders`, `get_subcontract_order_summary`) and then generate the chart from that data.",
+        "- When retrieving status summaries or plotting sales status breakdowns, do not rely on the default 30 days. You MUST pass a larger `period_days` parameter (e.g. 365 or 1000 days) to `get_sales_summary` to capture older statuses like 'To Deliver and Bill' and 'To Bill' that fell outside the default 30-day window.",
+        "- If the query is about a SINGLE specific record (e.g. asking by specific ID like 'SO-2026-00001', or for one customer's details), do NOT generate any charts. Only return the text details.",
+        "- For sales order lists, use Customer names as the labels on the X-axis (e.g. 'Grant Plastics Ltd' or 'Tech' instead of 'SAL-ORD-2026-00001').",
         "- Extract raw numbers only (e.g., pass 11800 instead of '₹11,800' or '11.8k').",
         "- Do NOT output plain-text markdown links or images like `![...](chart)`. You MUST call the chart tools to generate the graph."
     ]
