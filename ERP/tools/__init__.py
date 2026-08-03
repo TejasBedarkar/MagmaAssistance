@@ -29,6 +29,7 @@ from .inventory_write_tools import (
     REQUIRED_FIELDS as INVENTORY_REQUIRED_FIELDS,
     FIELD_PARSERS as INVENTORY_FIELD_PARSERS,
 )
+from .inventory_read_tools import INVENTORY_READ_TOOLS
 from .hr_write_tools import (
     HR_WRITE_TOOLS,
     REQUIRED_FIELDS as HR_REQUIRED_FIELDS,
@@ -44,19 +45,18 @@ from .purchase_write_tools import (
     REQUIRED_FIELDS as PURCHASE_REQUIRED_FIELDS,
     FIELD_PARSERS as PURCHASE_FIELD_PARSERS,
 )
+from .purchase_read_tools import PURCHASE_READ_TOOLS
 from .capabilities_tools import CAPABILITY_TOOLS
-
-# NEW: Import OCR PO Tool
-from .ocr_po_tool import process_ocr_po_and_create_order
 
 ALL_TOOLS = [
     *SALES_WRITE_TOOLS,
+    *INVENTORY_READ_TOOLS,
     *INVENTORY_WRITE_TOOLS,
     *HR_WRITE_TOOLS,
     *ACCOUNTS_WRITE_TOOLS,
+    *PURCHASE_READ_TOOLS,
     *PURCHASE_WRITE_TOOLS,
     *CAPABILITY_TOOLS,
-    process_ocr_po_and_create_order,  # Added OCR Tool here
 ]
 
 ALL_REQUIRED_FIELDS = {

@@ -232,8 +232,18 @@ def record_file_upload(
     status: str = "processed",
 ) -> str:
     """Inserts one file_uploads row and returns its id (uuid string).
-    Call this right after storage.s3_storage.upload_file() succeeds."""
+    The parent session is created in the same transaction first so a new
+    upload session cannot violate file_uploads_session_id_fkey."""
     with _conn() as conn, conn.cursor() as cur:
+        if session_id:
+            cur.execute(
+                """
+                INSERT INTO sessions (session_id, user_id)
+                VALUES (%s, %s)
+                ON CONFLICT (session_id) DO NOTHING
+                """,
+                (session_id, user_id),
+            )
         cur.execute(
             """
             INSERT INTO file_uploads (

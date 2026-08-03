@@ -70,6 +70,24 @@ def _payload(**kwargs):
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
+_MAPPED_DOC_METADATA = {
+    "name", "owner", "creation", "modified", "modified_by", "docstatus", "idx",
+}
+
+
+def _clean_mapped_doc(value):
+    """Remove Frappe identity/UI metadata from a mapped but unsaved doc."""
+    if isinstance(value, list):
+        return [_clean_mapped_doc(row) for row in value]
+    if isinstance(value, dict):
+        return {
+            key: _clean_mapped_doc(item)
+            for key, item in value.items()
+            if key not in _MAPPED_DOC_METADATA and not key.startswith("__")
+        }
+    return value
+
+
 # ---------------------------------------------------------------------
 # Supplier (+ a linked Contact for email/mobile, same as create_customer)
 # ---------------------------------------------------------------------
@@ -249,12 +267,54 @@ def create_purchase_invoice(
     return _safe_call(f"create purchase invoice for {supplier}", run)
 
 
+@tool
+def create_purchase_invoice_from_purchase_order(
+    purchase_order_id: str,
+    due_date: Optional[str] = None,
+    submit: bool = False,
+):
+    """Create a Purchase Invoice directly from an existing Purchase Order.
+    Use this when the user says "using/from/against purchase order". The
+    supplier, uninvoiced items, quantities, rates, taxes, and PO row links
+    are loaded from ERPNext, so do not ask the user to repeat them. Requires
+    only the Purchase Order ID; due_date is optional. Creates a draft unless
+    submit is explicitly requested."""
+
+    def run():
+        mapped = erp_client.call_method(
+            "erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_invoice",
+            params={"source_name": purchase_order_id},
+            use_cache=False,
+        )
+        if not isinstance(mapped, dict):
+            raise RuntimeError("ERPNext did not return a mapped Purchase Invoice document.")
+
+        # Mapped documents include server-managed metadata that should not
+        # be posted as a new resource.
+        data = _clean_mapped_doc(mapped)
+        data["doctype"] = "Purchase Invoice"
+        if due_date:
+            data["due_date"] = due_date
+
+        result = erp_client.create_doc("Purchase Invoice", data)
+        if submit:
+            invoice_id = result.get("name")
+            try:
+                result = erp_client.submit_doc("Purchase Invoice", invoice_id)
+            except Exception as exc:  # noqa: BLE001
+                return str(result) + f" (created as draft; submit failed: {exc})"
+        return str(result)
+
+    return _safe_call(f"create purchase invoice from {purchase_order_id}", run)
+
+
 PURCHASE_WRITE_TOOLS = [
     create_supplier,
     update_supplier,
     create_purchase_order,
     update_purchase_order,
     create_purchase_invoice,
+    create_purchase_invoice_from_purchase_order,
 ]
 
 
@@ -288,6 +348,9 @@ REQUIRED_FIELDS = {
             "'item code, quantity, rate' — separate multiple items with a "
             "semicolon, e.g. 'ITEM-001, 50, 1200; ITEM-002, 10, 500'.",
         ),
+    ],
+    "create_purchase_invoice_from_purchase_order": [
+        ("purchase_order_id", "Which Purchase Order should I use? Please give its ID."),
     ],
 }
 

@@ -4,6 +4,7 @@ import re
 import shutil
 import logging
 import json
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -252,6 +253,48 @@ TOOL_RAG_MIN_SCORE = float(os.environ.get("TOOL_RAG_MIN_SCORE", "0.25"))
 # tool_rag/tool_map are declared here and mutated (not replaced) there.
 tool_rag = None
 tool_map = {}
+
+
+def _validate_tool_registry(tools, required_fields, field_parsers):
+    """Fail at startup when tool schemas and orchestration metadata drift."""
+    names = [tool.name for tool in tools]
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        raise RuntimeError(f"Duplicate local tool names: {duplicate_names}")
+
+    by_name = {tool.name: tool for tool in tools}
+    errors = []
+    for tool_name, questions in required_fields.items():
+        tool = by_name.get(tool_name)
+        if not tool:
+            errors.append(f"required-field metadata references missing tool {tool_name}")
+            continue
+        schema_fields = set(getattr(tool.args_schema, "model_fields", {}))
+        metadata_fields = {field for field, _question in questions}
+        schema_required = {
+            field for field, info in getattr(tool.args_schema, "model_fields", {}).items()
+            if info.is_required()
+        }
+        if metadata_fields != schema_required:
+            errors.append(
+                f"{tool_name}: schema requires {sorted(schema_required)}, "
+                f"metadata defines {sorted(metadata_fields)}"
+            )
+        unknown = metadata_fields - schema_fields
+        if unknown:
+            errors.append(f"{tool_name}: unknown required fields {sorted(unknown)}")
+
+    for tool_name, field in field_parsers:
+        tool = by_name.get(tool_name)
+        schema_fields = set(getattr(getattr(tool, "args_schema", None), "model_fields", {})) if tool else set()
+        if field not in schema_fields:
+            errors.append(f"parser references unknown field {tool_name}.{field}")
+
+    if errors:
+        raise RuntimeError("Invalid ERP tool registry:\n- " + "\n- ".join(errors))
+
+
+_validate_tool_registry(ALL_TOOLS, ALL_REQUIRED_FIELDS, ALL_FIELD_PARSERS)
 if ALL_TOOLS:
     logger.info("Indexing %d local ERP tool(s) for retrieval...", len(ALL_TOOLS))
     tool_rag = ToolRAG(ALL_TOOLS, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
@@ -290,12 +333,23 @@ async def lifespan(app: FastAPI):
     try:
         mcp_tools = await mcp_tool_source.start()
         if mcp_tools:
-            logger.info("Loaded %d MCP tool(s) from ERP/mcp_server.py", len(mcp_tools))
-            if tool_rag:
-                tool_rag.add_tools(mcp_tools)
+            # Local tools are the canonical implementations because their
+            # schemas and REQUIRED_FIELDS metadata are versioned together.
+            # MCP currently exposes several tools with the same names but
+            # older/different signatures (for example create_quotation).
+            # Never index or overwrite a canonical tool with such a duplicate.
+            duplicate_names = sorted({tool.name for tool in mcp_tools if tool.name in tool_map})
+            unique_mcp_tools = [tool for tool in mcp_tools if tool.name not in tool_map]
+            logger.info(
+                "Loaded %d MCP tool(s); using %d unique tools and skipping %d duplicate names: %s",
+                len(mcp_tools), len(unique_mcp_tools), len(duplicate_names), duplicate_names,
+            )
+            if tool_rag and unique_mcp_tools:
+                tool_rag.add_tools(unique_mcp_tools)
             else:
-                tool_rag = ToolRAG(mcp_tools, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
-            tool_map.update({tool.name: tool for tool in mcp_tools})
+                if unique_mcp_tools and not tool_rag:
+                    tool_rag = ToolRAG(unique_mcp_tools, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
+            tool_map.update({tool.name: tool for tool in unique_mcp_tools})
         else:
             logger.warning("ERP MCP server started but reported zero tools.")
     except Exception:
@@ -355,6 +409,8 @@ class ChatState(TypedDict):
     task_slots: dict
     pending_tool: Optional[str]
     pending_missing: list  # ordered [(field, question), ...] still to collect
+    pending_confirmation: bool  # explicit approval required before document-derived writes
+    stop_after_intake: bool
     session_id: str        # thread id, passed through so nodes can attribute audit_log entries
     user_id: Optional[str] # who prompted this turn, passed through for the same reason
 
@@ -365,6 +421,54 @@ def _missing_fields(tool_name: str, args: dict) -> list:
     required = ALL_REQUIRED_FIELDS.get(tool_name, [])
     args = args or {}
     return [(field, question) for field, question in required if not args.get(field)]
+
+
+def _is_write_tool(tool_name: str) -> bool:
+    """Conservatively identify tools that can mutate ERPNext data."""
+    return tool_name.startswith(("create_", "update_", "delete_", "submit_", "cancel_")) or (
+        tool_name == "process_ocr_po_and_create_order"
+    )
+
+
+def _is_document_read_request(text: str, session_id: Optional[str]) -> bool:
+    """Route document Q&A directly to the LLM without exposing ERP tools.
+
+    This prevents a retrieval similarity (especially around invoices/POs)
+    from turning a read-only question into a create action.
+    """
+    if not session_id or not document_store.get(session_id):
+        return False
+    normalized = text.lower()
+    document_reference = re.search(
+        r"\b(document|doc|pdf|image|file|attachment|upload(?:ed)?|this|it)\b",
+        normalized,
+    )
+    read_intent = re.search(
+        r"\b(tell|explain|summari[sz]e|read|extract|show|what|who|when|where|why|how|check|find|describe|question|ask)\b",
+        normalized,
+    )
+    write_intent = re.search(
+        r"\b(create|add|save|insert|update|edit|delete|remove|submit|cancel|fill|populate|make|generate|convert|import|post)\b",
+        normalized,
+    )
+    return bool(document_reference and read_intent and not write_intent)
+
+
+def _confirmation_prompt(tool_name: str, args: dict) -> str:
+    return (
+        f"I extracted data for the ERP action `{tool_name}` with these values: "
+        f"{json.dumps(args, ensure_ascii=False, default=str)}. "
+        "This will write data to ERPNext. Shall I proceed? Reply yes to confirm or no to cancel."
+    )
+
+
+def _confirmation_answer(text: str) -> Optional[bool]:
+    normalized = re.sub(r"[^a-z]+", " ", text.lower()).strip()
+    if normalized in {"yes", "y", "confirm", "confirmed", "proceed", "go ahead", "do it", "save it"}:
+        return True
+    if normalized in {"no", "n", "cancel", "stop", "do not", "don t", "do not save"}:
+        return False
+    return None
 
 
 def _last_human_message(messages) -> Optional[str]:
@@ -417,6 +521,35 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
 
     cleaned = dict(args)
 
+    # Accept the older list-based quotation shape defensively. This was
+    # exposed by the duplicate MCP implementation and may still appear in
+    # saved conversations or from a model following older context.
+    if tool_name == "create_quotation" and isinstance(cleaned.get("items"), list):
+        item_rows = cleaned.pop("items")
+        if item_rows:
+            first = item_rows[0] or {}
+            cleaned.setdefault("item_code", first.get("item_code"))
+            cleaned.setdefault("quantity", first.get("qty", first.get("quantity")))
+            cleaned.setdefault("rate", first.get("rate"))
+            if len(item_rows) > 1:
+                cleaned.setdefault("extra_items", item_rows[1:])
+    if tool_name == "create_quotation":
+        aliases = {
+            "transaction_date": "date",
+            "quotation_date": "date",
+            "party_name": "customer",
+            "qty": "quantity",
+        }
+        for old_name, canonical_name in aliases.items():
+            if old_name in cleaned and canonical_name not in cleaned:
+                cleaned[canonical_name] = cleaned.pop(old_name)
+
+    unknown_args = set(cleaned) - set(fields)
+    if unknown_args:
+        logger.warning("Dropping unknown arguments for tool '%s': %s", tool_name, sorted(unknown_args))
+        for field_name in unknown_args:
+            cleaned.pop(field_name, None)
+
     for field_name, field_info in fields.items():
         if field_name not in cleaned:
             continue
@@ -453,46 +586,190 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
 # Initialize LLM instance for OCR processing
 llm_ocr_engine = LLM()
 
+# class DocumentUploadResponse(BaseModel):
+#     status: str
+#     filename: str
+#     message: str
+#     ocr_data: Optional[Dict[str, Any]] = None
+
+# @app.post("/api/upload-po", response_model=DocumentUploadResponse)
+# async def upload_purchase_order_file(
+#     file: UploadFile = File(...),
+#     session_id: str = Form("default"),
+#     user_id: str = Form("anonymous"),
+# ):
+#     """
+#     Handles PO Image / PDF file upload, runs Vision OCR extraction, and --
+#     if the document actually looks like a Purchase Order -- creates it
+#     directly in ERPNext right here via the OCR-aware auto-create tool
+#     (process_ocr_po_and_create_order in ERP/tools/ocr_po_tool.py, which
+#     matches-or-auto-creates the Supplier and Items).
+
+#     This is deliberate: it does NOT hand the extracted data off to the
+#     chat agent to decide which tool to call. That path is ambiguous --
+#     the agent's tool-RAG retrieval can surface the generic
+#     create_purchase_order tool (ERP/tools/purchase_write_tools.py)
+#     instead, which requires an *already-existing* Supplier ID and Item
+#     codes and fails outright ("supplier/item not found") rather than
+#     auto-creating them like the OCR tool does. Calling the right tool
+#     directly here removes that ambiguity entirely.
+
+#     If the document doesn't look like a PO, nothing is created -- its
+#     extracted text is stashed in document_store instead (same as
+#     /api/upload-document), so the user can ask questions about it in
+#     chat afterward.
+#     """
+#     allowed_types = ["image/jpeg", "image/png", "application/pdf", "image/jpg"]
+
+#     # 1. Check file type
+#     if file.content_type.lower() not in allowed_types:
+#         raise HTTPException(
+#             status_code=400,
+#             detail=f"Unsupported file format '{file.content_type}'. Please upload JPEG, PNG, or PDF."
+#         )
+
+#     try:
+#         # 2. Read file bytes
+#         file_bytes = await file.read()
+
+#         # 3. Check file size (Max 10MB)
+#         if len(file_bytes) > 10 * 1024 * 1024:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="File size exceeds the 10MB limit."
+#             )
+
+#         logger.info(f"File '{file.filename}' uploaded successfully for session '{session_id}'. Extracting OCR data...")
+
+#         # 3.5. Store the original file in S3 and record who uploaded it
+#         # and when -- independent of whether OCR later decides it's a PO
+#         # or not, so the original document is never lost.
+#         upload_meta = s3_storage.upload_file(
+#             file_bytes=file_bytes,
+#             original_filename=file.filename,
+#             content_type=file.content_type,
+#             upload_kind="purchase_order",
+#             session_id=session_id,
+#             user_id=user_id,
+#         )
+
+#         # 4. Trigger Vision OCR Extraction from LLM.py. ocr_result["is_po"]
+#         # tells us which branch this document fell into.
+#         ocr_result = llm_ocr_engine.extract_po_data_from_document(
+#             file_bytes=file_bytes,
+#             mime_type=file.content_type
+#         )
+
+#         if not ocr_result.get("is_po"):
+#             # Not a recognizable PO -- store its text for chat Q&A
+#             # instead of attempting (and failing) to create anything.
+#             document_store[session_id] = {
+#                 "filename": file.filename,
+#                 "text": ocr_result.get("raw_text", ""),
+#                 "injected": False,
+#             }
+#             audit_log.record_file_upload(
+#                 **upload_meta, extracted_metadata=ocr_result, status="processed",
+#             )
+#             return DocumentUploadResponse(
+#                 status="not_a_po",
+#                 filename=file.filename,
+#                 message=ocr_result.get(
+#                     "note", "This document doesn't look like a Purchase Order."
+#                 ) + " You can ask questions about it in chat.",
+#                 ocr_data=ocr_result
+#             )
+
+#         # 5. It IS a PO -- create it directly via the OCR-aware auto-create
+#         # tool (matches/auto-creates Supplier + Items), bypassing the chat
+#         # agent's tool selection for this flow.
+#         create_args = {
+#             "vendor_name": ocr_result.get("vendor_name", ""),
+#             "items": ocr_result.get("items", []),
+#             "po_number": ocr_result.get("po_number", ""),
+#             "delivery_date": ocr_result.get("delivery_date", ""),
+#             "remarks": ocr_result.get("payment_terms", ""),
+#         }
+#         creation_result = await _execute_tool(
+#             "process_ocr_po_and_create_order", create_args, session_id=session_id,
+#             user_id=user_id, prompt_text=f"[uploaded PO file '{file.filename}']",
+#         )
+#         logger.info("PO auto-create result: %s", creation_result)
+
+#         audit_log.record_file_upload(
+#             **upload_meta, extracted_metadata=ocr_result, status="processed",
+#         )
+
+#         return DocumentUploadResponse(
+#             status="success",
+#             filename=file.filename,
+#             message=str(creation_result),
+#             ocr_data=ocr_result
+#         )
+
+#     except HTTPException as http_exc:
+#         raise http_exc
+#     except Exception as e:
+#         logger.exception("Error handling document upload in /api/upload-po")
+#         raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
+
+
+
+# # =====================================================================
+# # GENERAL-PURPOSE DOCUMENT UPLOAD (ANY PDF/IMAGE, NOT JUST POs)
+# # =====================================================================
+# # Separate from /api/upload-po above -- that endpoint's strict Purchase
+# # Order JSON extraction / auto-create-in-ERPNext flow is untouched.
+# # This lets a user upload any PDF/image and then just ask questions
+# # about it in normal chat (/api/chat, /query); the extracted text is
+# # stashed here per session_id and injected into the conversation once
+# # by generate_reply() below.
+# document_store: Dict[str, Dict[str, Any]] = {}  # session_id -> {filename, text, injected}
+
+
+document_store: Dict[str, Dict[str, Any]] = {}  # session_id -> {filename, text, injected}
+
+MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+ALLOWED_DOCUMENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".pdf": "application/pdf",
+}
+
 class DocumentUploadResponse(BaseModel):
     status: str
     filename: str
     message: str
     ocr_data: Optional[Dict[str, Any]] = None
 
+
 @app.post("/api/upload-po", response_model=DocumentUploadResponse)
-async def upload_purchase_order_file(
+@app.post("/api/upload-document", response_model=DocumentUploadResponse)
+async def upload_generic_document_file(
     file: UploadFile = File(...),
     session_id: str = Form("default"),
     user_id: str = Form("anonymous"),
 ):
     """
-    Handles PO Image / PDF file upload, runs Vision OCR extraction, and --
-    if the document actually looks like a Purchase Order -- creates it
-    directly in ERPNext right here via the OCR-aware auto-create tool
-    (process_ocr_po_and_create_order in ERP/tools/ocr_po_tool.py, which
-    matches-or-auto-creates the Supplier and Items).
+    Unified Endpoint: Upload hue document (Image/PDF) se Vision OCR/Text extract karta hai
+    aur runtime memory (document_store) mein stash kar deta hai.
 
-    This is deliberate: it does NOT hand the extracted data off to the
-    chat agent to decide which tool to call. That path is ambiguous --
-    the agent's tool-RAG retrieval can surface the generic
-    create_purchase_order tool (ERP/tools/purchase_write_tools.py)
-    instead, which requires an *already-existing* Supplier ID and Item
-    codes and fails outright ("supplier/item not found") rather than
-    auto-creating them like the OCR tool does. Calling the right tool
-    directly here removes that ambiguity entirely.
-
-    If the document doesn't look like a PO, nothing is created -- its
-    extracted text is stashed in document_store instead (same as
-    /api/upload-document), so the user can ask questions about it in
-    chat afterward.
+    Isse chat agent dynamic commands (e.g., 'Is invoice se Lead banayein',
+    'Customer record add karein', ya 'PO generate karein') ke basis par
+    sahi ERP tool aur DocType choose karke task complete karega.
     """
-    allowed_types = ["image/jpeg", "image/png", "application/pdf", "image/jpg"]
-    
-    # 1. Check file type
-    if file.content_type.lower() not in allowed_types:
+    filename = Path(file.filename or "").name
+    extension = Path(filename).suffix.lower()
+    content_type = (file.content_type or "").lower()
+    expected_type = ALLOWED_DOCUMENT_TYPES.get(extension)
+    accepted_types = {expected_type} if expected_type else set()
+    if extension in {".jpg", ".jpeg"}:
+        accepted_types.add("image/jpg")
+    if not expected_type or content_type not in accepted_types:
         raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format '{file.content_type}'. Please upload JPEG, PNG, or PDF."
+            status_code=415,
+            detail="Unsupported file format. Please upload a JPEG, PNG, or PDF file."
         )
 
     try:
@@ -500,176 +777,93 @@ async def upload_purchase_order_file(
         file_bytes = await file.read()
         
         # 3. Check file size (Max 10MB)
-        if len(file_bytes) > 10 * 1024 * 1024:
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        if len(file_bytes) > MAX_DOCUMENT_BYTES:
             raise HTTPException(
-                status_code=400, 
+                status_code=413,
                 detail="File size exceeds the 10MB limit."
             )
 
-        logger.info(f"File '{file.filename}' uploaded successfully for session '{session_id}'. Extracting OCR data...")
+        session_id = session_id.strip()
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id must not be empty.")
 
-        # 3.5. Store the original file in S3 and record who uploaded it
-        # and when -- independent of whether OCR later decides it's a PO
-        # or not, so the original document is never lost.
+        logger.info("File '%s' uploaded for session '%s'; extracting text", filename, session_id)
+
+        # Establish the FK parent before S3 metadata is eventually logged.
+        audit_log.ensure_session(session_id, user_id)
+
+        # 4. S3 Storage Upload
         upload_meta = s3_storage.upload_file(
             file_bytes=file_bytes,
-            original_filename=file.filename,
-            content_type=file.content_type,
+            original_filename=filename,
+            content_type=content_type,
             upload_kind="purchase_order",
             session_id=session_id,
             user_id=user_id,
         )
 
-        # 4. Trigger Vision OCR Extraction from LLM.py. ocr_result["is_po"]
-        # tells us which branch this document fell into.
-        ocr_result = llm_ocr_engine.extract_po_data_from_document(
-            file_bytes=file_bytes, 
-            mime_type=file.content_type
-        )
-
-        if not ocr_result.get("is_po"):
-            # Not a recognizable PO -- store its text for chat Q&A
-            # instead of attempting (and failing) to create anything.
-            document_store[session_id] = {
-                "filename": file.filename,
-                "text": ocr_result.get("raw_text", ""),
-                "injected": False,
-            }
-            audit_log.record_file_upload(
-                **upload_meta, extracted_metadata=ocr_result, status="processed",
+        # 5. Generic OCR / Vision Extraction
+        # Structured auto-creation ko bypass karke flexible extraction
+        if hasattr(llm_ocr_engine, "extract_document_text"):
+            ocr_result = llm_ocr_engine.extract_document_text(
+                file_bytes=file_bytes,
+                mime_type=content_type
             )
-            return DocumentUploadResponse(
-                status="not_a_po",
-                filename=file.filename,
-                message=ocr_result.get(
-                    "note", "This document doesn't look like a Purchase Order."
-                ) + " You can ask questions about it in chat.",
-                ocr_data=ocr_result
+        else:
+            ocr_result = llm_ocr_engine.extract_po_data_from_document(
+                file_bytes=file_bytes,
+                mime_type=content_type
             )
 
-        # 5. It IS a PO -- create it directly via the OCR-aware auto-create
-        # tool (matches/auto-creates Supplier + Items), bypassing the chat
-        # agent's tool selection for this flow.
-        create_args = {
-            "vendor_name": ocr_result.get("vendor_name", ""),
-            "items": ocr_result.get("items", []),
-            "po_number": ocr_result.get("po_number", ""),
-            "delivery_date": ocr_result.get("delivery_date", ""),
-            "remarks": ocr_result.get("payment_terms", ""),
+        extracted_text = ocr_result.get("text") or ocr_result.get("raw_text", "")
+
+        # Accumulate documents within the session instead of replacing the
+        # previous upload. This supports single- or multi-file UI upload
+        # flows even when the client sends each multipart request separately.
+        stored_document = {
+            "filename": filename,
+            "text": extracted_text,
+            "ocr_meta": ocr_result,
         }
-        creation_result = await _execute_tool(
-            "process_ocr_po_and_create_order", create_args, session_id=session_id,
-            user_id=user_id, prompt_text=f"[uploaded PO file '{file.filename}']",
-        )
-        logger.info("PO auto-create result: %s", creation_result)
+        session_documents = document_store.get(session_id, {}).get("documents", [])
+        session_documents = [*session_documents, stored_document]
+        document_store[session_id] = {
+            "filename": filename,
+            "filenames": [document["filename"] for document in session_documents],
+            "documents": session_documents,
+            "text": "\n\n".join(
+                f"===== DOCUMENT: {document['filename']} =====\n{document['text']}"
+                for document in session_documents
+            ),
+            # Re-inject all accumulated context after every new upload.
+            "injected": False,
+        }
 
+        # Audit Logging
         audit_log.record_file_upload(
-            **upload_meta, extracted_metadata=ocr_result, status="processed",
+            **upload_meta,
+            extracted_metadata=ocr_result,
+            status="processed"
         )
 
         return DocumentUploadResponse(
             status="success",
-            filename=file.filename,
-            message=str(creation_result),
+            filename=filename,
+            message=(f"Document '{filename}' was processed successfully. "
+                     "You can now request a matching ERP action in chat."),
             ocr_data=ocr_result
         )
 
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        logger.exception("Error handling document upload in /api/upload-po")
-        raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
-
-
-
-# =====================================================================
-# GENERAL-PURPOSE DOCUMENT UPLOAD (ANY PDF/IMAGE, NOT JUST POs)
-# =====================================================================
-# Separate from /api/upload-po above -- that endpoint's strict Purchase
-# Order JSON extraction / auto-create-in-ERPNext flow is untouched.
-# This lets a user upload any PDF/image and then just ask questions
-# about it in normal chat (/api/chat, /query); the extracted text is
-# stashed here per session_id and injected into the conversation once
-# by generate_reply() below.
-document_store: Dict[str, Dict[str, Any]] = {}  # session_id -> {filename, text, injected}
-
-
-class GeneralDocumentUploadResponse(BaseModel):
-    status: str
-    filename: str
-    message: str
-    page_count: int
-    extraction_method: str
-
-
-@app.post("/api/upload-document", response_model=GeneralDocumentUploadResponse)
-async def upload_general_document(
-    file: UploadFile = File(...),
-    session_id: str = Form("default"),
-    user_id: str = Form("anonymous"),
-):
-    """Reads ANY PDF or image (not just Purchase Orders), extracts its
-    full text, and stores it against session_id so the user can ask
-    follow-up questions about it in normal chat."""
-    allowed_types = ["image/jpeg", "image/png", "application/pdf", "image/jpg"]
-
-    if file.content_type.lower() not in allowed_types:
+        logger.exception("Error handling generic document upload")
         raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format '{file.content_type}'. Please upload JPEG, PNG, or PDF."
-        )
-
-    try:
-        file_bytes = await file.read()
-        if len(file_bytes) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File size exceeds the 10MB limit.")
-
-        logger.info(f"File '{file.filename}' uploaded for session '{session_id}'. Extracting document text...")
-
-        upload_meta = s3_storage.upload_file(
-            file_bytes=file_bytes,
-            original_filename=file.filename,
-            content_type=file.content_type,
-            upload_kind="general_document",
-            session_id=session_id,
-            user_id=user_id,
-        )
-
-        extraction = llm_ocr_engine.extract_document_text(file_bytes=file_bytes, mime_type=file.content_type)
-
-        document_store[session_id] = {
-            "filename": file.filename,
-            "text": extraction["text"],
-            "injected": False,
-        }
-
-        audit_log.record_file_upload(
-            **upload_meta,
-            extracted_metadata={
-                "page_count": extraction["page_count"],
-                "pages_read": extraction["pages_read"],
-                "method": extraction["method"],
-            },
-            status="processed",
-        )
-
-        return GeneralDocumentUploadResponse(
-            status="success",
-            filename=file.filename,
-            message=(
-                f"Document read successfully ({extraction['pages_read']}/{extraction['page_count']} "
-                f"page(s), method={extraction['method']}). You can now ask questions about it in chat."
-            ),
-            page_count=extraction["page_count"],
-            extraction_method=extraction["method"],
-        )
-
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        logger.exception("Error handling document upload in /api/upload-document")
-        raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
-
+            status_code=500,
+            detail="Failed to store or extract the uploaded document.",
+        ) from e
 
 async def _execute_tool(
     tool_name: str,
@@ -774,17 +968,29 @@ def _extract_fake_tool_call(content: str):
     return {"name": name, "args": args, "id": "fake-tool-call-0"}
 
 
+# _CLASSIFY_SYSTEM = (
+#     "You track whether a new user message continues the SAME task as before, "
+#     "or starts a NEW, unrelated task, for an ERP sales assistant.\n"
+#     "Reply with ONLY a compact JSON object, nothing else: "
+#     '{"same_task": true|false, "task_label": "<3-6 word label for the CURRENT task after this message>"}\n'
+#     "Rules:\n"
+#     "- A follow-up about the same record/order/lead/customer, or the user "
+#     "supplying info the assistant just asked for, is the SAME task.\n"
+#     "- A greeting, thanks, or closing remark right after a task is finished "
+#     "does NOT start a new task; keep same_task=true with the same label.\n"
+#     "- A request about a different customer/record/action/topic is a NEW task."
+# )
+
 _CLASSIFY_SYSTEM = (
     "You track whether a new user message continues the SAME task as before, "
-    "or starts a NEW, unrelated task, for an ERP sales assistant.\n"
+    "or starts a NEW, unrelated task, for Magna AI assistant.\n"
     "Reply with ONLY a compact JSON object, nothing else: "
     '{"same_task": true|false, "task_label": "<3-6 word label for the CURRENT task after this message>"}\n'
     "Rules:\n"
-    "- A follow-up about the same record/order/lead/customer, or the user "
-    "supplying info the assistant just asked for, is the SAME task.\n"
+    "- A follow-up about the same topic, record, or user-supplied info is the SAME task.\n"
     "- A greeting, thanks, or closing remark right after a task is finished "
     "does NOT start a new task; keep same_task=true with the same label.\n"
-    "- A request about a different customer/record/action/topic is a NEW task."
+    "- A request about a different topic, action, or context is a NEW task."
 )
 
 
@@ -795,8 +1001,25 @@ def intake_node(state: ChatState) -> dict:
     record is complete. Otherwise, no-op and fall through to classify_task."""
     pending_tool = state.get("pending_tool")
     pending_missing = state.get("pending_missing") or []
+    if pending_tool and state.get("pending_confirmation"):
+        answer = _confirmation_answer(_last_human_message(state["messages"]) or "")
+        if answer is True:
+            return {"pending_confirmation": False}
+        if answer is False:
+            return {
+                "pending_tool": None,
+                "pending_missing": [],
+                "pending_confirmation": False,
+                "task_slots": {},
+                "stop_after_intake": True,
+                "messages": [AIMessage(content="Cancelled. No ERP record was created or changed.")],
+            }
+        return {
+            "messages": [AIMessage(content="Please reply yes to proceed with saving, or no to cancel.")],
+        }
+
     if not pending_tool or not pending_missing:
-        return {}
+        return {"stop_after_intake": False}
 
     last_user_msg = _last_human_message(state["messages"]) or ""
     field, _question = pending_missing[0]
@@ -816,12 +1039,21 @@ def intake_node(state: ChatState) -> dict:
     # All required fields collected -- clear the queue so the router sends
     # this to execute_pending. pending_tool/task_slots stay set until the
     # tool call actually runs (execute_pending clears them after).
+    if document_store.get(state.get("session_id")) and _is_write_tool(pending_tool):
+        return {
+            "task_slots": slots,
+            "pending_missing": [],
+            "pending_confirmation": True,
+            "messages": [AIMessage(content=_confirmation_prompt(pending_tool, slots))],
+        }
     return {"task_slots": slots, "pending_missing": []}
 
 
 def _route_after_intake(state: ChatState) -> str:
+    if state.get("stop_after_intake"):
+        return END
     if state.get("pending_tool"):
-        return END if state.get("pending_missing") else "execute_pending"
+        return END if state.get("pending_missing") or state.get("pending_confirmation") else "execute_pending"
     return "classify_task"
 
 
@@ -883,12 +1115,65 @@ async def agent_node(state: ChatState) -> dict:
         max_tokens=MAX_HISTORY_MESSAGES,
         token_counter=len,  # counts messages, not tokens -- a cheap, adequate proxy here
         strategy="last",
-        include_system=False,
+        # Keep the uploaded-document context available even after older chat
+        # turns are trimmed from the short-term conversation window.
+        include_system=True,
     )
+
+    # Document questions are conversational/read-only. Do not bind any ERP
+    # tools for these turns, regardless of ToolRAG similarity or DocType-like
+    # words appearing inside the uploaded text.
+    if _is_document_read_request(last_user_msg, state.get("session_id")):
+        reply = _plain_reply(history, task_context)
+        return {"messages": [AIMessage(content=reply)]}
 
     if not tool_rag:
         reply = _plain_reply(history, task_context)
         return {"messages": [AIMessage(content=reply)]}
+
+    # A request for how many/which Purchase Orders exist means all matching
+    # PO records, including drafts. Do not reinterpret "available" as only
+    # pending/submitted orders or accidentally choose a Sales Order tool.
+    normalized_lookup = last_user_msg.lower()
+    purchase_order_noun = re.search(r"\b(?:purchase orders?|pos?)\b", normalized_lookup)
+    purchase_order_list_intent = re.search(
+        r"\b(?:available|how many|what are|which|list|show|tell me|exist)\b",
+        normalized_lookup,
+    )
+    if purchase_order_noun and purchase_order_list_intent:
+        result = await _execute_tool(
+            "get_purchase_orders", {}, session_id=state.get("session_id"),
+            user_id=state.get("user_id"), prompt_text=last_user_msg,
+        )
+        return {"messages": [AIMessage(content=str(result))]}
+
+    purchase_invoice_noun = re.search(r"\b(?:purchase invoices?|pinvs?)\b", normalized_lookup)
+    purchase_invoice_list_intent = re.search(
+        r"\b(?:available|how many|what are|which|list|show|tell me|exist)\b",
+        normalized_lookup,
+    )
+    if purchase_invoice_noun and purchase_invoice_list_intent:
+        result = await _execute_tool(
+            "get_purchase_invoices", {}, session_id=state.get("session_id"),
+            user_id=state.get("user_id"), prompt_text=last_user_msg,
+        )
+        return {"messages": [AIMessage(content=str(result))]}
+
+    # This common lookup is deterministic: it needs no clarification and
+    # no model interpretation. Calling Item directly also prevents a small
+    # model from ignoring the read tool and incorrectly claiming it has no
+    # inventory access.
+    item_noun = re.search(r"\b(?:items?|products?|skus?|item codes?)\b", normalized_lookup)
+    list_intent = re.search(
+        r"\b(?:available|availability|all|list|show|what are|which are|tell me)\b",
+        normalized_lookup,
+    )
+    if item_noun and list_intent:
+        result = await _execute_tool(
+            "get_available_items", {}, session_id=state.get("session_id"),
+            user_id=state.get("user_id"), prompt_text=last_user_msg,
+        )
+        return {"messages": [AIMessage(content=str(result))]}
 
     retrieval_query = f"{task_context}. {last_user_msg}" if task_context else last_user_msg
     candidate_tools = tool_rag.retrieve(retrieval_query)
@@ -926,8 +1211,8 @@ async def agent_node(state: ChatState) -> dict:
     # one flow runs at a time, so the first offending call wins.
     for tool_call in tool_calls:
         tool_name = tool_call["name"]
+        args = _sanitize_tool_args(tool_name, tool_call.get("args") or {})
         if tool_name in ALL_REQUIRED_FIELDS:
-            args = _sanitize_tool_args(tool_name, tool_call.get("args") or {})
             missing = _missing_fields(tool_name, args)
             if missing:
                 return {
@@ -935,8 +1220,24 @@ async def agent_node(state: ChatState) -> dict:
                     "pending_tool": tool_name,
                     "task_slots": args,
                     "pending_missing": missing,
+                    "pending_confirmation": False,
                     "messages": [AIMessage(content=missing[0][1])],
                 }
+
+
+        # Stage every complete write call for approval. Crucially, preserve
+        # the exact schema-valid arguments in state; after "yes" the graph
+        # executes these values directly instead of asking the model to
+        # reconstruct the call from prose and potentially changing its shape.
+        if _is_write_tool(tool_name):
+            return {
+                "current_task": task_context or f"{tool_name} requested",
+                "pending_tool": tool_name,
+                "task_slots": args,
+                "pending_missing": [],
+                "pending_confirmation": True,
+                "messages": [AIMessage(content=_confirmation_prompt(tool_name, args))],
+            }
 
     results = []
     for tool_call in tool_calls:
@@ -995,6 +1296,8 @@ async def execute_pending_node(state: ChatState) -> dict:
         "pending_tool": None,
         "task_slots": {},
         "pending_missing": [],
+        "pending_confirmation": False,
+        "stop_after_intake": False,
     }
 
 
@@ -1050,20 +1353,39 @@ async def generate_reply(text: str, session_id: str = "default", user_id: Option
 
     initial_messages = [HumanMessage(content=text)]
 
+    # doc = document_store.get(session_id)
+    # if doc and not doc["injected"]:
+    #     # Fires once, on the first chat turn after an /api/upload-document
+    #     # call for this session -- after that it stays in the LangGraph
+    #     # checkpointer's message history like any other turn, so it isn't
+    #     # re-sent (and re-billed) on every subsequent message.
+    #     doc_context = (
+    #         f"[System note: the user uploaded a document named "
+    #         f"'{doc['filename']}'. Its full extracted content is below -- "
+    #         f"use it to answer any questions they ask about it.]\n\n"
+    #         f"{doc['text'][:40000]}"
+    #     )
+    #     initial_messages = [SystemMessage(content=doc_context)] + initial_messages
+    #     doc["injected"] = True
+
     doc = document_store.get(session_id)
-    if doc and not doc["injected"]:
-        # Fires once, on the first chat turn after an /api/upload-document
-        # call for this session -- after that it stays in the LangGraph
-        # checkpointer's message history like any other turn, so it isn't
-        # re-sent (and re-billed) on every subsequent message.
+    inject_document = bool(doc and not doc.get("injected", False))
+    if inject_document:
+        document_names = doc.get("filenames") or [doc.get("filename", "document")]
         doc_context = (
-            f"[System note: the user uploaded a document named "
-            f"'{doc['filename']}'. Its full extracted content is below -- "
-            f"use it to answer any questions they ask about it.]\n\n"
-            f"{doc['text'][:40000]}"
+            f"[UPLOADED DOCUMENT CONTEXT: {', '.join(document_names)}]\n"
+            f"EXTRACTED DOCUMENT CONTENT:\n"
+            f"\"\"\"\n{doc['text'][:40000]}\n\"\"\"\n\n"
+            f"INSTRUCTION FOR AGENT:\n"
+            f"- Use the information above to extract necessary parameter values (e.g., vendor name, items, customer details, prices, dates, etc.).\n"
+            "- For every requested ERP action, first verify that the document's structure and fields match the requested DocType.\n"
+            "- Execute a tool only when all mandatory parameters are explicitly present. Never infer or invent IDs or values.\n"
+            "- If the DocType does not match, do not call a tool. Explain the mismatch and suggest the DocType that best fits the document.\n"
+            "- If the type matches but required data is absent, ask the user for that data.\n"
+            "- Uploaded documents are read-only context. Never save, create, update, submit, or delete an ERP record without first showing the proposed action and receiving explicit user confirmation.\n"
+            "- If the current request is unrelated to the uploaded documents, ignore their content and handle the request normally with the appropriate general ERP tool or a direct answer."
         )
         initial_messages = [SystemMessage(content=doc_context)] + initial_messages
-        doc["injected"] = True
 
     config = {
         "configurable": {"thread_id": session_id},
@@ -1079,6 +1401,10 @@ async def generate_reply(text: str, session_id: str = "default", user_id: Option
             {"messages": initial_messages, "session_id": session_id, "user_id": user_id},
             config,
         )
+    if inject_document:
+        # Mark it only after the graph accepted the context; transient chat
+        # failures therefore do not permanently discard the document.
+        doc["injected"] = True
     reply = result["messages"][-1].content
 
     audit_log.log_turn(
@@ -1229,8 +1555,28 @@ def health():
     return {"status": "ok"}
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
-    port = int(os.environ.get("PORT", 8050))
-    logger.info(f"Starting server on port {port}...")
 
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
+    parser = argparse.ArgumentParser(description="Run the Magna AI FastAPI server.")
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("HOST", "0.0.0.0"),
+        help="Interface to bind (default: HOST or 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT", "8050")),
+        help="TCP port to bind (default: PORT or 8050).",
+    )
+    cli_args = parser.parse_args()
+
+    if not 1 <= cli_args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+
+    logger.info("Starting server on %s:%d...", cli_args.host, cli_args.port)
+    # Passing the app object prevents Uvicorn from importing server.py a
+    # second time, which previously loaded Whisper, ToolRAG, and all tools
+    # twice before startup.
+    uvicorn.run(app, host=cli_args.host, port=cli_args.port, reload=False)

@@ -6,6 +6,8 @@ python-multipart
 # ERP client (ERP/erp_client.py) -- not previously listed here
 requests
 python-dotenv
+# LLM/LLM.py imports fitz for PDF OCR/rendering.
+PyMuPDF
 
 # MCP: server side (ERP/mcp_server.py) + client side (ERP/tools/mcp_tools.py)
 fastmcp

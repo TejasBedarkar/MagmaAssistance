@@ -114,6 +114,25 @@ def _resolve_link(doctype, value):
             return matches[0]["name"]
     except Exception:  # noqa: BLE001
         pass
+    display_fields = {
+        "Customer": "customer_name",
+        "Supplier": "supplier_name",
+        "Item": "item_name",
+        "Company": "company_name",
+    }
+    display_field = display_fields.get(doctype)
+    if display_field:
+        try:
+            matches = erp_client.get_list(
+                doctype,
+                fields=["name", display_field],
+                filters=[[display_field, "like", f"%{value}%"]],
+                limit=1,
+            )
+            if matches:
+                return matches[0]["name"]
+        except Exception:  # noqa: BLE001
+            pass
     return value
 
 
@@ -386,17 +405,20 @@ def create_quotation(
     company Magna Data Pvt Ltd'."""
 
     def run():
-        items = [{"item_code": item_code, "qty": quantity, "rate": rate}]
+        items = [{"item_code": _resolve_link("Item", item_code), "qty": quantity, "rate": rate}]
         if extra_items:
-            items.extend(extra_items)
+            items.extend([
+                {**row, "item_code": _resolve_link("Item", row.get("item_code"))}
+                for row in extra_items
+            ])
         data = _payload(
             quotation_to="Customer",
-            party_name=customer,
+            party_name=_resolve_link("Customer", customer),
             transaction_date=date,
             items=items,
             valid_till=valid_till,
             order_type=order_type,
-            company=company,
+            company=_resolve_link("Company", company),
         )
         result = erp_client.create_doc("Quotation", data)
         return str(result)
@@ -464,21 +486,24 @@ def create_sales_order(
     Ltd'."""
 
     def run():
-        item = {"item_code": item_code, "warehouse": warehouse}
+        item = {"item_code": _resolve_link("Item", item_code), "warehouse": warehouse}
         if quantity is not None:
             item["qty"] = quantity
         if rate is not None:
             item["rate"] = rate
         items = [item]
         if extra_items:
-            items.extend(extra_items)
+            items.extend([
+                {**row, "item_code": _resolve_link("Item", row.get("item_code"))}
+                for row in extra_items
+            ])
         data = _payload(
-            customer=customer,
+            customer=_resolve_link("Customer", customer),
             transaction_date=date.today().isoformat(),
             delivery_date=delivery_date,
             items=items,
             order_type=order_type,
-            company=company,
+            company=_resolve_link("Company", company),
         )
         result = erp_client.create_doc("Sales Order", data)
 
@@ -634,6 +659,4 @@ def _parse_items_answer(text: str) -> list:
 # (e.g. `items` must be a list of dicts, not raw text). Any (tool, field)
 # pair not listed here is stored as the user's raw, trimmed text.
 FIELD_PARSERS = {
-    ("create_quotation", "items"): _parse_items_answer,
-    ("create_sales_order", "items"): _parse_items_answer,
 }
