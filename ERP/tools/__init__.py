@@ -46,9 +46,11 @@ from .purchase_write_tools import (
     FIELD_PARSERS as PURCHASE_FIELD_PARSERS,
 )
 from .purchase_read_tools import PURCHASE_READ_TOOLS
+from .module_read_tools import MODULE_READ_TOOLS
 from .capabilities_tools import CAPABILITY_TOOLS
 
 ALL_TOOLS = [
+    *MODULE_READ_TOOLS,
     *SALES_WRITE_TOOLS,
     *INVENTORY_READ_TOOLS,
     *INVENTORY_WRITE_TOOLS,

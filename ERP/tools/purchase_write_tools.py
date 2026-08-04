@@ -60,7 +60,7 @@ def _safe_call(label, fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001
-        return f"Could not {label} in ERPNext right now ({exc})."
+        return f"Could not {label} in MagnaERP right now ({exc})."
 
 
 def _payload(**kwargs):
@@ -95,8 +95,8 @@ def _clean_mapped_doc(value):
 @tool
 def create_supplier(
     supplier_name: str,
+    supplier_type: str,
     supplier_group: Optional[str] = None,
-    supplier_type: Optional[str] = None,
     country: Optional[str] = None,
     email_id: Optional[str] = None,
     mobile_no: Optional[str] = None,
@@ -172,6 +172,7 @@ def update_supplier(
 def create_purchase_order(
     supplier: str,
     items: list,
+    company: str,
     schedule_date: Optional[str] = None,
     submit: bool = False,
 ):
@@ -186,6 +187,7 @@ def create_purchase_order(
     def run():
         data = _payload(
             supplier=supplier,
+            company=company,
             transaction_date=date.today().isoformat(),
             schedule_date=schedule_date or date.today().isoformat(),
             items=items,
@@ -287,7 +289,7 @@ def create_purchase_invoice_from_purchase_order(
             use_cache=False,
         )
         if not isinstance(mapped, dict):
-            raise RuntimeError("ERPNext did not return a mapped Purchase Invoice document.")
+            raise RuntimeError("MagnaERP did not return a mapped Purchase Invoice document.")
 
         # Mapped documents include server-managed metadata that should not
         # be posted as a new resource.
@@ -324,12 +326,14 @@ PURCHASE_WRITE_TOOLS = [
 REQUIRED_FIELDS = {
     "create_supplier": [
         ("supplier_name", "What's the supplier name?"),
+        ("supplier_type", "What is the supplier type? (Company, Individual, or Partnership)"),
     ],
     "update_supplier": [
         ("supplier_id", "Which supplier should I update?"),
     ],
     "create_purchase_order": [
         ("supplier", "Which supplier is this purchase order for?"),
+        ("company", "Which company is this Purchase Order for?"),
         (
             "items",
             "What items should be on the order? Give each as "

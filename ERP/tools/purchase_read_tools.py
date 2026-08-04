@@ -11,7 +11,7 @@ def _safe_call(label, fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001
-        return f"Could not {label} in ERPNext right now ({exc})."
+        return f"Could not {label} in MagnaERP right now ({exc})."
 
 
 @tool

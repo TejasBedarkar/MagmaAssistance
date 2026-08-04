@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 from ERP.tools import ALL_FIELD_PARSERS, ALL_REQUIRED_FIELDS, ALL_TOOLS
 from ERP.tools.sales_write_tools import create_quotation
+from ERP.tools.capabilities_tools import list_capabilities
+from ERP.tools.hr_write_tools import create_employee
 
 
 def test_local_tool_names_are_unique():
@@ -61,3 +63,38 @@ def test_create_quotation_builds_expected_erpnext_payload():
             "company": "Magnadata PVT. LTD.",
         },
     )
+
+
+def test_every_advertised_module_supports_lookup():
+    result = list_capabilities.invoke({})
+    labels = [
+        "Sales Orders", "Sales Invoices", "Quotations", "Opportunities",
+        "Leads", "Customers", "Purchase Orders", "Purchase Invoices",
+        "Suppliers", "Material Requests", "Stock Movements", "Items",
+        "Employees", "Leave", "Attendance", "Payments", "Journal Entries",
+    ]
+    for label in labels:
+        line = next(
+            (line for line in result.splitlines() if line.startswith(f"- {label}:")),
+            None,
+        )
+        assert line is not None and "look up" in line, label
+
+
+def test_create_employee_maps_live_mandatory_fields():
+    with patch(
+        "ERP.tools.hr_write_tools.erp_client.create_doc",
+        return_value={"name": "HR-EMP-TEST"},
+    ) as create_doc:
+        result = create_employee.invoke({
+            "employee_name": "Prince",
+            "gender": "Male",
+            "date_of_birth": "1998-01-15",
+            "date_of_joining": "2026-08-04",
+        })
+    assert "HR-EMP-TEST" in result
+    payload = create_doc.call_args.args[1]
+    assert payload["first_name"] == "Prince"
+    assert payload["employee_name"] == "Prince"
+    assert payload["gender"] == "Male"
+    assert payload["date_of_birth"] == "1998-01-15"

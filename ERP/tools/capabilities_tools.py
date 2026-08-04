@@ -37,7 +37,7 @@ DOMAIN_PATTERNS = [
     ("Sales Orders", ("sales_order",)),
     ("Sales Invoices", ("sales_invoice",)),
     ("Quotations", ("quotation",)),
-    ("Opportunities", ("opportunity",)),
+    ("Opportunities", ("opportunity", "opportunit")),
     ("Leads", ("lead",)),
     ("Customers", ("customer",)),
     ("Contacts", ("contact",)),
@@ -45,7 +45,7 @@ DOMAIN_PATTERNS = [
     ("Purchase Invoices", ("purchase_invoice",)),
     ("Suppliers", ("supplier",)),
     ("Material Requests", ("material_request",)),
-    ("Stock Movements", ("stock_entry",)),
+    ("Stock Movements", ("stock_entry", "stock_entr")),
     ("Items", ("item",)),
     ("Employees", ("employee",)),
     ("Leave", ("leave",)),
@@ -82,7 +82,7 @@ def _action(tool_name: str) -> str:
 @tool
 def list_capabilities():
     """Tells the user what this assistant can do — the full range of
-    supported actions across the connected ERPNext system. Use this
+    supported actions across the connected MagnaERP system. Use this
     whenever the user asks things like 'what can you do?', 'what are
     your tools?', 'what are you capable of?', 'what can you help me
     with?', 'what's in your range?', or similar general
@@ -111,7 +111,7 @@ def list_capabilities():
             lines.append(f"- {label}: {', '.join(actions)}")
 
         summary = (
-            "Here's what I can help with in ERPNext:\n"
+            "Here's what I can help with in MagnaERP:\n"
             + "\n".join(lines)
             + "\n\nJust tell me what you'd like done (e.g. 'create a lead for "
             "Rahul Sharma' or 'what are our pending sales orders?') and I'll "

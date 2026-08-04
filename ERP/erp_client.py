@@ -244,7 +244,7 @@ class ERPClient:
                 err_json = response.json()
                 if "_server_messages" in err_json:
                     messages = json.loads(err_json["_server_messages"])
-                    error_details = " | ERPNext Rule Failure: " + " ".join([json.loads(m).get("message", "") for m in messages])
+                    error_details = " | MagnaERP Rule Failure: " + " ".join([json.loads(m).get("message", "") for m in messages])
                 elif "exception" in err_json:
                     error_details = f" | Exception: {err_json['exception']}"
                 elif "message" in err_json:
@@ -289,7 +289,7 @@ class ERPClient:
                 err_json = response.json()
                 if "_server_messages" in err_json:
                     messages = json.loads(err_json["_server_messages"])
-                    error_details = " | ERPNext Rule Failure: " + " ".join([json.loads(m).get("message", "") for m in messages])
+                    error_details = " | MagnaERP Rule Failure: " + " ".join([json.loads(m).get("message", "") for m in messages])
                 elif "exception" in err_json:
                     error_details = f" | Exception: {err_json['exception']}"
             except Exception:

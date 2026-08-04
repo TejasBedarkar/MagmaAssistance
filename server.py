@@ -458,12 +458,14 @@ def _confirmation_prompt(tool_name: str, args: dict) -> str:
     return (
         f"I extracted data for the ERP action `{tool_name}` with these values: "
         f"{json.dumps(args, ensure_ascii=False, default=str)}. "
-        "This will write data to ERPNext. Shall I proceed? Reply yes to confirm or no to cancel."
+        "This will write data to MagnaERP. Shall I proceed? Reply yes to confirm or no to cancel."
     )
 
 
 def _confirmation_answer(text: str) -> Optional[bool]:
     normalized = re.sub(r"[^a-z]+", " ", text.lower()).strip()
+    normalized = re.sub(r"\b(?:please|kindly|now)\b", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
     if normalized in {"yes", "y", "confirm", "confirmed", "proceed", "go ahead", "do it", "save it"}:
         return True
     if normalized in {"no", "n", "cancel", "stop", "do not", "don t", "do not save"}:
@@ -476,6 +478,11 @@ def _last_human_message(messages) -> Optional[str]:
         if isinstance(m, HumanMessage):
             return m.content
     return None
+
+
+def _apply_user_facing_brand(text: str) -> str:
+    """Keep implementation framework names out of MagnaERP chat output."""
+    return re.sub(r"\bERPNext\b", "MagnaERP", str(text), flags=re.IGNORECASE)
 
 
 def _parse_json_loose(text: str) -> dict:
@@ -1191,6 +1198,30 @@ async def agent_node(state: ChatState) -> dict:
 
     response = llm_with_tools.invoke(call_messages)
 
+    # The application owns write confirmation. If the model nevertheless
+    # drafts its own "please confirm/proceed" message, retry once and require
+    # the actual tool call. This prevents two consecutive confirmation turns.
+    response_asks_confirmation = bool(re.search(
+        r"\b(?:please\s+)?confirm\b|\bwould you like me to proceed\b|\bshall i proceed\b",
+        response.content or "",
+        flags=re.IGNORECASE,
+    ))
+    write_task_context = bool(re.search(
+        r"\b(?:create|add|make|update|edit)\b",
+        retrieval_query,
+        flags=re.IGNORECASE,
+    ))
+    if not response.tool_calls and response_asks_confirmation and write_task_context:
+        retry_messages = [
+            *call_messages,
+            response,
+            SystemMessage(content=(
+                "Do not ask for confirmation yourself. Call the appropriate write tool now using "
+                "all required values already provided in the conversation and omit blank optional fields."
+            )),
+        ]
+        response = llm_with_tools.invoke(retry_messages)
+
     tool_calls = response.tool_calls
     is_recovered = False
     if not tool_calls:
@@ -1405,7 +1436,7 @@ async def generate_reply(text: str, session_id: str = "default", user_id: Option
         # Mark it only after the graph accepted the context; transient chat
         # failures therefore do not permanently discard the document.
         doc["injected"] = True
-    reply = result["messages"][-1].content
+    reply = _apply_user_facing_brand(result["messages"][-1].content)
 
     audit_log.log_turn(
         session_id, "assistant", reply, user_id=user_id, prompt_text=text,

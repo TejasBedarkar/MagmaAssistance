@@ -60,7 +60,7 @@ def process_ocr_po_and_create_order(
     and creates a Purchase Order draft in ERPNext. Auto-creates missing Supplier and Items.
     """
     if not erp_client.base_url:
-        return "Error: ERPNext integration client is not configured properly in .env."
+        return "Error: MagnaERP integration client is not configured properly in .env."
 
     try:
         transaction_date = datetime.date.today().strftime('%Y-%m-%d')
@@ -170,8 +170,8 @@ def process_ocr_po_and_create_order(
         res = erp_client.create_doc("Purchase Order", po_doc)
         created_po_name = res.get("name", "Draft")
 
-        return f"Successfully created Purchase Order '{created_po_name}' in ERPNext for Supplier '{vendor_name}'."
+        return f"Successfully created Purchase Order '{created_po_name}' in MagnaERP for Supplier '{vendor_name}'."
 
     except Exception as e:
         logger.exception("Failed to create Purchase Order in ERPNext")
-        return f"Failed to create Purchase Order in ERPNext: {str(e)}"
+        return f"Failed to create Purchase Order in MagnaERP: {str(e)}"

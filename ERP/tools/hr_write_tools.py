@@ -46,7 +46,7 @@ def _safe_call(label, fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001
-        return f"Could not {label} in ERPNext right now ({exc})."
+        return f"Could not {label} in MagnaERP right now ({exc})."
 
 
 def _payload(**kwargs):
@@ -63,15 +63,17 @@ def _payload(**kwargs):
 @tool
 def create_employee(
     employee_name: str,
+    gender: str,
+    date_of_birth: str,
     department: Optional[str] = None,
     designation: Optional[str] = None,
     date_of_joining: Optional[str] = None,
     company: Optional[str] = None,
     employment_type: Optional[str] = None,
-    gender: Optional[str] = None,
 ):
-    """Create a new Employee. `employee_name` is required (e.g. 'Priya
-    Nair'). `date_of_joining` should be YYYY-MM-DD, defaults to today if
+    """Create a new Employee. `employee_name`, `gender`, and
+    `date_of_birth` (YYYY-MM-DD) are required. `date_of_joining` should be
+    YYYY-MM-DD and defaults to today if
     not given. `company` and `department` fall back to your ERPNext
     site's configured defaults if not given. Use for requests like 'add
     a new employee Priya Nair, Sales department, joining today'."""
@@ -80,6 +82,7 @@ def create_employee(
         import datetime
 
         data = _payload(
+            first_name=employee_name.strip().split()[0],
             employee_name=employee_name,
             department=department,
             designation=designation,
@@ -87,6 +90,7 @@ def create_employee(
             company=company,
             employment_type=employment_type,
             gender=gender,
+            date_of_birth=date_of_birth,
         )
         result = erp_client.create_doc("Employee", data)
         return str(result)
@@ -247,6 +251,8 @@ HR_WRITE_TOOLS = [
 REQUIRED_FIELDS = {
     "create_employee": [
         ("employee_name", "What's the employee's name?"),
+        ("gender", "What is the employee's gender?"),
+        ("date_of_birth", "What is the employee's date of birth? (YYYY-MM-DD)"),
     ],
     "update_employee": [
         ("employee_id", "Which employee should I update? (its ID)"),
