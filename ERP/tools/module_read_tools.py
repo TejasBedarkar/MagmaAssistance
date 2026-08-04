@@ -11,6 +11,7 @@ def _list_records(label, doctype, fields, limit=20, filters=None, order_by=None)
     try:
         rows = erp_client.get_list(
             doctype, fields=fields, filters=filters, order_by=order_by, limit=limit,
+            use_cache=False,
         )
     except Exception as exc:  # noqa: BLE001
         return f"Could not fetch {label.lower()} from MagnaERP right now ({exc})."

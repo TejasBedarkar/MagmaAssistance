@@ -1108,6 +1108,33 @@ def _plain_reply(history, task_context: Optional[str] = None) -> str:
     return response.content
 
 
+def _clean_history_for_model(history):
+    """Remove internal tool protocol messages from persisted chat history.
+
+    Only user-facing final AI text is meant to survive between turns. Older
+    sessions may contain an AIMessage with tool_calls but no matching
+    ToolMessage, which OpenAI rejects with HTTP 400. ToolMessages are also
+    internal and unsafe without their exact preceding call, so omit both.
+    """
+    cleaned = []
+    removed = 0
+    for message in history:
+        if isinstance(message, ToolMessage):
+            removed += 1
+            continue
+        if isinstance(message, AIMessage) and message.tool_calls:
+            removed += 1
+            # Preserve any user-facing text that accompanied the call, but
+            # strip the protocol payload itself.
+            if message.content:
+                cleaned.append(AIMessage(content=message.content))
+            continue
+        cleaned.append(message)
+    if removed:
+        logger.warning("Removed %d stale internal tool message(s) from model history", removed)
+    return cleaned
+
+
 async def agent_node(state: ChatState) -> dict:
     """Retrieve-tools -> call-LLM -> call-tool turn, same logic as the
     original generate_reply, now working off the trimmed short-term
@@ -1126,6 +1153,7 @@ async def agent_node(state: ChatState) -> dict:
         # turns are trimmed from the short-term conversation window.
         include_system=True,
     )
+    history = _clean_history_for_model(history)
 
     # Document questions are conversational/read-only. Do not bind any ERP
     # tools for these turns, regardless of ToolRAG similarity or DocType-like
@@ -1142,6 +1170,42 @@ async def agent_node(state: ChatState) -> dict:
     # PO records, including drafts. Do not reinterpret "available" as only
     # pending/submitted orders or accidentally choose a Sales Order tool.
     normalized_lookup = last_user_msg.lower()
+
+    # List/count requests are deterministic across every exposed module.
+    # Execute the matching fresh read directly so the model cannot answer
+    # from memory, confuse domains, or turn "available" into another status.
+    list_intent = re.search(
+        r"\b(?:available|how many|what are|which|list|show|tell me|exist|all)\b",
+        normalized_lookup,
+    )
+    direct_list_lookups = [
+        (r"\bsales orders?\b", "get_sales_orders"),
+        (r"\bsales invoices?\b", "get_sales_invoices"),
+        (r"\bquotations?\b", "get_quotations"),
+        (r"\bopportunit(?:y|ies)\b", "get_opportunities"),
+        (r"\bleads?\b", "get_leads"),
+        (r"\bcustomers?\b", "get_customers"),
+        (r"\bpurchase orders?\b", "get_purchase_orders"),
+        (r"\bpurchase invoices?\b", "get_purchase_invoices"),
+        (r"\bsuppliers?\b", "get_suppliers"),
+        (r"\bmaterial requests?\b", "get_material_requests"),
+        (r"\b(?:stock movements?|stock entries)\b", "get_stock_entries"),
+        (r"\b(?:items?|products?|skus?|item codes?)\b", "get_available_items"),
+        (r"\bemployees?\b", "get_employees"),
+        (r"\b(?:leave applications?|leaves?)\b", "get_leave_applications"),
+        (r"\battendance(?: records?)?\b", "get_attendance"),
+        (r"\b(?:payments?|payment entries)\b", "get_payment_entries"),
+        (r"\bjournal entries\b", "get_journal_entries"),
+    ]
+    if list_intent:
+        for noun_pattern, lookup_tool in direct_list_lookups:
+            if re.search(noun_pattern, normalized_lookup):
+                result = await _execute_tool(
+                    lookup_tool, {}, session_id=state.get("session_id"),
+                    user_id=state.get("user_id"), prompt_text=last_user_msg,
+                )
+                return {"messages": [AIMessage(content=str(result))]}
+
     purchase_order_noun = re.search(r"\b(?:purchase orders?|pos?)\b", normalized_lookup)
     purchase_order_list_intent = re.search(
         r"\b(?:available|how many|what are|which|list|show|tell me|exist)\b",
@@ -1288,7 +1352,10 @@ async def agent_node(state: ChatState) -> dict:
         # orphaned tool_call without its ToolMessage alongside it.
         for tool_call, result in results:
             call_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
-        final_response = llm_with_tools.invoke(call_messages)
+        # Final wording must use the unbound model. Keeping tools bound here
+        # allows a second tool call that this branch does not execute, leaving
+        # an orphaned tool_call in persisted history and breaking the next turn.
+        final_response = assistant.llm.model.invoke(call_messages)
         return {"messages": [final_response]}
 
     # Recovered fake tool call: there's no real AIMessage.tool_calls entry

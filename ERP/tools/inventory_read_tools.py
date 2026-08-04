@@ -31,12 +31,12 @@ def get_available_items(limit: int = 50, search: Optional[str] = None) -> str:
             by_code = erp_client.get_list(
                 "Item", fields=fields,
                 filters=[*filters, ["item_code", "like", f"%{search}%"]],
-                order_by="item_name asc", limit=limit,
+                order_by="item_name asc", limit=limit, use_cache=False,
             )
             by_name = erp_client.get_list(
                 "Item", fields=fields,
                 filters=[*filters, ["item_name", "like", f"%{search}%"]],
-                order_by="item_name asc", limit=limit,
+                order_by="item_name asc", limit=limit, use_cache=False,
             )
             merged = {row.get("name") or row.get("item_code"): row for row in [*by_code, *by_name]}
             items = list(merged.values())[:limit]
@@ -47,6 +47,7 @@ def get_available_items(limit: int = 50, search: Optional[str] = None) -> str:
                 filters=filters,
                 order_by="item_name asc",
                 limit=limit,
+                use_cache=False,
             )
         if not items:
             scope = f" matching '{search}'" if search else ""

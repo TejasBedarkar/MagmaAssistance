@@ -24,7 +24,7 @@ def get_purchase_orders(limit: int = 20, supplier: Optional[str] = None) -> str:
         rows = erp_client.get_list(
             "Purchase Order",
             fields=["name", "supplier", "transaction_date", "grand_total", "status", "per_billed"],
-            filters=filters, order_by="transaction_date desc", limit=limit,
+            filters=filters, order_by="transaction_date desc", limit=limit, use_cache=False,
         )
         if not rows:
             return "Purchase Orders found: 0."
@@ -64,7 +64,7 @@ def get_purchase_invoices(limit: int = 20, supplier: Optional[str] = None) -> st
         rows = erp_client.get_list(
             "Purchase Invoice",
             fields=["name", "supplier", "posting_date", "due_date", "grand_total", "outstanding_amount", "status"],
-            filters=filters, order_by="posting_date desc", limit=limit,
+            filters=filters, order_by="posting_date desc", limit=limit, use_cache=False,
         )
         if not rows:
             return "Purchase Invoices found: 0."
