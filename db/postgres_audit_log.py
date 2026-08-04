@@ -232,7 +232,13 @@ def record_file_upload(
     status: str = "processed",
 ) -> str:
     """Inserts one file_uploads row and returns its id (uuid string).
-    Call this right after storage.s3_storage.upload_file() succeeds."""
+    Call this right after storage.s3_storage.upload_file() succeeds.
+
+    Upserts the parent session first (same fix as log_turn()) so a file
+    uploaded on a brand-new session_id -- before any chat turn has run
+    ensure_session() for it -- can't violate file_uploads_session_id_fkey."""
+    if session_id:
+        ensure_session(session_id, user_id)
     with _conn() as conn, conn.cursor() as cur:
         cur.execute(
             """

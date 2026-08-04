@@ -136,3 +136,82 @@ the separate Frappe app.
 - `server.py` and `ERP/erp_client.py` import structure checked by hand;
   no renamed/removed symbol that anything else in the repo still
   references.
+
+---
+
+# Second pass: re-syncing against a newer `MagmaAssistance-Development` upload
+
+A newer copy of the `MagmaAssistance-Development` branch (the same
+branch used as the CRUD/base source above) was compared file-by-file
+against this already-merged project to pull forward anything genuinely
+new. Full `diff -rq` results below, with the disposition of each
+difference.
+
+## Applied
+
+- **`requirements.txt`** — `PyMuPDF` was missing even though
+  `LLM/LLM.py` still does `import fitz` and uses it for PDF OCR/
+  rendering in two places. This project would have failed at import
+  time on a clean install. Restored from the Development copy.
+- **`db/postgres_audit_log.py`** — `record_file_upload()` didn't upsert
+  the parent `sessions` row first, unlike `log_turn()` (which calls the
+  `ensure_session()` helper already in this file). A file uploaded on a
+  brand-new `session_id`, before any chat turn had run for it, could
+  violate `file_uploads_session_id_fkey`. The Development copy had its
+  own inline fix for this same bug (a raw `INSERT INTO sessions ...
+  ON CONFLICT DO NOTHING` duplicated inside `record_file_upload`); ported
+  the fix forward using this project's existing `ensure_session()` helper
+  instead of duplicating the insert.
+
+## Checked, no action needed (base is already ahead)
+
+- **`ERP/erp_client.py`**, **`ERP/mcp_server.py`** — the Development
+  copy is missing the per-user `ERPIdentity`/`use_identity()` auth layer,
+  `get_meta()`/`get_count()`, and the count-aware list-tool helpers —
+  all of that is already in this project (see the main merge notes
+  above and `ENHANCEMENTS.md`). Nothing to pull in.
+- **`LLM/LLM.py`** (system prompt), **`server.py`** (`MagnaERP` branding,
+  `_apply_user_facing_brand`) — this project deliberately dropped the
+  "always call it MagnaERP" branding layer and the old per-doctype,
+  OCR-heavy system prompt in favor of the shorter prompt + Markdown-table
+  reply formatting described in `ENHANCEMENTS.md`. Not reverted.
+- **`test/test_tool_contracts.py`** — this project's tests were already
+  rewritten for the dynamic/doctype-agnostic tool set; the Development
+  copy's tests target the old per-doctype tool modules directly, which
+  this project doesn't register. Not reverted.
+- **`server.py` — document-upload write confirmation**
+  (`_confirmation_prompt` / `_confirmation_answer` / `_is_write_tool`):
+  in the Development copy, a write triggered from data extracted out of
+  an *uploaded document* pauses and asks the user to reply yes/no before
+  saving. This project's PO-upload endpoint (`/api/upload-po`) instead
+  calls the OCR auto-create tool directly and unconditionally (see the
+  docstring on `upload_purchase_order_file` in `server.py` for the
+  reasoning: it deliberately bypasses the chat agent's tool selection to
+  avoid it picking the wrong `create_purchase_order` tool). Porting the
+  Development copy's confirm-before-save step back in is a real, worth-
+  considering safety improvement for OCR-derived data specifically, but
+  it's a behavior change, not a bug fix, and doesn't have a like-for-like
+  home in the current `ERP_Unified`-based flow (the old flow's
+  `ALL_REQUIRED_FIELDS`/`ALL_FIELD_PARSERS` it depended on are
+  intentionally empty here — see the comment above `ALL_TOOLS` in
+  `server.py`). Flagged rather than silently added; happy to build it
+  against the OCR-upload endpoint specifically if wanted.
+- **`ERP/tools/*_write_tools.py`, `ERP/tools/capabilities_tools.py`,
+  new `ERP/tools/{inventory,purchase,module}_read_tools.py`** — all
+  per-doctype tool modules from the old (pre-`ERP_Unified`) architecture.
+  Per the original merge decision above, these are superseded by
+  `ERP_Unified/tools.py` + `ERP/dynamic_fields.py` and are not wired
+  into `server.py` (`ALL_TOOLS = list(ERP_UNIFIED_TOOLS)`), so newer
+  versions of them from the Development copy were not pulled in. The one
+  exception, `ERP/tools/ocr_po_tool.py`, *is* still actively used (the
+  PO-upload endpoint calls `process_ocr_po_and_create_order` directly) —
+  its Development-copy diff was checked and is branding text only
+  ("MagnaERP" → "ERPNext"), already consistent with this project.
+- `langgraph.json` — line-ending only (CRLF vs LF), no content change.
+- `README.md` — already describes this merged project accurately.
+
+## Not applicable
+
+- `ERP_Unified/`, `erp_theme/` (the whole Frappe-side custom UI/auth
+  app), `.env.example` — don't exist in the Development copy at all;
+  it predates/doesn't include that work.
