@@ -1,17 +1,34 @@
 -- =====================================================================
--- MagmaAssistance -- PostgreSQL Audit Log + File Storage Schema
+-- MagmaAssistance -- PostgreSQL Schema
 -- =====================================================================
--- Replaces the SQLite-backed audit_log.py with a proper Postgres schema.
+-- Replaces the old single flat `audit_log` table with the normalized
+-- design from the "Saving History in Postgres DataBase" area of the
+-- architecture diagram (Untitled-2026-08-03-1515.excalidraw):
+--
+--   OVERVIEW      -- one row per turn (prompt/output), the unique key
+--                    everything else hangs off of
+--   DETAILS       -- depth info per OVERVIEW row: how many times the
+--                    agent tried, tokens used
+--   TOOLS         -- master registry of tools currently available
+--   TOOLS_SEC     -- per-OVERVIEW-row record of which tool ran and
+--                    whether it worked (aggregate success/fail counts
+--                    with a GROUP BY over this table, rather than a
+--                    running counter, so it can't drift out of sync)
+--   TOOLS_DETAILS -- depth view per TOOLS_SEC row: input given / output
+--                    received from that tool call
+--   TOKEN_DETAILS -- per-department token usage & allotment, for both
+--                    the Agent and TTS
+--
+-- Intentionally NOT included (marked red / "not developed" / "table
+-- schema is pending" in the diagram -- add these once designed):
+--   OCR_DETAILS
+--
+-- sessions and file_uploads are unchanged -- they're not part of the
+-- diagram's DB Area, and file_uploads is still required by
+-- storage/s3_storage.py and the /api/upload-po and /api/upload-document
+-- endpoints in server.py.
+--
 -- Safe to run multiple times (idempotent: IF NOT EXISTS / DO blocks).
---
--- Design notes:
---   * sessions        -- one row per chat/thread session
---   * audit_log       -- one row per turn: user message, assistant reply,
---                        or tool call. Captures who asked, which tool was
---                        picked, what it returned, and how long it took.
---   * file_uploads    -- one row per uploaded file (PO/OCR or general doc),
---                        with S3 location + who uploaded it and when.
---
 -- Run with: psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDATABASE -f db/schema.sql
 -- or via:   python db/init_db.py
 -- =====================================================================
@@ -43,14 +60,14 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------
--- sessions -- one row per conversation thread
+-- sessions -- one row per conversation thread (unchanged)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sessions (
     session_id      TEXT PRIMARY KEY,
-    user_id         TEXT,                                    -- who owns/started this session
+    user_id         TEXT,
     started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_active_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,       -- free-form (client, ip, channel, etc.)
+    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -58,65 +75,150 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions (user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions (last_active_at DESC);
 
 -- ---------------------------------------------------------------------
--- audit_log -- one row per user message / assistant reply / tool call
+-- Drop the old flat audit table -- replaced by OVERVIEW / DETAILS /
+-- TOOLS_SEC / TOOLS_DETAILS below. No migration of old rows: nothing in
+-- the new design preserves audit_log's shape 1:1, and this project's
+-- audit trail is disposable/regenerable, so this is a clean cut rather
+-- than a column-by-column migration.
 -- ---------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS audit_log (
+DROP TABLE IF EXISTS audit_log CASCADE;
+
+-- ---------------------------------------------------------------------
+-- OVERVIEW -- one row per turn: prompt + output, with a unique key
+-- ("Basic table of Prompt and output of model with date and time")
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS overview (
     id                BIGSERIAL PRIMARY KEY,
     session_id        TEXT NOT NULL REFERENCES sessions (session_id) ON DELETE CASCADE,
 
     role              turn_role NOT NULL,           -- 'user' | 'assistant' | 'tool' | 'system'
-    user_id           TEXT,                         -- who prompted the question (for role='user';
-                                                      -- carried through to the tool/assistant rows
-                                                      -- that answer the same request)
-    prompt_text       TEXT,                         -- the user question that triggered this row
-                                                      -- (denormalized onto tool/assistant rows too,
-                                                      -- so "who asked for this tool call" is a
-                                                      -- single-row lookup, no self-join needed)
-
-    content           TEXT NOT NULL,                 -- message text / tool result (stringified)
-
-    tool_name         TEXT,                          -- which tool was selected (NULL for user/assistant)
-    tool_args         JSONB,                         -- arguments passed to the tool
-    tool_status       tool_status,                   -- outcome of the tool call
-    error_message     TEXT,                          -- populated when tool_status = 'error'
-
-    duration_ms       INTEGER,                       -- wall-clock time taken to produce this row
-                                                      -- (LLM latency for assistant rows, tool
-                                                      -- execution time for tool rows)
+    user_id           TEXT,                         -- who prompted the underlying request
+    prompt_text       TEXT,                         -- the user question this row answers
+    output_text       TEXT NOT NULL,                -- message text / tool result (stringified)
 
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_log_session      ON audit_log (session_id, id);
-CREATE INDEX IF NOT EXISTS idx_audit_log_created_at   ON audit_log (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_log_tool_name    ON audit_log (tool_name) WHERE tool_name IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_audit_log_user_id      ON audit_log (user_id) WHERE user_id IS NOT NULL;
--- Fast "everything ERP-write-tool X did last week" type queries
-CREATE INDEX IF NOT EXISTS idx_audit_log_tool_created ON audit_log (tool_name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_overview_session      ON overview (session_id, id);
+CREATE INDEX IF NOT EXISTS idx_overview_created_at   ON overview (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_overview_user_id      ON overview (user_id) WHERE user_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------
+-- DETAILS -- depth details of the prompt: how many times the agent
+-- tried, and tokens used by the user
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS details (
+    id                BIGSERIAL PRIMARY KEY,
+    overview_id       BIGINT NOT NULL REFERENCES overview (id) ON DELETE CASCADE,
+
+    tries             INTEGER,
+    tokens_used       INTEGER,
+
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE (overview_id)
+);
+
+-- ---------------------------------------------------------------------
+-- TOOLS -- master registry of tools currently present with us
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tools (
+    tool_id           SERIAL PRIMARY KEY,
+    tool_name         TEXT NOT NULL UNIQUE,
+    description       TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------
+-- TOOLS_SEC -- with the OVERVIEW unique key, which tool(s) were used
+-- by the AI and whether each call worked or failed
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tools_sec (
+    id                BIGSERIAL PRIMARY KEY,
+    overview_id       BIGINT NOT NULL REFERENCES overview (id) ON DELETE CASCADE,
+    tool_id           INTEGER NOT NULL REFERENCES tools (tool_id),
+
+    status            tool_status NOT NULL,         -- success | error | not_found
+    duration_ms       INTEGER,                      -- tool execution time
+
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tools_sec_overview     ON tools_sec (overview_id);
+CREATE INDEX IF NOT EXISTS idx_tools_sec_tool_status  ON tools_sec (tool_id, status, created_at DESC);
+
+-- ---------------------------------------------------------------------
+-- TOOLS_DETAILS -- depth view per tool call: what input was given and
+-- what output was received from the tool
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tools_details (
+    id                BIGSERIAL PRIMARY KEY,
+    tools_sec_id      BIGINT NOT NULL REFERENCES tools_sec (id) ON DELETE CASCADE,
+
+    tool_args         JSONB,                        -- input given to the tool
+    tool_output       TEXT,                          -- output received from the tool
+    error_message     TEXT,                          -- populated when tools_sec.status = 'error'
+
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE (tools_sec_id)
+);
+
+-- ---------------------------------------------------------------------
+-- TOKEN_DETAILS -- tokens used by each department, and total tokens
+-- left for both the Agent and TTS
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS token_details (
+    id                     BIGSERIAL PRIMARY KEY,
+    department             TEXT NOT NULL UNIQUE,
+
+    agent_tokens_allotted  BIGINT,
+    agent_tokens_used      BIGINT NOT NULL DEFAULT 0,
+    tts_tokens_allotted    BIGINT,
+    tts_tokens_used        BIGINT NOT NULL DEFAULT 0,
+
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION touch_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_token_details_touch ON token_details;
+CREATE TRIGGER trg_token_details_touch
+    BEFORE UPDATE ON token_details
+    FOR EACH ROW
+    EXECUTE FUNCTION touch_updated_at();
 
 -- ---------------------------------------------------------------------
 -- file_uploads -- metadata for every file uploaded, content lives in S3
+-- (unchanged -- not part of the diagram's DB Area, still required by
+-- storage/s3_storage.py and the upload endpoints in server.py)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS file_uploads (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id          TEXT REFERENCES sessions (session_id) ON DELETE SET NULL,
-    user_id             TEXT,                        -- who uploaded the file
+    user_id             TEXT,
     uploaded_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     original_filename   TEXT NOT NULL,
     content_type        TEXT NOT NULL,
     file_size_bytes     BIGINT NOT NULL CHECK (file_size_bytes >= 0),
-    checksum_sha256     TEXT NOT NULL,                -- de-dupe / integrity check
+    checksum_sha256     TEXT NOT NULL,
 
-    upload_kind         upload_kind NOT NULL,         -- purchase_order | general_document | audio
+    upload_kind         upload_kind NOT NULL,
     status              upload_status NOT NULL DEFAULT 'pending',
 
     s3_bucket           TEXT NOT NULL,
     s3_key              TEXT NOT NULL,
     s3_region           TEXT NOT NULL,
-    s3_version_id       TEXT,                         -- set if bucket versioning is enabled
+    s3_version_id       TEXT,
 
-    extracted_metadata  JSONB NOT NULL DEFAULT '{}'::jsonb,  -- OCR result / page count / etc.
+    extracted_metadata  JSONB NOT NULL DEFAULT '{}'::jsonb,
     processing_error    TEXT,
 
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -129,15 +231,6 @@ CREATE INDEX IF NOT EXISTS idx_file_uploads_session   ON file_uploads (session_i
 CREATE INDEX IF NOT EXISTS idx_file_uploads_user      ON file_uploads (user_id);
 CREATE INDEX IF NOT EXISTS idx_file_uploads_uploaded  ON file_uploads (uploaded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_file_uploads_checksum  ON file_uploads (checksum_sha256);
-
--- Keep updated_at current on any row change (e.g. status pending -> processed)
-CREATE OR REPLACE FUNCTION touch_updated_at()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = now();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_file_uploads_touch ON file_uploads;
 CREATE TRIGGER trg_file_uploads_touch

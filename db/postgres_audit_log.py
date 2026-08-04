@@ -1,18 +1,27 @@
 """
 db/postgres_audit_log.py
 
-Postgres-backed replacement for the SQLite audit_log.py. Same job --
-durable, queryable record of every session -- but now:
-  * records which tool was selected, its args/result and how long it took
-    (duration_ms)
-  * records who prompted each turn (user_id), not just the session id
-  * uses a connection pool instead of one sqlite file, so multiple
-    server processes/workers can log to the same place safely
+Postgres-backed audit trail, now written against the normalized schema
+from the "Saving History in Postgres DataBase" area of the architecture
+diagram (Untitled-2026-08-03-1515.excalidraw): overview / details /
+tools / tools_sec / tools_details / token_details, replacing the old
+flat `audit_log` table.
 
-Drop-in usage: `import db.postgres_audit_log as audit_log` in server.py
-instead of `import audit_log` -- log_turn/get_transcript/list_sessions/
-export_json keep the same names and shapes, plus new
-`log_tool_call(..., duration_ms=...)` and `time_tool_call()` helpers.
+Public API is unchanged on purpose -- log_turn/get_transcript/
+list_sessions/export_json/record_file_upload/time_tool_call keep the
+same names, signatures, and return shapes as before, so server.py's
+call sites don't need to change. Underneath, log_turn now fans a single
+call out across overview (+ details, + tools_sec/tools_details when a
+tool was involved), and get_transcript/list_sessions read it back via
+joins reassembled into the same row shape the old flat table produced.
+
+New, additive-only: log_turn() gained optional `tries`/`tokens_used`
+kwargs (default None -- existing call sites that don't pass them are
+unaffected) that land in the new `details` table. record_token_usage()/
+get_token_details() are new, for the per-department token-budget ledger
+(`token_details`) -- nothing in server.py populates that yet, since the
+token-budget/RBAC flow it belongs to isn't wired up on the agent side
+per the diagram; they're here ready for when it is.
 
 Requires:
     pip install psycopg2-binary python-dotenv
@@ -47,8 +56,6 @@ _pool: Optional[pg_pool.ThreadedConnectionPool] = None
 def _get_pool() -> pg_pool.ThreadedConnectionPool:
     global _pool
     if _pool is None:
-        # Raises with a clear "which env var is missing" message if
-        # PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE aren't all set.
         params = get_connection_params()
         _pool = pg_pool.ThreadedConnectionPool(_MIN_CONN, _MAX_CONN, **params)
     return _pool
@@ -86,6 +93,23 @@ def ensure_session(session_id: str, user_id: Optional[str] = None) -> None:
         logger.exception("Failed to upsert session '%s'", session_id)
 
 
+def _ensure_tool(cur, tool_name: str) -> int:
+    """Upserts a row in `tools` for `tool_name` and returns its tool_id.
+    Called from inside log_turn's own connection/transaction (not its
+    own _conn()) so it commits atomically with the overview/tools_sec
+    rows it's part of."""
+    cur.execute(
+        """
+        INSERT INTO tools (tool_name)
+        VALUES (%s)
+        ON CONFLICT (tool_name) DO UPDATE SET tool_name = EXCLUDED.tool_name
+        RETURNING tool_id
+        """,
+        (tool_name,),
+    )
+    return cur.fetchone()[0]
+
+
 def log_turn(
     session_id: str,
     role: str,
@@ -97,39 +121,78 @@ def log_turn(
     tool_status: Optional[str] = None,
     error_message: Optional[str] = None,
     duration_ms: Optional[int] = None,
+    tries: Optional[int] = None,
+    tokens_used: Optional[int] = None,
 ) -> None:
-    """Appends one audit_log row. Never raises -- a logging failure must
-    never take down the actual conversation turn it's trying to record.
+    """Appends one turn to the new normalized schema. Never raises -- a
+    logging failure must never take down the actual conversation turn
+    it's trying to record.
 
     role: 'user' | 'assistant' | 'tool' | 'system'
     user_id: who prompted the underlying request (thread through from the
              originating user message to any tool calls it triggers)
     prompt_text: the user question this row is answering, if not `role='user'` itself
     duration_ms: how long this step took (LLM call latency / tool execution time)
+    tries / tokens_used: optional depth info -> written to `details`
+        (e.g. how many times the agent retried, tokens the user's
+        request consumed). Omit if not known yet -- nothing requires them.
+
+    Writes:
+      - always: one `overview` row (prompt_text, output_text=content)
+      - if tries/tokens_used given: one `details` row for that overview row
+      - if tool_name given: upserts `tools`, inserts one `tools_sec` row
+        (status/duration_ms), and one `tools_details` row (tool_args as
+        input, content as output, error_message)
     """
     try:
         ensure_session(session_id, user_id)
         with _conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO audit_log (
-                    session_id, role, user_id, prompt_text, content,
-                    tool_name, tool_args, tool_status, error_message, duration_ms
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO overview (session_id, role, user_id, prompt_text, output_text)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
                 """,
-                (
-                    session_id,
-                    role,
-                    user_id,
-                    prompt_text,
-                    content,
-                    tool_name,
-                    json.dumps(tool_args) if tool_args is not None else None,
-                    tool_status,
-                    error_message,
-                    duration_ms,
-                ),
+                (session_id, role, user_id, prompt_text, content),
             )
+            overview_id = cur.fetchone()[0]
+
+            if tries is not None or tokens_used is not None:
+                cur.execute(
+                    """
+                    INSERT INTO details (overview_id, tries, tokens_used)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (overview_id) DO UPDATE SET
+                        tries = COALESCE(EXCLUDED.tries, details.tries),
+                        tokens_used = COALESCE(EXCLUDED.tokens_used, details.tokens_used)
+                    """,
+                    (overview_id, tries, tokens_used),
+                )
+
+            if tool_name:
+                tool_id = _ensure_tool(cur, tool_name)
+                cur.execute(
+                    """
+                    INSERT INTO tools_sec (overview_id, tool_id, status, duration_ms)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (overview_id, tool_id, tool_status or "success", duration_ms),
+                )
+                tools_sec_id = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    INSERT INTO tools_details (tools_sec_id, tool_args, tool_output, error_message)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (
+                        tools_sec_id,
+                        json.dumps(tool_args) if tool_args is not None else None,
+                        content,
+                        error_message,
+                    ),
+                )
     except Exception:
         logger.exception("Failed to write audit log entry for session '%s'", session_id)
 
@@ -147,18 +210,29 @@ def time_tool_call():
     yield lambda: int((time.perf_counter() - start) * 1000)
 
 
+# Reassembles overview + details + tools_sec/tools/tools_details back into
+# the same row shape the old flat audit_log query produced, so callers
+# (get_transcript's consumers, export_json, the /api/audit/* routes)
+# don't need to change.
+_TRANSCRIPT_QUERY = """
+    SELECT
+        o.role, o.user_id, o.prompt_text, o.output_text AS content,
+        t.tool_name, td.tool_args, ts.status AS tool_status,
+        td.error_message, ts.duration_ms, o.created_at,
+        d.tries, d.tokens_used
+    FROM overview o
+    LEFT JOIN tools_sec ts     ON ts.overview_id = o.id
+    LEFT JOIN tools t          ON t.tool_id = ts.tool_id
+    LEFT JOIN tools_details td ON td.tools_sec_id = ts.id
+    LEFT JOIN details d        ON d.overview_id = o.id
+    WHERE o.session_id = %s
+    ORDER BY o.id ASC
+"""
+
+
 def get_transcript(session_id: str) -> list[dict[str, Any]]:
     with _conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT role, user_id, prompt_text, content, tool_name, tool_args,
-                   tool_status, error_message, duration_ms, created_at
-            FROM audit_log
-            WHERE session_id = %s
-            ORDER BY id ASC
-            """,
-            (session_id,),
-        )
+        cur.execute(_TRANSCRIPT_QUERY, (session_id,))
         rows = cur.fetchall()
     return [dict(r) for r in rows]
 
@@ -166,9 +240,9 @@ def get_transcript(session_id: str) -> list[dict[str, Any]]:
 def list_sessions(since: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
     query = """
         SELECT s.session_id, s.user_id, s.started_at, s.last_active_at,
-               COUNT(a.id) AS turn_count
+               COUNT(o.id) AS turn_count
         FROM sessions s
-        LEFT JOIN audit_log a ON a.session_id = s.session_id
+        LEFT JOIN overview o ON o.session_id = s.session_id
     """
     params: list = []
     if since:
@@ -213,7 +287,88 @@ def write_json_export(path: str, session_id: Optional[str] = None) -> str:
 
 
 # ---------------------------------------------------------------------
-# File upload metadata (paired with storage/s3_storage.py)
+# Tool success/failure summary -- "did it work or fail how many times"
+# (TOOLS_SEC's stated purpose), derived from tools_sec rather than a
+# running counter so it can't drift out of sync with the raw log.
+# ---------------------------------------------------------------------
+
+def tool_stats(session_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """Per-tool success/fail/not_found counts, optionally scoped to one
+    session. Backs a 'which tools worked, which didn't, how often'
+    view -- the thing TOOLS_SEC exists for."""
+    query = """
+        SELECT t.tool_name,
+               COUNT(*) FILTER (WHERE ts.status = 'success')   AS success_count,
+               COUNT(*) FILTER (WHERE ts.status = 'error')     AS error_count,
+               COUNT(*) FILTER (WHERE ts.status = 'not_found') AS not_found_count,
+               COUNT(*)                                        AS total_calls
+        FROM tools_sec ts
+        JOIN tools t ON t.tool_id = ts.tool_id
+        JOIN overview o ON o.id = ts.overview_id
+    """
+    params: list = []
+    if session_id:
+        query += " WHERE o.session_id = %s"
+        params.append(session_id)
+    query += " GROUP BY t.tool_name ORDER BY total_calls DESC"
+
+    with _conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------
+# Token budget ledger (token_details) -- per-department usage/allotment
+# for the Agent and TTS. Nothing populates this yet (the token-check/
+# RBAC flow it belongs to isn't wired up on the agent side per the
+# diagram) -- these are here ready for when it is.
+# ---------------------------------------------------------------------
+
+def record_token_usage(
+    department: str,
+    agent_tokens_used: int = 0,
+    tts_tokens_used: int = 0,
+    agent_tokens_allotted: Optional[int] = None,
+    tts_tokens_allotted: Optional[int] = None,
+) -> None:
+    """Adds to a department's running token usage, upserting the row if
+    it doesn't exist yet. Pass *_allotted only when (re)setting a
+    department's budget -- omitted, the existing allotment is kept."""
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO token_details (
+                department, agent_tokens_used, tts_tokens_used,
+                agent_tokens_allotted, tts_tokens_allotted
+            ) VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (department) DO UPDATE SET
+                agent_tokens_used = token_details.agent_tokens_used + EXCLUDED.agent_tokens_used,
+                tts_tokens_used = token_details.tts_tokens_used + EXCLUDED.tts_tokens_used,
+                agent_tokens_allotted = COALESCE(EXCLUDED.agent_tokens_allotted, token_details.agent_tokens_allotted),
+                tts_tokens_allotted = COALESCE(EXCLUDED.tts_tokens_allotted, token_details.tts_tokens_allotted)
+            """,
+            (department, agent_tokens_used, tts_tokens_used, agent_tokens_allotted, tts_tokens_allotted),
+        )
+
+
+def get_token_details(department: Optional[str] = None) -> list[dict[str, Any]]:
+    query = "SELECT * FROM token_details"
+    params: list = []
+    if department:
+        query += " WHERE department = %s"
+        params.append(department)
+    query += " ORDER BY department"
+
+    with _conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------
+# File upload metadata (paired with storage/s3_storage.py) -- unchanged,
+# file_uploads wasn't touched by the schema redesign.
 # ---------------------------------------------------------------------
 
 def record_file_upload(
@@ -232,11 +387,7 @@ def record_file_upload(
     status: str = "processed",
 ) -> str:
     """Inserts one file_uploads row and returns its id (uuid string).
-    Call this right after storage.s3_storage.upload_file() succeeds.
-
-    Upserts the parent session first (same fix as log_turn()) so a file
-    uploaded on a brand-new session_id -- before any chat turn has run
-    ensure_session() for it -- can't violate file_uploads_session_id_fkey."""
+    Call this right after storage.s3_storage.upload_file() succeeds."""
     if session_id:
         ensure_session(session_id, user_id)
     with _conn() as conn, conn.cursor() as cur:
