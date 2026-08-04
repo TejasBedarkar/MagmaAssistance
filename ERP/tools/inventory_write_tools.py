@@ -54,7 +54,7 @@ def _safe_call(label, fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001
-        return f"Could not {label} in ERPNext right now ({exc})."
+        return f"Could not {label} in MagnaERP right now ({exc})."
 
 
 def _payload(**kwargs):
@@ -71,9 +71,9 @@ def _payload(**kwargs):
 @tool
 def create_item(
     item_code: str,
+    item_group: str,
+    stock_uom: str,
     item_name: Optional[str] = None,
-    item_group: Optional[str] = None,
-    stock_uom: Optional[str] = None,
     is_stock_item: bool = True,
     description: Optional[str] = None,
 ):
@@ -132,6 +132,7 @@ def update_item(
 @tool
 def create_material_request(
     items: list,
+    company: str,
     material_request_type: Optional[str] = None,
     schedule_date: Optional[str] = None,
     submit: bool = False,
@@ -149,6 +150,7 @@ def create_material_request(
         data = _payload(
             material_request_type=material_request_type or "Purchase",
             schedule_date=schedule_date,
+            company=company,
             items=items,
         )
         result = erp_client.create_doc("Material Request", data)
@@ -194,6 +196,7 @@ def update_material_request(
 @tool
 def create_stock_entry(
     items: list,
+    company: str,
     stock_entry_type: Optional[str] = None,
     from_warehouse: Optional[str] = None,
     to_warehouse: Optional[str] = None,
@@ -214,6 +217,7 @@ def create_stock_entry(
     def run():
         data = _payload(
             stock_entry_type=stock_entry_type or "Material Transfer",
+            company=company,
             from_warehouse=from_warehouse,
             to_warehouse=to_warehouse,
             items=items,
@@ -247,11 +251,14 @@ INVENTORY_WRITE_TOOLS = [
 REQUIRED_FIELDS = {
     "create_item": [
         ("item_code", "What's the item code?"),
+        ("item_group", "Which Item Group should this item use?"),
+        ("stock_uom", "What is the default stock UOM? (for example, Nos or Kg)"),
     ],
     "update_item": [
         ("item_code", "Which item should I update? (its item code)"),
     ],
     "create_material_request": [
+        ("company", "Which company is this Material Request for?"),
         (
             "items",
             "What items are needed? Give each as 'item code, quantity' — "
@@ -263,6 +270,7 @@ REQUIRED_FIELDS = {
         ("material_request_id", "Which material request should I update? (e.g. MAT-MR-2026-00001)"),
     ],
     "create_stock_entry": [
+        ("company", "Which company is this Stock Entry for?"),
         (
             "items",
             "What items are moving? Give each as 'item code, quantity' — "

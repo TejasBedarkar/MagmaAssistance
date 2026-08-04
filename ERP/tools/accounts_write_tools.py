@@ -57,7 +57,7 @@ def _safe_call(label, fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001
-        return f"Could not {label} in ERPNext right now ({exc})."
+        return f"Could not {label} in MagnaERP right now ({exc})."
 
 
 def _payload(**kwargs):
@@ -75,6 +75,7 @@ def _payload(**kwargs):
 def create_sales_invoice(
     customer: str,
     items: list,
+    company: str,
     due_date: Optional[str] = None,
     submit: bool = False,
 ):
@@ -90,6 +91,7 @@ def create_sales_invoice(
     def run():
         data = _payload(
             customer=customer,
+            company=company,
             posting_date=date.today().isoformat(),
             due_date=due_date,
             items=items,
@@ -138,6 +140,9 @@ def update_sales_invoice(
 def create_payment_entry(
     party: str,
     paid_amount: float,
+    company: str,
+    paid_from: str,
+    paid_to: str,
     payment_type: Optional[str] = None,
     party_type: Optional[str] = None,
     reference_no: Optional[str] = None,
@@ -164,6 +169,9 @@ def create_payment_entry(
             payment_type=resolved_payment_type,
             party_type=resolved_party_type,
             party=party,
+            company=company,
+            paid_from=paid_from,
+            paid_to=paid_to,
             paid_amount=paid_amount,
             received_amount=paid_amount,
             posting_date=date.today().isoformat(),
@@ -191,6 +199,7 @@ def create_payment_entry(
 @tool
 def create_journal_entry(
     accounts: list,
+    company: str,
     voucher_type: Optional[str] = None,
     posting_date: Optional[str] = None,
     user_remark: Optional[str] = None,
@@ -212,6 +221,7 @@ def create_journal_entry(
             voucher_type=voucher_type or "Journal Entry",
             posting_date=posting_date or date.today().isoformat(),
             accounts=accounts,
+            company=company,
             user_remark=user_remark,
         )
         result = erp_client.create_doc("Journal Entry", data)
@@ -242,6 +252,7 @@ ACCOUNTS_WRITE_TOOLS = [
 REQUIRED_FIELDS = {
     "create_sales_invoice": [
         ("customer", "Which customer is this invoice for?"),
+        ("company", "Which company is this Sales Invoice for?"),
         (
             "items",
             "What items should be on the invoice? Give each as "
@@ -255,8 +266,12 @@ REQUIRED_FIELDS = {
     "create_payment_entry": [
         ("party", "Which customer or supplier is this payment for/from?"),
         ("paid_amount", "What's the payment amount?"),
+        ("company", "Which company is this Payment Entry for?"),
+        ("paid_from", "Which account is the payment coming from?"),
+        ("paid_to", "Which account is the payment going to?"),
     ],
     "create_journal_entry": [
+        ("company", "Which company is this Journal Entry for?"),
         (
             "accounts",
             "What accounts should be debited/credited? Give each as "

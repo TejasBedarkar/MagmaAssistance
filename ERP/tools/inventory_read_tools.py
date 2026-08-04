@@ -11,7 +11,7 @@ def _safe_call(label, fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001
-        return f"Could not {label} in ERPNext right now ({exc})."
+        return f"Could not {label} in MagnaERP right now ({exc})."
 
 
 @tool
@@ -50,7 +50,7 @@ def get_available_items(limit: int = 50, search: Optional[str] = None) -> str:
             )
         if not items:
             scope = f" matching '{search}'" if search else ""
-            return f"No enabled items{scope} were found in ERPNext."
+            return f"No enabled items{scope} were found in MagnaERP."
         lines = []
         for row in items:
             code = row.get("item_code") or row.get("name") or "(no code)"

@@ -73,7 +73,7 @@ def _safe_call(label, fn):
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001
-        return f"Could not {label} in ERPNext right now ({exc})."
+        return f"Could not {label} in MagnaERP right now ({exc})."
 
 
 def _payload(**kwargs):
@@ -215,7 +215,7 @@ def update_lead(
 @tool
 def create_customer(
     customer_name: str,
-    customer_type: Optional[str] = None,
+    customer_type: str,
     customer_group: Optional[str] = None,
     territory: Optional[str] = None,
     email_id: Optional[str] = None,
@@ -579,6 +579,7 @@ REQUIRED_FIELDS = {
     ],
     "create_customer": [
         ("customer_name", "What is the customer's name?"),
+        ("customer_type", "What is the customer type? (Company, Individual, or Partnership)"),
     ],
     "update_customer": [
         ("customer_id", "Which customer should I update?"),
