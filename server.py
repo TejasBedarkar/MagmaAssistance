@@ -211,11 +211,9 @@ from ERP.tool_rag import ToolRAG
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS
 from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
-
-ALL_TOOLS = list(ERP_UNIFIED_TOOLS) + list(DASHBOARD_UI_TOOLS)
 from Web.serper_tools import WEB_TOOLS
 
-ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *WEB_TOOLS]
+ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
 ALL_FIELD_PARSERS: dict = {}
 
@@ -1233,27 +1231,38 @@ async def agent_node(state: ChatState) -> dict:
         results.append((tool_call, result))
 
     if not is_recovered:
-        # Real tool calls: thread the results back in as ToolMessages and
-        # let the model compose the final reply. Only the final text is
-        # persisted to short-term memory -- the intermediate tool-call
-        # message isn't, so a later trimmed window never ships an
-        # orphaned tool_call without its ToolMessage alongside it.
-        #
-        # IMPORTANT: this step uses `assistant.llm.model` (NOT
-        # `llm_with_tools`) deliberately. If tools stayed bound here, the
-        # model is free to emit a SECOND tool_calls entry while
-        # "composing the final reply" (e.g. call get_customers, see the
-        # result, then also call create_quotation in the same response).
-        # That second call is never executed and never gets a matching
-        # ToolMessage, but it still gets persisted via the return below —
-        # every later turn then resends a history with an unanswered
-        # tool_call, which OpenAI rejects with a 400 on EVERY subsequent
-        # message for that session until it ages out of the trim window.
-        # Composing with the plain (tool-less) model guarantees this step
-        # can only ever produce a text reply.
+        # Keep tools available while processing their results. Some requests
+        # legitimately need more than one step, for example:
+        # erp_describe_fields -> erp_data_tool(list). Execute every emitted
+        # call before returning and persist only the final text response, so
+        # short-term history can never contain an orphaned tool call.
         for tool_call, result in results:
             call_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
-        final_response = assistant.llm.model.invoke(call_messages)
+
+        max_followup_rounds = 4
+        for round_number in range(max_followup_rounds + 1):
+            final_response = llm_with_tools.invoke(call_messages)
+            followup_calls = final_response.tool_calls
+            if not followup_calls:
+                break
+
+            if round_number == max_followup_rounds:
+                logger.warning("Tool-call round limit reached; composing a final response.")
+                final_response = assistant.llm.model.invoke(call_messages)
+                break
+
+            call_messages.append(final_response)
+            for tool_call in followup_calls:
+                result = await _execute_tool(
+                    tool_call["name"], tool_call.get("args") or {},
+                    session_id=state.get("session_id"), user_id=state.get("user_id"),
+                    prompt_text=last_user_msg,
+                )
+                logger.info("Tool '%s' raw result: %s", tool_call["name"], result)
+                results.append((tool_call, result))
+                call_messages.append(
+                    ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+                )
 
         # Clean up any raw tool-argument JSON leaks (e.g. {"type": "bar", "x_axis_data": [...], "series_data": [...]})
         if final_response.content:
