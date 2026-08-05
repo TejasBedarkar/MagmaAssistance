@@ -86,6 +86,38 @@ def get_required_fields(doctype: str, exclude: set | None = None) -> list[dict]:
     return required
 
 
+def get_available_fields(doctype: str) -> list[dict]:
+    """Return the live, data-bearing fields that may be used in queries.
+
+    Unlike :func:`get_required_fields`, this is intended for read/list
+    operations, where the model needs the real ERPNext fieldnames instead
+    of guessing them from natural-language labels.
+    """
+    meta = erp_client.get_meta(doctype)
+    available = [
+        {"fieldname": "name", "label": "ID / Name", "fieldtype": "Data"},
+        {"fieldname": "creation", "label": "Created On", "fieldtype": "Datetime"},
+        {"fieldname": "modified", "label": "Last Modified", "fieldtype": "Datetime"},
+        {"fieldname": "owner", "label": "Owner", "fieldtype": "Link"},
+        {"fieldname": "docstatus", "label": "Document Status", "fieldtype": "Int"},
+    ]
+    seen = {field["fieldname"] for field in available}
+    for field in meta.get("fields", []) or []:
+        fieldname = field.get("fieldname")
+        fieldtype = field.get("fieldtype")
+        if not fieldname or fieldname in seen or fieldtype in _NON_DATA_FIELDTYPES:
+            continue
+        if field.get("hidden") or fieldtype in {"Table", "Table MultiSelect"}:
+            continue
+        available.append({
+            "fieldname": fieldname,
+            "label": field.get("label") or fieldname.replace("_", " ").title(),
+            "fieldtype": fieldtype or "Data",
+        })
+        seen.add(fieldname)
+    return available
+
+
 def missing_required_fields(doctype: str, data: dict | None) -> list[dict]:
     """Same as get_required_fields(), but filtered down to the ones NOT
     already present (and non-empty) in `data`."""
@@ -222,6 +254,12 @@ def _extract_server_messages(exc: Exception) -> list[str]:
                         messages.append(re.sub("<[^<]+?>", "", parsed["message"]))
             except Exception:
                 pass
+        if err_json and not messages:
+            # Read/list DataErrors commonly put the useful explanation in
+            # `exception` or `message` rather than `_server_messages`.
+            raw_detail = err_json.get("message") or err_json.get("exception")
+            if raw_detail:
+                messages.append(re.sub("<[^<]+?>", "", str(raw_detail)))
 
     if not messages and "ERPNext Rule Failure:" in text:
         messages.append(text.split("ERPNext Rule Failure:", 1)[1].strip())
@@ -275,6 +313,16 @@ def explain_erp_error(exc: Exception, context: str = "") -> str:
 
     if "already exists" in haystack or "duplicate" in haystack:
         return f"{prefix}A record with these details already exists in ERPNext: {detail}."
+
+    # Frappe describes unknown/non-queryable columns as "Field not
+    # permitted in query".  That is a query-schema error, not an RBAC
+    # denial; classify it before the broader permission check below.
+    if "field not permitted in query" in haystack:
+        return (
+            f"{prefix}The query used a field that does not exist or cannot be "
+            f"queried on this document type: {detail}. Use "
+            "erp_describe_fields for the exact ERPNext fieldnames and retry."
+        )
 
     if status_code == 403 or "permission" in haystack or "not permitted" in haystack:
         return (

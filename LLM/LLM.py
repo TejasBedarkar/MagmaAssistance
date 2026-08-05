@@ -80,8 +80,30 @@ DEFAULT_SYSTEM_PROMPT = (
     "₹ symbol and the Indian numbering system (e.g., ₹1,25,000 or ₹12,50,00,000), "
     "rounding large figures sensibly.\n"
     "- Format numbers and dates clearly.\n"
+    "- For relative dates such as today, yesterday, this month, or last month, "
+    "calculate them from the current date supplied in the system message.\n"
+    "- Never guess ERPNext fieldnames. Before a list/search call, use "
+    "erp_describe_fields when exact fields or filter/date fields are uncertain, "
+    "then use only fieldnames returned by that schema lookup. Common sales fields "
+    "include Sales Order `transaction_date` and `grand_total`, and Sales Invoice "
+    "`posting_date`, `name`, and `grand_total`.\n"
     "- If data is unavailable or a tool call fails, say so in one plain sentence — "
     "never invent values.\n"
+    "- When the user asks to find, verify, enrich, or research a named person at a "
+    "company on the public web, call research_lead_web. Present only evidence-backed "
+    "Lead fields and put the supporting source URL beside each value. Search results "
+    "are leads to verify, not automatically proven facts. Never create or update the "
+    "Lead until the user explicitly approves the displayed research.\n"
+    "- For Lead records, the researched employer/organization always maps to "
+    "`company_name`. The `company` field is the internal ERP Company Link and must "
+    "never contain the researched employer unless it is explicitly an existing "
+    "internal Company selected by the user. Do not guess Link-field values.\n"
+    "- Populate an email field only when the research evidence contains a complete, "
+    "valid address with a real dotted domain (for example, name@example.com). If an "
+    "email is missing, incomplete, malformed, or merely guessed, omit the field.\n"
+    "- For researched Leads, copy first_name/middle_name/last_name exactly from the "
+    "research tool's suggested_lead_fields. Never place company_name into a person's "
+    "name field, including after short follow-ups such as yes, approve, or skip email.\n"
     "- When creating or updating a record, only use information the user actually "
     "gave you. If something required is missing, ask for it — never guess a name, "
     "ID, phone number, email, or amount.\n"
@@ -104,20 +126,35 @@ DEFAULT_SYSTEM_PROMPT = (
 class LLM:
 
     def __init__(self, api_key: str = None, model: str = "gpt-4o-mini", system_prompt: str = DEFAULT_SYSTEM_PROMPT, temperature: float = 0.7, base_url: str = "https://api.openai.com/v1/chat/completions"):
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("No API key provided. Set OPENAI_API_KEY in your .env file or pass api_key directly.")
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+        env_openai_key = os.environ.get("OPENAI_API_KEY")
+        key = api_key or openrouter_key or env_openai_key
 
-        self.model_name = model
+        is_openrouter = bool(openrouter_key) or (key and key.startswith("sk-or-v1-"))
+
+        if is_openrouter:
+            self.api_key = openrouter_key or key
+            self.base_url = "https://openrouter.ai/api/v1/chat/completions"
+            self.model_name = model if "/" in model else f"openai/{model}"
+            self.headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8050",
+                "X-Title": "MagmaAssistance",
+            }
+        else:
+            self.api_key = key
+            if not self.api_key:
+                raise ValueError("No API key provided. Set OPENAI_API_KEY or OPENROUTER_API_KEY in your .env file.")
+            self.model_name = model
+            self.base_url = base_url
+            self.headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+
         self.system_prompt = system_prompt
         self.temperature = temperature
-        self.base_url = base_url
-
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-
         self.history = [{"role": "system", "content": self.system_prompt}]
 
     def set_system_prompt(self, system_prompt: str, reset_history: bool = True):

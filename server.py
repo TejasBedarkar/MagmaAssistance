@@ -5,6 +5,8 @@ import shutil
 import logging
 import json
 import sys
+import ast
+from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -98,14 +100,31 @@ class OpenAIChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         api_messages = [convert_message_to_dict(msg) for msg in messages]
-        
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+        env_openai_key = os.environ.get("OPENAI_API_KEY")
+        key = openrouter_key or self.api_key or env_openai_key
+
+        is_openrouter = bool(openrouter_key) or (key and str(key).startswith("sk-or-v1-")) or "openrouter.ai" in str(self.base_url)
+
+        if is_openrouter:
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8050",
+                "X-Title": "MagmaAssistance",
+            }
+            target_url = "https://openrouter.ai/api/v1/chat/completions"
+            model_name = self.model_name if "/" in self.model_name else f"openai/{self.model_name}"
+        else:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+            target_url = self.base_url
+            model_name = self.model_name
 
         data = {
-            "model": self.model_name,
+            "model": model_name,
             "messages": api_messages,
             "temperature": self.temperature,
         }
@@ -113,10 +132,10 @@ class OpenAIChatModel(BaseChatModel):
         if self.bound_tools:
             data["tools"] = self.bound_tools
             
-        response = requests.post(self.base_url, json=data, headers=headers)
+        response = requests.post(target_url, json=data, headers=headers)
         
         if not response.ok:
-            logger.error(f"OpenAI Rejected Request ({response.status_code}): {response.text}")
+            logger.error(f"LLM API Rejected Request ({response.status_code}): {response.text}")
 
         response.raise_for_status()
         res_json = response.json()
@@ -191,13 +210,10 @@ from ERP.tool_rag import ToolRAG
 # either; erp_data_tool does its own missing-field prompting internally
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS
+from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
+from Web.serper_tools import WEB_TOOLS
 
-# Generic internet-access tools (web_search, web_fetch_page, web_crawl) --
-# not tied to ERPNext, let the agent look things up on the open internet
-# when the answer isn't in ERP data. See web/web_tools.py.
-from web.web_tools import WEB_TOOLS
-
-ALL_TOOLS = list(ERP_UNIFIED_TOOLS) + list(WEB_TOOLS)
+ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
 ALL_FIELD_PARSERS: dict = {}
 
@@ -283,7 +299,7 @@ logger.info("Using ERP_Unified as the sole ERP tool source (erp_data_tool / erp_
 tool_rag = None
 tool_map = {}
 if ALL_TOOLS:
-    logger.info("Indexing %d local ERP tool(s) for retrieval...", len(ALL_TOOLS))
+    logger.info("Indexing %d local agent tool(s) for retrieval...", len(ALL_TOOLS))
     tool_rag = ToolRAG(ALL_TOOLS, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
     tool_map = {tool.name: tool for tool in ALL_TOOLS}
 else:
@@ -365,12 +381,29 @@ class ChatState(TypedDict):
     user_id: Optional[str] # who prompted this turn, passed through for the same reason
 
 
+# Values a model sometimes invents in place of a real answer when it
+# doesn't actually know one, instead of leaving the field blank so
+# slot-filling can ask. Treated as "still missing" so a required field
+# (e.g. company, warehouse) can't be silently satisfied by a guess.
+_PLACEHOLDER_VALUES = {
+    "default", "n/a", "na", "none", "null", "unknown",
+    "not specified", "not sure", "unspecified", "todo", "tbd", "-",
+}
+
+
 def _missing_fields(tool_name: str, args: dict) -> list:
     """Ordered (field, question) pairs required for `tool_name` that are
-    absent or empty in `args`."""
+    absent, empty, or filled with a placeholder-like guess in `args`."""
     required = ALL_REQUIRED_FIELDS.get(tool_name, [])
     args = args or {}
-    return [(field, question) for field, question in required if not args.get(field)]
+    missing = []
+    for field, question in required:
+        value = args.get(field)
+        if not value:
+            missing.append((field, question))
+        elif isinstance(value, str) and value.strip().lower() in _PLACEHOLDER_VALUES:
+            missing.append((field, question))
+    return missing
 
 
 def _last_human_message(messages) -> Optional[str]:
@@ -608,6 +641,10 @@ document_store: Dict[str, Dict[str, Any]] = {}  # session_id -> {filename, text,
 # using the shared service account, same as before this was wired up.
 session_identities: Dict[str, ERPIdentity] = {}
 
+# Keep the researched person/company identity stable across approval turns such
+# as "yes" or "skip that email", where the model has little text to map from.
+lead_research_context: Dict[str, Dict[str, str]] = {}
+
 
 class SessionIdentifyRequest(BaseModel):
     session_id: str
@@ -745,11 +782,40 @@ async def _execute_tool(
             )
         return result
     try:
+        effective_args = _sanitize_tool_args(tool_name, args) or {}
+
+        if tool_name == "erp_data_tool" and session_id:
+            operation = str(effective_args.get("operation") or "").strip().lower()
+            doctype = str(effective_args.get("doctype") or "").strip().lower()
+            context = lead_research_context.get(session_id)
+            if operation in {"create", "insert", "add", "new"} and doctype == "lead" and context:
+                lead_data = dict(effective_args.get("data") or {})
+                for fieldname in ("first_name", "middle_name", "last_name", "company_name"):
+                    if context.get(fieldname):
+                        lead_data[fieldname] = context[fieldname]
+                effective_args["data"] = lead_data
+                effective_args["session_id"] = session_id
+
         with audit_log.time_tool_call() as elapsed:
-            result = await tool.ainvoke(_sanitize_tool_args(tool_name, args) or {})
+            result = await tool.ainvoke(effective_args)
+
+        if tool_name == "research_lead_web" and session_id:
+            try:
+                research = json.loads(str(result))
+                suggested = research.get("suggested_lead_fields") or {}
+                if suggested.get("first_name") and suggested.get("company_name"):
+                    lead_research_context[session_id] = {
+                        key: str(value)
+                        for key, value in suggested.items()
+                        if key in {"first_name", "middle_name", "last_name", "company_name"}
+                        and value
+                    }
+            except (TypeError, ValueError, AttributeError):
+                pass
+
         if session_id:
             audit_log.log_turn(
-                session_id, "tool", str(result), tool_name=tool_name, tool_args=args,
+                session_id, "tool", str(result), tool_name=tool_name, tool_args=effective_args,
                 user_id=user_id, prompt_text=prompt_text, tool_status="success",
                 duration_ms=elapsed(),
             )
@@ -920,7 +986,7 @@ def _plain_reply(history, task_context: Optional[str] = None) -> str:
     uploaded a document...]' context from generate_reply() -- so a
     follow-up like 'solve problem 3 from that PDF' actually has the
     document content available instead of being answered blind."""
-    system_parts = [assistant.llm.system_prompt]
+    system_parts = [assistant.llm.system_prompt, f"Current date: {datetime.now().astimezone():%Y-%m-%d}."]
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
     call_messages = [SystemMessage(content="\n".join(system_parts)), *history]
@@ -928,10 +994,138 @@ def _plain_reply(history, task_context: Optional[str] = None) -> str:
     return response.content
 
 
+def _build_fallback_chart(results: list, query_lower: str) -> Optional[str]:
+    """Generic, zero-hardcode fallback chart generator: parses ANY list of records
+    returned by erp_data_tool, detects category/label keys and numeric/status keys,
+    and dynamically builds bar, line, or pie chart specs."""
+    if not results:
+        return None
+
+    IGNORED_KEYS = {"name", "docstatus", "idx", "owner", "creation", "modified"}
+
+    for _tc, raw_result in reversed(results):
+        raw_text = str(raw_result)
+        try:
+            cleaned = raw_text
+            if cleaned.startswith("[{'type': 'text', 'text':"):
+                parsed_wrapper = ast.literal_eval(cleaned)
+                if isinstance(parsed_wrapper, list) and len(parsed_wrapper) > 0 and 'text' in parsed_wrapper[0]:
+                    cleaned = parsed_wrapper[0]['text']
+
+            data = ast.literal_eval(cleaned)
+
+            if not (isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict)):
+                continue
+
+            first_row = data[0]
+            avail_keys = [k for k in first_row.keys() if k.lower() not in IGNORED_KEYS]
+
+            if not avail_keys:
+                continue
+
+            cat_keys = []
+            num_keys = []
+            for k in avail_keys:
+                val = first_row.get(k)
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    num_keys.append(k)
+                elif isinstance(val, str) and not val.replace(".", "", 1).isdigit():
+                    cat_keys.append(k)
+                elif val is not None:
+                    try:
+                        float(str(val))
+                        num_keys.append(k)
+                    except ValueError:
+                        cat_keys.append(k)
+
+            # Prioritize standard ERP label fields over generic text
+            priority_cat = [
+                "customer", "customer_name", "supplier", "supplier_name", 
+                "item_code", "item_name", "production_item", "warehouse", 
+                "territory", "item_group", "posting_date", "transaction_date"
+            ]
+            best_cat = next((k for p in priority_cat for k in cat_keys if k.lower() == p or p in k.lower()), cat_keys[0] if cat_keys else None)
+
+            # Prioritize standard ERP financial & quantity fields over generic numbers
+            priority_num = [
+                "grand_total", "total", "net_total", "amount", 
+                "qty", "produced_qty", "stock_qty", "rate", "valuation_rate"
+            ]
+            best_num = next((k for p in priority_num for k in num_keys if k.lower() == p or p in k.lower()), num_keys[0] if num_keys else None)
+
+            # If all rows belong to a single category (e.g. single customer query like "West View Software Ltd."),
+            # or if date fields are present, switch category key to date for a Timeline Line Chart!
+            date_key = next((k for k in avail_keys if any(dw in k.lower() for dw in ["date", "posting", "transaction"])), None)
+            if best_cat and date_key:
+                unique_cats = {str(r.get(best_cat) or "").strip() for r in data}
+                if len(unique_cats) <= 1:
+                    best_cat = date_key
+
+            # Strategy 1: Numerical aggregation (Category key + Numeric key) -> Bar or Line Chart
+            if best_cat and best_num:
+                label_key = best_cat
+                value_key = best_num
+
+                totals: dict[str, float] = {}
+                for row in data:
+                    label = str(row.get(label_key) or "Unknown").strip()
+                    try:
+                        num_val = float(row.get(value_key) or 0)
+                    except (ValueError, TypeError):
+                        num_val = 0.0
+                    totals[label] = totals.get(label, 0.0) + num_val
+
+                if totals:
+                    is_timeline = any(w in label_key.lower() for w in ["date", "month", "year", "time", "day"])
+                    if is_timeline:
+                        sorted_items = sorted(totals.items(), key=lambda x: x[0])
+                        x_axis = [item[0] for item in sorted_items]
+                        series_data = [round(item[1], 2) for item in sorted_items]
+                    else:
+                        x_axis = list(totals.keys())
+                        series_data = [round(v, 2) for v in totals.values()]
+
+                    label_title = label_key.replace("_", " ").title()
+                    value_title = value_key.replace("_", " ").title()
+                    chart_type = "line" if is_timeline else "bar"
+
+                    chart_spec = {
+                        "type": chart_type,
+                        "title": f"{value_title} Over Time" if is_timeline else f"{value_title} by {label_title}",
+                        "xAxis": x_axis,
+                        "series": [{"name": value_title, "data": series_data}]
+                    }
+                    return f"\n\n```chart\n{json.dumps(chart_spec, indent=2)}\n```"
+
+            # Strategy 2: Categorical Frequency Breakdown (Status/Type key) -> Pie Chart
+            if cat_keys:
+                status_key = next((k for k in cat_keys if "status" in k.lower() or "group" in k.lower() or "type" in k.lower()), cat_keys[0])
+                counts: dict[str, int] = {}
+                for row in data:
+                    cat_val = str(row.get(status_key) or "Unknown").strip()
+                    counts[cat_val] = counts.get(cat_val, 0) + 1
+
+                if counts:
+                    title_name = status_key.replace("_", " ").title()
+                    chart_spec = {
+                        "type": "pie",
+                        "title": f"{title_name} Distribution",
+                        "labels": list(counts.keys()),
+                        "values": list(counts.values())
+                    }
+                    return f"\n\n```chart\n{json.dumps(chart_spec, indent=2)}\n```"
+
+        except Exception as e:
+            logger.debug("Generic fallback chart parsing skipped: %s", e)
+            continue
+
+    return None
+
+
 async def agent_node(state: ChatState) -> dict:
     """Retrieve-tools -> call-LLM -> call-tool turn, same logic as the
     original generate_reply, now working off the trimmed short-term
-    history instead of a single isolated message, and opening a
+    history in state['messages'] and carrying pending_tool / task_slots
     slot-filling flow (via state) instead of a global dict when a
     write-tool call is missing required info."""
     last_user_msg = _last_human_message(state["messages"]) or ""
@@ -972,7 +1166,28 @@ async def agent_node(state: ChatState) -> dict:
     logger.info("Tools selected for query: %s", [t.name for t in candidate_tools])
 
     llm_with_tools = assistant.llm.model.bind_tools(candidate_tools)
-    system_parts = [assistant.llm.system_prompt]
+    import datetime
+    current_date_str = datetime.date.today().strftime("%Y-%m-%d")
+    system_parts = [
+        assistant.llm.system_prompt,
+        f"\nCURRENT SYSTEM DATE: {current_date_str}. Use this date when calculating date ranges for 'last 3 months', 'this month', or 'recent' records.",
+        "\nSENIOR ERP EXPERT & BUSINESS INTELLIGENCE DIRECTIVE:",
+        "- You are an expert ERP & Data Analyst. Think contextually about when visual charts add true executive value.",
+        "- PROACTIVELY & AUTOMATICALLY generate visual charts (`create_bar_chart`, `create_pie_chart`, or `create_line_chart`) whenever the query involves tabular datasets, list overviews, status breakdowns, multi-record sales/purchase summaries, inventory counts, or financial trends — WITHOUT requiring the user to explicitly ask for 'chart' or 'graph'.",
+        "- For single-record lookups (e.g. details of one specific order 'SAL-ORD-2026-00001'), single entity details, or general guidance questions, provide a clean executive response without forcing an unnecessary chart.",
+        "\nEXECUTIVE REPORTING & FORMATTING STANDARDS:",
+        "For all multi-record data responses, structure your output with clear headers:",
+        "1. ### Executive Summary: High-level narrative with total metrics in bold (e.g. **₹6,43,000** or **6 orders**), completion percentages (e.g. **83%**), top customer/item contribution with percentage share, and operational insights.",
+        "2. ### Order Breakdown (or ### Data Table): Clean, aligned Markdown table. All financial columns MUST include currency symbols (e.g. **₹20,000**), and dates MUST be cleanly formatted (e.g. 2026-08-05).",
+        "3. Interactive Visual Spec: Embed the matching ```chart JSON block for any summary, list, or status comparison query.",
+        "\nCHARTING & DATA REPORTING INSTRUCTIONS:",
+        "- When generating charts, call the appropriate chart tool (`create_bar_chart`, `create_line_chart`, or `create_pie_chart`).",
+        "- For bar charts (e.g. comparing sales revenue by customer), call `create_bar_chart` with x_axis_data (customer names) and series_data (revenue values).",
+        "- For status distributions, call `create_pie_chart` with labels (status names) and values (counts).",
+        "- For timeline trends over months/dates, call `create_line_chart` with x_axis_data (dates/months) and series_data (amounts).",
+        "- Always retrieve real records from ERPNext using `erp_data_tool` first before generating charts or summaries.",
+        "- When querying sales data with `erp_data_tool`, ALWAYS use `doctype='Sales Order'` (do NOT pass fieldnames like 'transaction_date' or 'grand_total' as the doctype parameter)."
+    ]
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
     call_messages = [SystemMessage(content="\n".join(system_parts)), *history]
@@ -1022,27 +1237,74 @@ async def agent_node(state: ChatState) -> dict:
         results.append((tool_call, result))
 
     if not is_recovered:
-        # Real tool calls: thread the results back in as ToolMessages and
-        # let the model compose the final reply. Only the final text is
-        # persisted to short-term memory -- the intermediate tool-call
-        # message isn't, so a later trimmed window never ships an
-        # orphaned tool_call without its ToolMessage alongside it.
-        #
-        # IMPORTANT: this step uses `assistant.llm.model` (NOT
-        # `llm_with_tools`) deliberately. If tools stayed bound here, the
-        # model is free to emit a SECOND tool_calls entry while
-        # "composing the final reply" (e.g. call get_customers, see the
-        # result, then also call create_quotation in the same response).
-        # That second call is never executed and never gets a matching
-        # ToolMessage, but it still gets persisted via the return below —
-        # every later turn then resends a history with an unanswered
-        # tool_call, which OpenAI rejects with a 400 on EVERY subsequent
-        # message for that session until it ages out of the trim window.
-        # Composing with the plain (tool-less) model guarantees this step
-        # can only ever produce a text reply.
+        # Keep tools available while processing their results. Some requests
+        # legitimately need more than one step, for example:
+        # erp_describe_fields -> erp_data_tool(list). Execute every emitted
+        # call before returning and persist only the final text response, so
+        # short-term history can never contain an orphaned tool call.
         for tool_call, result in results:
             call_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
-        final_response = assistant.llm.model.invoke(call_messages)
+
+        max_followup_rounds = 4
+        for round_number in range(max_followup_rounds + 1):
+            final_response = llm_with_tools.invoke(call_messages)
+            followup_calls = final_response.tool_calls
+            if not followup_calls:
+                break
+
+            if round_number == max_followup_rounds:
+                logger.warning("Tool-call round limit reached; composing a final response.")
+                final_response = assistant.llm.model.invoke(call_messages)
+                break
+
+            call_messages.append(final_response)
+            for tool_call in followup_calls:
+                result = await _execute_tool(
+                    tool_call["name"], tool_call.get("args") or {},
+                    session_id=state.get("session_id"), user_id=state.get("user_id"),
+                    prompt_text=last_user_msg,
+                )
+                logger.info("Tool '%s' raw result: %s", tool_call["name"], result)
+                results.append((tool_call, result))
+                call_messages.append(
+                    ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+                )
+
+        # Clean up any raw tool-argument JSON leaks (e.g. {"type": "bar", "x_axis_data": [...], "series_data": [...]})
+        if final_response.content:
+            cleaned_content = re.sub(
+                r'```(?:json)?\s*\{[\s\S]*?"(?:x_axis_data|series_data)"[\s\S]*?\}\s*```',
+                '',
+                final_response.content
+            )
+            lines = []
+            in_chart_block = False
+            for line in cleaned_content.splitlines():
+                if "```chart" in line:
+                    in_chart_block = True
+                elif "```" in line and in_chart_block:
+                    in_chart_block = False
+
+                if not in_chart_block and ('"x_axis_data"' in line or '"series_data"' in line):
+                    continue
+                lines.append(line)
+            final_response.content = "\n".join(lines).strip()
+
+        # 1. Auto-append executed chart tool result if missing from final response
+        chart_tool_names = {"create_bar_chart", "create_line_chart", "create_pie_chart"}
+        for tool_call, result in results:
+            if tool_call["name"] in chart_tool_names:
+                res_str = str(result)
+                if "```chart" in res_str and "```chart" not in (final_response.content or ""):
+                    final_response.content = (final_response.content or "").strip() + "\n\n" + res_str.strip()
+
+        # 2. Fallback guarantee: if list/summary query produced data but no chart block, build one automatically
+        if "```chart" not in (final_response.content or ""):
+            fallback = _build_fallback_chart(results, last_user_msg.lower())
+            if fallback:
+                logger.info("Auto-charting fallback injected chart into final response.")
+                final_response.content = (final_response.content or "").strip() + fallback
+
         return {"messages": [final_response]}
 
     # Recovered fake tool call: there's no real AIMessage.tool_calls entry
