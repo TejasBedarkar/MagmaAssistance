@@ -73,20 +73,35 @@ DEFAULT_SYSTEM_PROMPT = (
 class LLM:
 
     def __init__(self, api_key: str = None, model: str = "gpt-4o-mini", system_prompt: str = DEFAULT_SYSTEM_PROMPT, temperature: float = 0.7, base_url: str = "https://api.openai.com/v1/chat/completions"):
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("No API key provided. Set OPENAI_API_KEY in your .env file or pass api_key directly.")
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+        env_openai_key = os.environ.get("OPENAI_API_KEY")
+        key = api_key or openrouter_key or env_openai_key
 
-        self.model_name = model
+        is_openrouter = bool(openrouter_key) or (key and key.startswith("sk-or-v1-"))
+
+        if is_openrouter:
+            self.api_key = openrouter_key or key
+            self.base_url = "https://openrouter.ai/api/v1/chat/completions"
+            self.model_name = model if "/" in model else f"openai/{model}"
+            self.headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8050",
+                "X-Title": "MagmaAssistance",
+            }
+        else:
+            self.api_key = key
+            if not self.api_key:
+                raise ValueError("No API key provided. Set OPENAI_API_KEY or OPENROUTER_API_KEY in your .env file.")
+            self.model_name = model
+            self.base_url = base_url
+            self.headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+
         self.system_prompt = system_prompt
         self.temperature = temperature
-        self.base_url = base_url
-
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-
         self.history = [{"role": "system", "content": self.system_prompt}]
 
     def set_system_prompt(self, system_prompt: str, reset_history: bool = True):
