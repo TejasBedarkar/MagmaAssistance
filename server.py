@@ -5,6 +5,7 @@ import shutil
 import logging
 import json
 import sys
+from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -191,8 +192,9 @@ from ERP.tool_rag import ToolRAG
 # either; erp_data_tool does its own missing-field prompting internally
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS
+from Web.serper_tools import WEB_TOOLS
 
-ALL_TOOLS = list(ERP_UNIFIED_TOOLS)
+ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *WEB_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
 ALL_FIELD_PARSERS: dict = {}
 
@@ -272,7 +274,7 @@ logger.info("Using ERP_Unified as the sole ERP tool source (erp_data_tool / erp_
 tool_rag = None
 tool_map = {}
 if ALL_TOOLS:
-    logger.info("Indexing %d local ERP tool(s) for retrieval...", len(ALL_TOOLS))
+    logger.info("Indexing %d local agent tool(s) for retrieval...", len(ALL_TOOLS))
     tool_rag = ToolRAG(ALL_TOOLS, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
     tool_map = {tool.name: tool for tool in ALL_TOOLS}
 else:
@@ -909,7 +911,7 @@ def _plain_reply(history, task_context: Optional[str] = None) -> str:
     uploaded a document...]' context from generate_reply() -- so a
     follow-up like 'solve problem 3 from that PDF' actually has the
     document content available instead of being answered blind."""
-    system_parts = [assistant.llm.system_prompt]
+    system_parts = [assistant.llm.system_prompt, f"Current date: {datetime.now().astimezone():%Y-%m-%d}."]
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
     call_messages = [SystemMessage(content="\n".join(system_parts)), *history]
@@ -961,7 +963,7 @@ async def agent_node(state: ChatState) -> dict:
     logger.info("Tools selected for query: %s", [t.name for t in candidate_tools])
 
     llm_with_tools = assistant.llm.model.bind_tools(candidate_tools)
-    system_parts = [assistant.llm.system_prompt]
+    system_parts = [assistant.llm.system_prompt, f"Current date: {datetime.now().astimezone():%Y-%m-%d}."]
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
     call_messages = [SystemMessage(content="\n".join(system_parts)), *history]

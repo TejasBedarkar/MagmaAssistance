@@ -210,21 +210,26 @@ def _run_create(doctype: str, data: Optional[dict], submit: bool, session_id: st
 
 @tool
 def erp_describe_fields(doctype: str) -> str:
-    """Looks up, LIVE from ERPNext's own schema, which fields are
-    required to create a record of `doctype` (any ERPNext doctype).
-    Use this when the user asks something like 'what do you need to
-    create a <doctype>?' or before starting a multi-field create so you
-    know what to ask for — though calling erp_data_tool with
-    operation='create' directly will also surface missing fields one at
-    a time on its own."""
+    """Looks up the LIVE ERPNext schema for a doctype. Use this before
+    list/search calls whenever you are not certain of exact fieldnames,
+    filter fields, or date fields. It returns every queryable field plus
+    the subset required for creation. Never invent fieldnames."""
 
     def run():
-        from ERP.dynamic_fields import get_required_fields
+        from ERP.dynamic_fields import get_available_fields, get_required_fields
 
+        available = get_available_fields(doctype)
         req = get_required_fields(doctype)
+        lines = [f"Queryable fields for {doctype} (label: fieldname [type]):"]
+        lines.extend(
+            f"- {f['label']}: {f['fieldname']} [{f['fieldtype']}]"
+            for f in available
+        )
+        lines.append("")
         if not req:
-            return f"ERPNext doesn't mark any field as required to create a {doctype}."
-        lines = [f"To create a {doctype}, ERPNext requires:"]
+            lines.append("ERPNext does not mark any user-supplied field as required for creation.")
+            return "\n".join(lines)
+        lines.append("Required fields for creation:")
         for f in req:
             note = " (structured line items, not a single answer)" if f["is_table"] else ""
             lines.append(f"- {f['label']} ({f['fieldname']}){note}: {field_question(f)}")
