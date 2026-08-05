@@ -29,6 +29,11 @@ def test_lead_research_runs_targeted_queries_and_deduplicates_sources(monkeypatc
     assert post.call_count == 3
     assert len(result["evidence"]) == 1
     assert result["evidence"][0]["url"] == "https://example.com/team/kunal"
+    assert result["suggested_lead_fields"] == {
+        "first_name": "Kunal",
+        "last_name": "Pradhan",
+        "company_name": "MagnaData Pvt. Ltd.",
+    }
     assert all(call.kwargs["headers"]["X-API-KEY"] == "test-key" for call in post.call_args_list)
 
 

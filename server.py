@@ -599,6 +599,10 @@ document_store: Dict[str, Dict[str, Any]] = {}  # session_id -> {filename, text,
 # using the shared service account, same as before this was wired up.
 session_identities: Dict[str, ERPIdentity] = {}
 
+# Keep the researched person/company identity stable across approval turns such
+# as "yes" or "skip that email", where the model has little text to map from.
+lead_research_context: Dict[str, Dict[str, str]] = {}
+
 
 class SessionIdentifyRequest(BaseModel):
     session_id: str
@@ -736,11 +740,40 @@ async def _execute_tool(
             )
         return result
     try:
+        effective_args = _sanitize_tool_args(tool_name, args) or {}
+
+        if tool_name == "erp_data_tool" and session_id:
+            operation = str(effective_args.get("operation") or "").strip().lower()
+            doctype = str(effective_args.get("doctype") or "").strip().lower()
+            context = lead_research_context.get(session_id)
+            if operation in {"create", "insert", "add", "new"} and doctype == "lead" and context:
+                lead_data = dict(effective_args.get("data") or {})
+                for fieldname in ("first_name", "middle_name", "last_name", "company_name"):
+                    if context.get(fieldname):
+                        lead_data[fieldname] = context[fieldname]
+                effective_args["data"] = lead_data
+                effective_args["session_id"] = session_id
+
         with audit_log.time_tool_call() as elapsed:
-            result = await tool.ainvoke(_sanitize_tool_args(tool_name, args) or {})
+            result = await tool.ainvoke(effective_args)
+
+        if tool_name == "research_lead_web" and session_id:
+            try:
+                research = json.loads(str(result))
+                suggested = research.get("suggested_lead_fields") or {}
+                if suggested.get("first_name") and suggested.get("company_name"):
+                    lead_research_context[session_id] = {
+                        key: str(value)
+                        for key, value in suggested.items()
+                        if key in {"first_name", "middle_name", "last_name", "company_name"}
+                        and value
+                    }
+            except (TypeError, ValueError, AttributeError):
+                pass
+
         if session_id:
             audit_log.log_turn(
-                session_id, "tool", str(result), tool_name=tool_name, tool_args=args,
+                session_id, "tool", str(result), tool_name=tool_name, tool_args=effective_args,
                 user_id=user_id, prompt_text=prompt_text, tool_status="success",
                 duration_ms=elapsed(),
             )

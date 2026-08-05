@@ -75,6 +75,19 @@ def _company_search_name(company_name: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip() or company_name
 
 
+def _person_name_fields(person_name: str) -> dict[str, str]:
+    parts = [part for part in person_name.split() if part]
+    if not parts:
+        return {}
+    fields = {"first_name": parts[0]}
+    if len(parts) == 2:
+        fields["last_name"] = parts[1]
+    elif len(parts) > 2:
+        fields["middle_name"] = " ".join(parts[1:-1])
+        fields["last_name"] = parts[-1]
+    return fields
+
+
 @tool
 def research_lead_web(
     person_name: str,
@@ -131,6 +144,10 @@ def research_lead_web(
 
     result = {
         "research_subject": {"person_name": person, "company_name": company},
+        "suggested_lead_fields": {
+            **_person_name_fields(person),
+            "company_name": company,
+        },
         "instructions": (
             "Treat these as search leads, not automatically verified facts. Cross-check the "
             "person-company match, cite the supporting URL beside every extracted Lead field, "
