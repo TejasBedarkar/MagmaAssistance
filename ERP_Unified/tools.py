@@ -172,6 +172,48 @@ def _with_warnings(message: str, warnings: list[str]) -> str:
     return message + "\nValidation adjustments: " + " ".join(warnings)
 
 
+_OPERATOR_MAP = {
+    "greaterthan": ">",
+    "greaterthanorequalto": ">=",
+    "greaterthanorequal": ">=",
+    "gt": ">",
+    "gte": ">=",
+    "ge": ">=",
+    "lessthan": "<",
+    "lessthanorequalto": "<=",
+    "lessthanorequal": "<=",
+    "lt": "<",
+    "lte": "<=",
+    "le": "<=",
+    "equal": "=",
+    "equalto": "=",
+    "equals": "=",
+    "eq": "=",
+    "notequal": "!=",
+    "notequalto": "!=",
+    "notequals": "!=",
+    "neq": "!=",
+    "ne": "!=",
+}
+
+
+def _normalize_filters(filters: Optional[list]) -> Optional[list]:
+    """Convert natural language comparison operators ('greater than', 'greaterthan', 'less than')
+    to standard SQL/Frappe comparison operators ('>', '<', '>=', etc.)."""
+    if not filters:
+        return filters
+    normalized = []
+    for f in filters:
+        if isinstance(f, (list, tuple)) and len(f) >= 3:
+            field, raw_op, val = f[0], str(f[1]), f[2]
+            key = raw_op.lower().replace(" ", "").replace("_", "").replace("-", "")
+            clean_op = _OPERATOR_MAP.get(key, raw_op)
+            normalized.append([field, clean_op, val])
+        else:
+            normalized.append(f)
+    return normalized
+
+
 @tool
 def erp_data_tool(
     operation: str,
@@ -193,7 +235,8 @@ def erp_data_tool(
     `operation` selects the action:
       - 'list'   : list/search records. Use `fields` (list of field
                    names), `filters` (ERPNext filter format, e.g.
-                   [["status", "=", "Open"]]), `order_by`, and `limit`.
+                   [["status", "=", "Open"]], [["transaction_date", ">=", "2026-01-01"]]),
+                   `order_by`, and `limit`. Note: Always use standard operators ('>=', '>', '<=', '<', '=', '!=') in filters.
       - 'get'    : fetch one full record by `name` (the document ID).
       - 'create' : create a new record. Pass whatever fields the user
                    has already given in `data` (can be partial or
@@ -235,11 +278,26 @@ def erp_data_tool(
 
     def run():
         if op in LIST_OPERATIONS:
+            req_fields = fields
+            clean_filters = _normalize_filters(filters)
+            if not req_fields:
+                dt_lower = (doctype or "").strip().lower()
+                if dt_lower == "sales order":
+                    req_fields = ["name", "customer", "transaction_date", "grand_total", "status"]
+                elif dt_lower == "work order":
+                    req_fields = ["name", "production_item", "qty", "produced_qty", "status", "planned_start_date"]
+                elif dt_lower == "purchase order":
+                    req_fields = ["name", "supplier", "transaction_date", "grand_total", "status"]
+                elif dt_lower == "item":
+                    req_fields = ["name", "item_name", "item_group", "stock_uom"]
+                elif dt_lower == "customer":
+                    req_fields = ["name", "customer_name", "customer_group", "territory"]
+
             return str(
                 erp_client.get_list(
                     doctype,
-                    fields=fields,
-                    filters=filters,
+                    fields=req_fields,
+                    filters=clean_filters,
                     order_by=order_by,
                     limit=limit,
                 )
