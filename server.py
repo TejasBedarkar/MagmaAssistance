@@ -279,9 +279,15 @@ TOOL_RAG_TOP_K = int(os.environ.get("TOOL_RAG_TOP_K", "3"))
 TOOL_RAG_MIN_SCORE = float(os.environ.get("TOOL_RAG_MIN_SCORE", "0.25"))
 # At or below this many total registered tools, agent_node binds every
 # tool directly instead of running ToolRAG's similarity-threshold
-# retrieval — see the comment in agent_node for why. Unified ERP only
-# registers 2 tools (erp_data_tool, erp_describe_fields), well under this.
-TOOL_RAG_BYPASS_THRESHOLD = int(os.environ.get("TOOL_RAG_BYPASS_THRESHOLD", "5"))
+# retrieval — see the comment in agent_node for why. With only a
+# handful of local tools (ERP_Unified's 2 + the web tools' 4 = 6),
+# direct binding is far more reliable than similarity search: ToolRAG's
+# top-k retrieval was built for scaling to dozens/hundreds of MCP tools,
+# and on a small fixed set it can drop an obviously-needed tool (e.g.
+# erp_data_tool) just because recent conversation text skewed the
+# embedding toward something else. Keep this comfortably above
+# len(ALL_TOOLS) unless you register many more tools later.
+TOOL_RAG_BYPASS_THRESHOLD = int(os.environ.get("TOOL_RAG_BYPASS_THRESHOLD", "10"))
 
 # ERP_Unified's erp_data_tool/erp_describe_fields are plain LangChain
 # @tool functions (ERP_Unified/tools.py calls erp_client directly, no
