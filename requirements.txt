@@ -13,6 +13,12 @@ PyMuPDF
 fastmcp
 langchain-mcp-adapters
 
+# Web tools (web/web_tools.py) -- internet search + page fetch + crawler.
+# ddgs = DuckDuckGo search, no API key needed.
+ddgs
+beautifulsoup4
+lxml
+
 # Agent pipeline (from Main.py)
 # NOTE: LLM/LLM.py talks to OpenRouter directly via `requests`, not
 # ChatOllama, so langchain-ollama is not actually imported anywhere --

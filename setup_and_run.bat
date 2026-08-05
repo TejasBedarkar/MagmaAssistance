@@ -107,13 +107,13 @@ echo Downloading AI Models
 echo ==============================
 
 python "%MODEL_SCRIPT%" ^
-    --skip-whisper ^
-    --skip-kokoro ^
     --tool-rag-dir "%BACKEND_DIR%ERP\models\all-MiniLM-L6-v2"
 
 if errorlevel 1 (
     echo.
-    echo ERROR downloading models.
+    echo ===============================================
+    echo Model download failed.
+    echo ===============================================
     pause
     exit /b 1
 )
@@ -133,18 +133,10 @@ echo Starting Voice Assistant Backend
 echo ==========================================
 echo.
 
-
 if exist "%VENV_DIR%\Scripts\activate.bat" (
-    start "Voice Assistant Backend" cmd /k ^
-    "cd /d "%BACKEND_DIR%" && ^
-    call "%VENV_DIR%\Scripts\activate.bat" && ^
-    set PORT=%BACKEND_PORT% && ^
-    python server.py"
+    start "Voice Assistant Backend" cmd /k "cd /d ""%BACKEND_DIR%"" && call ""%VENV_DIR%\Scripts\activate.bat"" && set PORT=%BACKEND_PORT% && python server.py"
 ) else (
-    start "Voice Assistant Backend" cmd /k ^
-    "cd /d "%BACKEND_DIR%" && ^
-    set PORT=%BACKEND_PORT% && ^
-    python server.py"
+    start "Voice Assistant Backend" cmd /k "cd /d ""%BACKEND_DIR%"" && set PORT=%BACKEND_PORT% && python server.py"
 )
 
 echo.
@@ -153,8 +145,5 @@ echo Backend Started
 echo ==========================================
 echo.
 echo Backend : http://localhost:%BACKEND_PORT%
-echo.
-echo If you are using GPU, install the CUDA version
-echo of PyTorch for much faster Whisper inference.
 echo.
 pause
