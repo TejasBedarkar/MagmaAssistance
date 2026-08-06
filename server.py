@@ -211,7 +211,7 @@ from ERP.tool_rag import ToolRAG
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS
 from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
-from Web.serper_tools import WEB_TOOLS
+from web.web_tool import WEB_TOOLS
 
 ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
@@ -641,11 +641,6 @@ document_store: Dict[str, Dict[str, Any]] = {}  # session_id -> {filename, text,
 # using the shared service account, same as before this was wired up.
 session_identities: Dict[str, ERPIdentity] = {}
 
-# Keep the researched person/company identity stable across approval turns such
-# as "yes" or "skip that email", where the model has little text to map from.
-lead_research_context: Dict[str, Dict[str, str]] = {}
-
-
 class SessionIdentifyRequest(BaseModel):
     session_id: str
     erp_api_key: str
@@ -784,34 +779,8 @@ async def _execute_tool(
     try:
         effective_args = _sanitize_tool_args(tool_name, args) or {}
 
-        if tool_name == "erp_data_tool" and session_id:
-            operation = str(effective_args.get("operation") or "").strip().lower()
-            doctype = str(effective_args.get("doctype") or "").strip().lower()
-            context = lead_research_context.get(session_id)
-            if operation in {"create", "insert", "add", "new"} and doctype == "lead" and context:
-                lead_data = dict(effective_args.get("data") or {})
-                for fieldname in ("first_name", "middle_name", "last_name", "company_name"):
-                    if context.get(fieldname):
-                        lead_data[fieldname] = context[fieldname]
-                effective_args["data"] = lead_data
-                effective_args["session_id"] = session_id
-
         with audit_log.time_tool_call() as elapsed:
             result = await tool.ainvoke(effective_args)
-
-        if tool_name == "research_lead_web" and session_id:
-            try:
-                research = json.loads(str(result))
-                suggested = research.get("suggested_lead_fields") or {}
-                if suggested.get("first_name") and suggested.get("company_name"):
-                    lead_research_context[session_id] = {
-                        key: str(value)
-                        for key, value in suggested.items()
-                        if key in {"first_name", "middle_name", "last_name", "company_name"}
-                        and value
-                    }
-            except (TypeError, ValueError, AttributeError):
-                pass
 
         if session_id:
             audit_log.log_turn(
@@ -1186,7 +1155,11 @@ async def agent_node(state: ChatState) -> dict:
         "- For status distributions, call `create_pie_chart` with labels (status names) and values (counts).",
         "- For timeline trends over months/dates, call `create_line_chart` with x_axis_data (dates/months) and series_data (amounts).",
         "- Always retrieve real records from ERPNext using `erp_data_tool` first before generating charts or summaries.",
-        "- When querying sales data with `erp_data_tool`, ALWAYS use `doctype='Sales Order'` (do NOT pass fieldnames like 'transaction_date' or 'grand_total' as the doctype parameter)."
+        "- When querying sales data with `erp_data_tool`, ALWAYS use `doctype='Sales Order'` (do NOT pass fieldnames like 'transaction_date' or 'grand_total' as the doctype parameter).",
+        "\nPUBLIC-WEB RESEARCH DIRECTIVE:",
+        "- For current public-web information, call `web_search`, then `web_fetch_page` when a full source page is needed.",
+        "- For a company's verified public website or contact details, call `web_company_lookup`; never guess missing values.",
+        "- Use `web_crawl` only when the user asks to inspect several related pages from a site."
     ]
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")

@@ -1,5 +1,5 @@
 """
-web/web_tools.py
+web/web_tool.py
 
 Generic internet-access tools for the agent, following the same
 LangChain `@tool` + plain-string-error pattern used by
