@@ -124,7 +124,7 @@ DEFAULT_SYSTEM_PROMPT = (
 
 class LLM:
 
-    def __init__(self, api_key: str = None, model: str = "gpt-4o-mini", system_prompt: str = DEFAULT_SYSTEM_PROMPT, temperature: float = 0.7, base_url: str = "https://api.openai.com/v1/chat/completions"):
+    def __init__(self, api_key: str = None, model: str = "gpt-4o-mini", system_prompt: str = DEFAULT_SYSTEM_PROMPT, temperature: float = 0.1, base_url: str = "https://api.openai.com/v1/chat/completions"):
         openrouter_key = os.environ.get("OPENROUTER_API_KEY")
         env_openai_key = os.environ.get("OPENAI_API_KEY")
         key = api_key or openrouter_key or env_openai_key

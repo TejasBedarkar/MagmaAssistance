@@ -105,6 +105,7 @@ class VoiceSession:
     async def run(self):
         import sounddevice as sd
 
+        self.stop_flag.clear()
         print(f"Connecting to {self.ws_url} ...")
         async with websockets.connect(self.ws_url, max_size=None) as ws:
             print("Connected. Listening -- speak naturally, Ctrl+C to quit.\n")
@@ -117,6 +118,10 @@ class VoiceSession:
                 self.stop_flag.set()
                 for task in pending:
                     task.cancel()
+                # Always retrieve task results.  Otherwise a normal WebSocket
+                # close (notably Uvicorn's 1012 "service restart") is reported
+                # later as "Task exception was never retrieved".
+                await asyncio.gather(sender, receiver, return_exceptions=True)
 
     async def _mic_sender(self, ws):
         loop = asyncio.get_event_loop()
@@ -130,36 +135,42 @@ class VoiceSession:
                 break
 
     async def _ws_receiver(self, ws):
-        async for message in ws:
-            if isinstance(message, (bytes, bytearray)):
-                self.playback_queue.put(bytes(message))
-                continue
-            try:
-                event = json.loads(message)
-            except Exception:
-                continue
-            etype = event.get("type")
-            if etype == "token":
-                sys.stdout.write(event.get("text", ""))
-                sys.stdout.flush()
-                self._line_open = True
-            elif etype == "tool_call":
-                self._print_line(f"[calling {event.get('name')}({event.get('args')})]")
-            elif etype == "tool_result":
-                self._print_line(f"[{event.get('name')} -> {event.get('result')}]")
-            elif etype == "partial_transcript":
-                sys.stdout.write(f"\r...{event.get('text', '')}" + " " * 10)
-                sys.stdout.flush()
-                self._line_open = True
-            elif etype == "final_transcript":
-                self._print_line(f"You: {event.get('text')}")
-            elif etype == "interrupted":
-                self.clear_playback()
-                self._print_line("[interrupted]")
-            elif etype == "done":
-                self._print_line("")
-            elif etype == "error":
-                self._print_line(f"[error] {event.get('message')}")
+        try:
+            async for message in ws:
+                if isinstance(message, (bytes, bytearray)):
+                    self.playback_queue.put(bytes(message))
+                    continue
+                try:
+                    event = json.loads(message)
+                except Exception:
+                    continue
+                etype = event.get("type")
+                if etype == "token":
+                    sys.stdout.write(event.get("text", ""))
+                    sys.stdout.flush()
+                    self._line_open = True
+                elif etype == "tool_call":
+                    self._print_line(f"[calling {event.get('name')}({event.get('args')})]")
+                elif etype == "tool_result":
+                    self._print_line(f"[{event.get('name')} -> {event.get('result')}]")
+                elif etype == "partial_transcript":
+                    sys.stdout.write(f"\r...{event.get('text', '')}" + " " * 10)
+                    sys.stdout.flush()
+                    self._line_open = True
+                elif etype == "final_transcript":
+                    self._print_line(f"You: {event.get('text')}")
+                elif etype == "interrupted":
+                    self.clear_playback()
+                    self._print_line("[interrupted]")
+                elif etype == "done":
+                    self._print_line("")
+                elif etype == "error":
+                    self._print_line(f"[error] {event.get('message')}")
+        except websockets.exceptions.ConnectionClosed as exc:
+            if exc.code == 1012:
+                self._print_line("[disconnected] Voice service restarted; run the client again.")
+            elif exc.code not in (1000, 1001):
+                self._print_line(f"[disconnected] WebSocket closed ({exc.code}): {exc.reason or 'no reason'}")
 
 
 def main():
