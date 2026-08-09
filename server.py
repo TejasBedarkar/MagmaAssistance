@@ -6,6 +6,7 @@ import logging
 import json
 import sys
 import ast
+import httpx
 from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -211,7 +212,7 @@ from ERP.tool_rag import ToolRAG
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS
 from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
-from web.web_tool import WEB_TOOLS
+from Web.web_tool import WEB_TOOLS
 
 ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
@@ -261,11 +262,15 @@ else:
         "LANGCHAIN_API_KEY in .env to enable)."
     )
 
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
+# `WHISPER_MODEL` now names an OpenAI hosted transcription model (STT),
+# not a local Whisper checkpoint -- e.g. "gpt-4o-mini-transcribe" or
+# "whisper-1". `TTS_VOICE` must be one of OpenAI's TTS voices (alloy,
+# ash, ballad, coral, echo, fable, onyx, nova, sage, shimmer, verse).
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "gpt-4o-mini-transcribe")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
+TTS_VOICE = os.environ.get("TTS_VOICE", "alloy")
 
-logger.info("Loading VoiceAssistant agent (Whisper=%s, LLM=%s)...", WHISPER_MODEL, LLM_MODEL)
+logger.info("Loading VoiceAssistant agent (STT=%s, LLM=%s)...", WHISPER_MODEL, LLM_MODEL)
 assistant = VoiceAssistant(
     whisper_model=WHISPER_MODEL,
     llm_model=LLM_MODEL,
@@ -813,6 +818,134 @@ async def _execute_tool(
                 error_message=str(e),
             )
         return failure
+
+
+async def _stream_chat_completion(messages, tools=None):
+    api_messages = [convert_message_to_dict(m) for m in messages]
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    env_openai_key = os.environ.get("OPENAI_API_KEY")
+    key = openrouter_key or env_openai_key
+    is_openrouter = bool(openrouter_key)
+    if is_openrouter:
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "HTTP-Referer": "http://localhost:8050", "X-Title": "MagmaAssistance"}
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        model_name = LLM_MODEL if "/" in LLM_MODEL else f"openai/{LLM_MODEL}"
+    else:
+        headers = {"Authorization": f"Bearer {env_openai_key}", "Content-Type": "application/json"}
+        url = "https://api.openai.com/v1/chat/completions"
+        model_name = LLM_MODEL
+    data = {"model": model_name, "messages": api_messages, "temperature": assistant.llm.temperature, "stream": True}
+    if tools:
+        data["tools"] = tools
+    tool_acc = {}
+    content = ""
+    finish_reason = None
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream("POST", url, json=data, headers=headers) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except Exception:
+                    continue
+                choice = (chunk.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                finish_reason = choice.get("finish_reason") or finish_reason
+                if delta.get("content"):
+                    content += delta["content"]
+                    yield {"type": "token", "text": delta["content"]}
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    entry = tool_acc.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+                    if tc.get("id"):
+                        entry["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        entry["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        entry["arguments"] += fn["arguments"]
+    tool_calls = []
+    for idx in sorted(tool_acc):
+        entry = tool_acc[idx]
+        try:
+            args = json.loads(entry["arguments"]) if entry["arguments"] else {}
+        except Exception:
+            args = {}
+        tool_calls.append({"name": entry["name"], "args": args, "id": entry["id"] or f"call_{idx}"})
+    yield {"type": "done", "content": content, "tool_calls": tool_calls, "finish_reason": finish_reason}
+
+
+async def stream_agent_turn(text, session_id=None, user_id=None, history=None, task_context=None):
+    """Streaming twin of agent_node/generate_reply for the realtime voice
+    WS path. Keeps its own `history` list (caller-owned, per-connection)
+    instead of the LangGraph checkpointer, so the existing text-chat graph
+    and its slot-filling flow are untouched. Yields token/tool_call/
+    tool_result/done event dicts in call order."""
+    history = history if history is not None else []
+    history.append(HumanMessage(content=text))
+    trimmed = trim_messages(history, max_tokens=MAX_HISTORY_MESSAGES, token_counter=len, strategy="last", include_system=False)
+
+    candidate_tools = []
+    if ALL_TOOLS:
+        candidate_tools = list(ALL_TOOLS) if len(ALL_TOOLS) <= TOOL_RAG_BYPASS_THRESHOLD else (tool_rag.retrieve(text) if tool_rag else [])
+
+    openai_tools = None
+    if candidate_tools:
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+        openai_tools = []
+        for t in candidate_tools:
+            formatted = convert_to_openai_tool(t)
+            if "function" in formatted and "parameters" in formatted["function"]:
+                formatted["function"]["parameters"] = _clean_schema_for_openai(formatted["function"]["parameters"])
+            openai_tools.append(formatted)
+
+    system_parts = [assistant.llm.system_prompt]
+    if task_context:
+        system_parts.append(f"\nCurrent task in progress: {task_context}.")
+    call_messages = [SystemMessage(content="\n".join(system_parts)), *trimmed]
+
+    max_rounds = 4
+    for round_number in range(max_rounds + 1):
+        content = ""
+        tool_calls = []
+        async for event in _stream_chat_completion(call_messages, tools=openai_tools):
+            if event["type"] == "token":
+                yield {"type": "token", "text": event["text"]}
+            else:
+                content = event["content"]
+                tool_calls = event["tool_calls"]
+
+        if not tool_calls:
+            ai_msg = AIMessage(content=content)
+            history.append(ai_msg)
+            yield {"type": "done", "text": content}
+            return
+
+        if round_number == max_rounds:
+            break
+
+        ai_msg = AIMessage(content=content, tool_calls=tool_calls)
+        call_messages.append(ai_msg)
+        for tc in tool_calls:
+            yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
+            result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
+            yield {"type": "tool_result", "name": tc["name"], "result": result}
+            call_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+
+    content = ""
+    async for event in _stream_chat_completion(call_messages, tools=None):
+        if event["type"] == "token":
+            yield {"type": "token", "text": event["text"]}
+        else:
+            content = event["content"]
+    ai_msg = AIMessage(content=content)
+    history.append(ai_msg)
+    yield {"type": "done", "text": content}
 
 
 _FAKE_NAME_RE = re.compile(r'"name"\s*:\s*"(?P<name>[a-zA-Z_][\w\-.]*)"')
@@ -1463,6 +1596,33 @@ async def chat(req: ChatRequest):
 
     return {"reply": reply, "audio": audio_b64}
 
+_stream_histories: dict = {}
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """SSE variant of /api/chat for token-by-token terminal streaming with
+    inline tool-call/tool_result markers, same event shape /ws/voice uses.
+    Keeps its own per-session_id history (separate from the LangGraph
+    checkpointer /api/chat uses) so this is purely additive."""
+    from fastapi.responses import StreamingResponse
+
+    text = (req.message or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    history = _stream_histories.setdefault(req.session_id, [])
+
+    async def event_gen():
+        try:
+            async for event in stream_agent_turn(text, session_id=req.session_id, user_id=req.user_id, history=history):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Streaming agent turn failed: %s", text)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
 @app.post("/query")
 async def handle_query(
     query: str = Form(None),
@@ -1552,6 +1712,10 @@ def export_audit_json(session_id: str = None):
 
     from fastapi.responses import FileResponse
     return FileResponse(path, media_type="application/json", filename=filename)
+
+
+from Voice.ws_voice import register_voice_ws
+register_voice_ws(app, stream_agent_turn, assistant.tts, logger)
 
 
 @app.get("/api/health")

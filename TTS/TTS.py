@@ -1,25 +1,49 @@
+"""
+TTS.py
+
+Text-to-speech backed by OpenAI's audio model (gpt-4o-mini-tts). This
+replaces the previous ElevenLabs-based implementation (ELTTS/elevenlabs
+SDK) -- same public interface (`synthesize_to_file`, `play_file`,
+`speak`), so anything that used to call ELTTS keeps working unchanged
+against OpenAITTS.
+
+.env file should contain:
+    OPENAI_API_KEY=your_key_here
+
+Optional overrides:
+    TTS_VOICE=alloy            # one of OPENAI_VOICES below
+    OPENAI_TTS_MODEL=gpt-4o-mini-tts
+"""
+
 import os
 import tempfile
-from elevenlabs.client import ElevenLabs
-from elevenlabs import save
 
-DEFAULT_VOICE = "Rachel"
+from openai import OpenAI
+
+# Valid voices for OpenAI's TTS models as of this writing.
+OPENAI_VOICES = {
+    "alloy", "ash", "ballad", "coral", "echo", "fable",
+    "onyx", "nova", "sage", "shimmer", "verse",
+}
+
+DEFAULT_VOICE = "alloy"
+DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
 
 
-class ELTTS:
-    def __init__(
-        self,
-        voice=DEFAULT_VOICE,
-        model="eleven_multilingual_v2"
-    ):
-        api_key = os.getenv("ELEVENLABS_API_KEY")
+class OpenAITTS:
+    def __init__(self, voice=DEFAULT_VOICE, model=None):
+        api_key = os.getenv("OPENAI_API_KEY")
 
         if not api_key:
-            raise RuntimeError("ELEVENLABS_API_KEY not found.")
+            raise RuntimeError("OPENAI_API_KEY not found.")
 
-        self.client = ElevenLabs(api_key=api_key)
-        self.voice = voice
-        self.model = model
+        self.client = OpenAI(api_key=api_key)
+
+        # Old ElevenLabs ("Rachel") or Kokoro ("af_heart") voice names
+        # don't mean anything to OpenAI's TTS -- fall back to a valid
+        # default instead of sending a request that will 400.
+        self.voice = voice if voice in OPENAI_VOICES else DEFAULT_VOICE
+        self.model = model or os.getenv("OPENAI_TTS_MODEL", DEFAULT_TTS_MODEL)
 
     def synthesize_to_file(self, text: str, output_path=None):
 
@@ -27,15 +51,20 @@ class ELTTS:
             fd, output_path = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
 
-        audio = self.client.text_to_speech.convert(
-            voice_id=self.voice,
-            model_id=self.model,
-            text=text
-        )
-
-        save(audio, output_path)
+        with self.client.audio.speech.with_streaming_response.create(
+            model=self.model,
+            voice=self.voice,
+            input=text,
+        ) as response:
+            response.stream_to_file(output_path)
 
         return output_path
+
+    def synthesize_stream(self, text, response_format="pcm"):
+        if not text.strip(): return
+        with self.client.audio.speech.with_streaming_response.create(model=self.model, voice=self.voice, input=text, response_format=response_format) as response:
+            for chunk in response.iter_bytes(chunk_size=4096):
+                if chunk: yield chunk
 
     def play_file(self, audio_path):
         from playsound import playsound
@@ -54,3 +83,8 @@ class ELTTS:
                 os.remove(path)
 
         return text
+
+
+# Backward-compatible alias -- older code imported the ElevenLabs-backed
+# class under this name.
+ELTTS = OpenAITTS

@@ -187,6 +187,28 @@ class LLM:
 
         return reply
 
+    def chat_stream(self, user_input: str, remember: bool = True):
+        messages = self.history + [{"role": "user", "content": user_input}]
+        data = {"model": self.model_name, "messages": messages, "temperature": self.temperature, "stream": True}
+        full = ""
+        with requests.post(self.base_url, json=data, headers=self.headers, stream=True) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line: continue
+                line = line.decode("utf-8")
+                if not line.startswith("data: "): continue
+                payload = line[6:].strip()
+                if payload == "[DONE]": break
+                try: chunk = json.loads(payload)
+                except Exception: continue
+                delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+                if delta:
+                    full += delta
+                    yield delta
+        if remember:
+            self.history.append({"role": "user", "content": user_input})
+            self.history.append({"role": "assistant", "content": full})
+
     def reset(self):
         self.history = [{"role": "system", "content": self.system_prompt}]
 
