@@ -212,7 +212,7 @@ from ERP.tool_rag import ToolRAG
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS
 from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
-from web.web_tool import WEB_TOOLS
+from Web.web_tool import WEB_TOOLS
 
 ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
@@ -1563,6 +1563,34 @@ def _get_tts_audio(text: str):
         except OSError:
             pass
 
+class TTSRequest(BaseModel):
+    text: str
+
+@app.post("/api/tts")
+async def synthesize_speech(req: TTSRequest):
+    """Synthesizes arbitrary text to speech with `assistant.tts` -- the
+    same OpenAI TTS voice/model instance Live Voice Mode speaks with (see
+    `register_voice_ws(app, stream_agent_turn, assistant.tts, logger)`
+    below). The chat UI's per-message "read aloud" button and the
+    "auto-read replies" toggle both call this, so typed-chat playback
+    sounds identical to the realtime voice assistant rather than falling
+    back to the browser's own (different-sounding) speech synthesis."""
+
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    try:
+        wav_bytes = _get_tts_audio(text)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("TTS synthesis failed for /api/tts")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if not wav_bytes:
+        raise HTTPException(status_code=500, detail="TTS synthesis returned no audio")
+
+    return {"audio": base64.b64encode(wav_bytes).decode("ascii")}
+
 class ChatRequest(BaseModel):
     message: str
 
@@ -1728,3 +1756,4 @@ if __name__ == "__main__":
     logger.info(f"Starting server on port {port}...")
 
     uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
+    
