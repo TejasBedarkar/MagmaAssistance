@@ -128,36 +128,76 @@ class OpenAIChatModel(BaseChatModel):
             "model": model_name,
             "messages": api_messages,
             "temperature": self.temperature,
+            "max_tokens": LLM_MAX_TOKENS,
         }
         
         if self.bound_tools:
             data["tools"] = self.bound_tools
-            
-        response = requests.post(target_url, json=data, headers=headers)
-        
-        if not response.ok:
-            logger.error(f"LLM API Rejected Request ({response.status_code}): {response.text}")
 
-        response.raise_for_status()
-        res_json = response.json()
-        
-        choice = res_json["choices"][0]
-        message_data = choice["message"]
-        
-        content = message_data.get("content") or ""
+        # If the model hits LLM_MAX_TOKENS mid-reply (finish_reason ==
+        # "length"), ask it to continue from where it left off instead
+        # of returning the truncated text as if it were the full
+        # answer. Tool-call replies are never continued this way --
+        # a tool call is either complete or it isn't, and re-prompting
+        # risks a duplicate/garbled call.
+        content = ""
         tool_calls = []
-        if "tool_calls" in message_data:
-            for tc in message_data["tool_calls"]:
-                try:
-                    args = json.loads(tc["function"]["arguments"])
-                except Exception:
-                    args = {}
-                tool_calls.append({
-                    "name": tc["function"]["name"],
-                    "args": args,
-                    "id": tc.get("id"),
-                })
-        
+        message_data = {}
+        for round_number in range(MAX_COMPLETION_ROUNDS + 1):
+            try:
+                response = requests.post(target_url, json=data, headers=headers, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
+            except requests.exceptions.Timeout:
+                logger.error(
+                    "LLM API call timed out after %ss with no response (%s)",
+                    LLM_REQUEST_TIMEOUT_SECONDS, target_url,
+                )
+                raise RuntimeError(
+                    f"The AI model didn't respond within {int(LLM_REQUEST_TIMEOUT_SECONDS)}s. "
+                    "Please try again."
+                )
+
+            if not response.ok:
+                logger.error(f"LLM API Rejected Request ({response.status_code}): {response.text}")
+
+            response.raise_for_status()
+            res_json = response.json()
+
+            choice = res_json["choices"][0]
+            message_data = choice["message"]
+            finish_reason = choice.get("finish_reason")
+
+            piece = message_data.get("content") or ""
+            content += piece
+
+            if "tool_calls" in message_data:
+                for tc in message_data["tool_calls"]:
+                    try:
+                        args = json.loads(tc["function"]["arguments"])
+                    except Exception:
+                        args = {}
+                    tool_calls.append({
+                        "name": tc["function"]["name"],
+                        "args": args,
+                        "id": tc.get("id"),
+                    })
+
+            if finish_reason != "length" or tool_calls or round_number == MAX_COMPLETION_ROUNDS:
+                if finish_reason == "length":
+                    logger.warning(
+                        "LLM reply still truncated after %d continuation round(s); "
+                        "returning what we have.", round_number
+                    )
+                break
+
+            # Continue the truncated reply: replay what the model said so
+            # far as an assistant turn, then ask it to pick up exactly
+            # where it stopped.
+            data = dict(data)
+            data["messages"] = api_messages + [
+                {"role": "assistant", "content": piece},
+                {"role": "user", "content": "Continue exactly where you left off. Do not repeat any text or restart the answer."},
+            ]
+
         ai_message = AIMessage(content=content, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
 
@@ -269,6 +309,29 @@ else:
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "gpt-4o-mini-transcribe")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 TTS_VOICE = os.environ.get("TTS_VOICE", "alloy")
+# Neither OpenAI nor (especially) OpenRouter can be trusted to pick a
+# sensible default completion length on their own -- OpenRouter in
+# particular will silently cap some routed providers far below the
+# model's real context window when `max_tokens` is omitted. Without an
+# explicit value here, long replies get cut off mid-sentence with
+# finish_reason="length" and no error, and the old code below wasn't
+# checking finish_reason at all, so the truncated text just went out
+# as if it were complete. Set high on purpose; MAX_COMPLETION_ROUNDS
+# below is what actually stops a truncated reply from continuing
+# forever.
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "4096"))
+# Safety cap on how many times we'll ask the model to continue a reply
+# that got cut off by the token limit above, so a pathological
+# never-ending completion can't loop forever.
+MAX_COMPLETION_ROUNDS = int(os.environ.get("LLM_MAX_COMPLETION_ROUNDS", "4"))
+# Neither the sync (requests) nor the async (httpx) call to the LLM API
+# had a timeout at all -- the streaming path was explicitly
+# timeout=None. If the provider stalls mid-connection (dropped
+# packets, an OpenRouter route hanging, etc.) the request just sits
+# open forever: no exception, no response, nothing -- which is exactly
+# what produces an endless "Thinking..." spinner on the frontend with
+# zero output and no visible error. This caps how long we'll wait.
+LLM_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("LLM_REQUEST_TIMEOUT_SECONDS", "90"))
 
 logger.info("Loading VoiceAssistant agent (STT=%s, LLM=%s)...", WHISPER_MODEL, LLM_MODEL)
 assistant = VoiceAssistant(
@@ -834,13 +897,13 @@ async def _stream_chat_completion(messages, tools=None):
         headers = {"Authorization": f"Bearer {env_openai_key}", "Content-Type": "application/json"}
         url = "https://api.openai.com/v1/chat/completions"
         model_name = LLM_MODEL
-    data = {"model": model_name, "messages": api_messages, "temperature": assistant.llm.temperature, "stream": True}
+    data = {"model": model_name, "messages": api_messages, "temperature": assistant.llm.temperature, "stream": True, "max_tokens": LLM_MAX_TOKENS}
     if tools:
         data["tools"] = tools
     tool_acc = {}
     content = ""
     finish_reason = None
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(LLM_REQUEST_TIMEOUT_SECONDS, connect=10.0)) as client:
         async with client.stream("POST", url, json=data, headers=headers) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -880,6 +943,44 @@ async def _stream_chat_completion(messages, tools=None):
     yield {"type": "done", "content": content, "tool_calls": tool_calls, "finish_reason": finish_reason}
 
 
+async def _stream_full_reply(call_messages, tools=None):
+    """Wraps _stream_chat_completion with the same finish_reason=="length"
+    continuation handling as OpenAIChatModel._generate, so streamed
+    replies don't silently cut off mid-sentence either. Yields token
+    events as they arrive, then a final {"type": "done", "content":
+    ..., "tool_calls": ...} once the reply is actually complete (or
+    MAX_COMPLETION_ROUNDS is hit). Tool-call replies are never
+    continued -- same reasoning as the non-streaming path."""
+    content = ""
+    tool_calls = []
+    messages = call_messages
+    for round_number in range(MAX_COMPLETION_ROUNDS + 1):
+        piece = ""
+        async for event in _stream_chat_completion(messages, tools=tools):
+            if event["type"] == "token":
+                yield {"type": "token", "text": event["text"]}
+            else:
+                piece = event["content"]
+                tool_calls = event["tool_calls"]
+                finish_reason = event["finish_reason"]
+
+        content += piece
+
+        if finish_reason != "length" or tool_calls or round_number == MAX_COMPLETION_ROUNDS:
+            if finish_reason == "length":
+                logger.warning(
+                    "Streamed LLM reply still truncated after %d continuation "
+                    "round(s); returning what we have.", round_number
+                )
+            break
+
+        messages = [*call_messages, AIMessage(content=piece), HumanMessage(
+            content="Continue exactly where you left off. Do not repeat any text or restart the answer."
+        )]
+
+    yield {"type": "done", "content": content, "tool_calls": tool_calls}
+
+
 async def stream_agent_turn(text, session_id=None, user_id=None, history=None, task_context=None):
     """Streaming twin of agent_node/generate_reply for the realtime voice
     WS path. Keeps its own `history` list (caller-owned, per-connection)
@@ -913,7 +1014,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     for round_number in range(max_rounds + 1):
         content = ""
         tool_calls = []
-        async for event in _stream_chat_completion(call_messages, tools=openai_tools):
+        async for event in _stream_full_reply(call_messages, tools=openai_tools):
             if event["type"] == "token":
                 yield {"type": "token", "text": event["text"]}
             else:
@@ -938,7 +1039,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             call_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
 
     content = ""
-    async for event in _stream_chat_completion(call_messages, tools=None):
+    async for event in _stream_full_reply(call_messages, tools=None):
         if event["type"] == "token":
             yield {"type": "token", "text": event["text"]}
         else:
