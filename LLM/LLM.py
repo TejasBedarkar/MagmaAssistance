@@ -93,6 +93,13 @@ DEFAULT_SYSTEM_PROMPT = (
     "₹ symbol and the Indian numbering system (e.g., ₹1,25,000 or ₹12,50,00,000), "
     "rounding large figures sensibly.\n"
     "- Format numbers and dates clearly.\n"
+    "- For relative dates such as today, yesterday, this month, or last month, "
+    "calculate them from the current date supplied in the system message.\n"
+    "- Never guess ERPNext fieldnames. Before a list/search call, use "
+    "erp_describe_fields when exact fields or filter/date fields are uncertain, "
+    "then use only fieldnames returned by that schema lookup. Common sales fields "
+    "include Sales Order `transaction_date` and `grand_total`, and Sales Invoice "
+    "`posting_date`, `name`, and `grand_total`.\n"
     "- If data is unavailable or a tool call fails, say so in one plain sentence — "
     "never invent values.\n"
     "- If a tool's result indicates the action did NOT complete (wording like "
@@ -105,6 +112,21 @@ DEFAULT_SYSTEM_PROMPT = (
     "the current turn supplies the missing piece, stop there and ask; do not "
     "claim you'll retry automatically, since you cannot call the tool again "
     "without the user's next message.\n"
+
+    "- For current public-web information, call web_search and use web_fetch_page to "
+    "read promising sources. For a company's verified public website/contact details, "
+    "call web_company_lookup. Present only evidence-backed values, never guess missing "
+    "details, and never create or update a Lead until the user explicitly approves.\n"
+    "- For Lead records, the researched employer/organization always maps to "
+    "`company_name`. The `company` field is the internal ERP Company Link and must "
+    "never contain the researched employer unless it is explicitly an existing "
+    "internal Company selected by the user. Do not guess Link-field values.\n"
+    "- Populate an email field only when the research evidence contains a complete, "
+    "valid address with a real dotted domain (for example, name@example.com). If an "
+    "email is missing, incomplete, malformed, or merely guessed, omit the field.\n"
+    "- For researched Leads, copy first_name/middle_name/last_name exactly from the "
+    "research tool's suggested_lead_fields. Never place company_name into a person's "
+    "name field, including after short follow-ups such as yes, approve, or skip email.\n"
     "- When creating or updating a record, only use information the user actually "
     "gave you. If something required is missing, ask for it — never guess a name, "
     "ID, phone number, email, or amount.\n"
@@ -136,21 +158,36 @@ DEFAULT_SYSTEM_PROMPT = (
 
 class LLM:
 
-    def __init__(self, api_key: str = None, model: str = "gpt-4o-mini", system_prompt: str = DEFAULT_SYSTEM_PROMPT, temperature: float = 0.7, base_url: str = "https://api.openai.com/v1/chat/completions"):
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("No API key provided. Set OPENAI_API_KEY in your .env file or pass api_key directly.")
+    def __init__(self, api_key: str = None, model: str = "gpt-4o-mini", system_prompt: str = DEFAULT_SYSTEM_PROMPT, temperature: float = 0.1, base_url: str = "https://api.openai.com/v1/chat/completions"):
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+        env_openai_key = os.environ.get("OPENAI_API_KEY")
+        key = api_key or openrouter_key or env_openai_key
 
-        self.model_name = model
+        is_openrouter = bool(openrouter_key) or (key and key.startswith("sk-or-v1-"))
+
+        if is_openrouter:
+            self.api_key = openrouter_key or key
+            self.base_url = "https://openrouter.ai/api/v1/chat/completions"
+            self.model_name = model if "/" in model else f"openai/{model}"
+            self.headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8050",
+                "X-Title": "MagmaAssistance",
+            }
+        else:
+            self.api_key = key
+            if not self.api_key:
+                raise ValueError("No API key provided. Set OPENAI_API_KEY or OPENROUTER_API_KEY in your .env file.")
+            self.model_name = model
+            self.base_url = base_url
+            self.headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+
         self.system_prompt = system_prompt
         self.temperature = temperature
-        self.base_url = base_url
-
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-
         self.history = [{"role": "system", "content": self.system_prompt}]
 
     def set_system_prompt(self, system_prompt: str, reset_history: bool = True):
@@ -183,6 +220,28 @@ class LLM:
             self.history.append({"role": "assistant", "content": reply})
 
         return reply
+
+    def chat_stream(self, user_input: str, remember: bool = True):
+        messages = self.history + [{"role": "user", "content": user_input}]
+        data = {"model": self.model_name, "messages": messages, "temperature": self.temperature, "stream": True}
+        full = ""
+        with requests.post(self.base_url, json=data, headers=self.headers, stream=True) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line: continue
+                line = line.decode("utf-8")
+                if not line.startswith("data: "): continue
+                payload = line[6:].strip()
+                if payload == "[DONE]": break
+                try: chunk = json.loads(payload)
+                except Exception: continue
+                delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+                if delta:
+                    full += delta
+                    yield delta
+        if remember:
+            self.history.append({"role": "user", "content": user_input})
+            self.history.append({"role": "assistant", "content": full})
 
     def reset(self):
         self.history = [{"role": "system", "content": self.system_prompt}]

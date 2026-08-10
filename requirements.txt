@@ -1,10 +1,11 @@
-# Web server (server.py runs on FastAPI + uvicorn, not Flask)
 fastapi
 uvicorn[standard]
 python-multipart
 
 # ERP client (ERP/erp_client.py) -- not previously listed here
 requests
+httpx
+websockets
 python-dotenv
 # LLM/LLM.py imports fitz for PDF OCR/rendering.
 PyMuPDF
@@ -12,12 +13,6 @@ PyMuPDF
 # MCP: server side (ERP/mcp_server.py) + client side (ERP/tools/mcp_tools.py)
 fastmcp
 langchain-mcp-adapters
-
-# Web tools (web/web_tools.py) -- internet search + page fetch + crawler.
-# ddgs = DuckDuckGo search, no API key needed.
-ddgs
-beautifulsoup4
-lxml
 
 # Agent pipeline (from Main.py)
 # NOTE: LLM/LLM.py talks to OpenRouter directly via `requests`, not
@@ -49,5 +44,17 @@ torch
 # they actually need as a transitive dependency.
 soundfile
 sentence-transformers
+# TTS (TTS/TTS.py) and STT (TTS/STT.py) both call OpenAI's hosted audio
+# models (gpt-4o-mini-tts / gpt-4o-mini-transcribe) through this client --
+# ElevenLabs is no longer used.
 openai
-elevenlabs
+# Used by TTS/TTS.py's play_file() for local CLI playback (Main.py only;
+# the FastAPI server returns base64 audio to the browser instead).
+playsound==1.2.2
+
+# API-key-free public web search, fetching, and crawling (web/web_tool.py)
+ddgs
+beautifulsoup4
+lxml
+psycopg2
+boto3

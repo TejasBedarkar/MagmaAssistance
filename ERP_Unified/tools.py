@@ -27,6 +27,7 @@ instead of a raw Python/HTTP error string, so the user always gets a
 sentence they can act on rather than a stack trace.
 """
 
+import re
 from typing import Optional
 
 from langchain_core.tools import tool
@@ -76,42 +77,159 @@ def pending_web_review_doctype(session_id: str) -> Optional[str]:
     return pending[0] if len(pending) == 1 else None
 
 
-def _prepare_lead_company(data: dict) -> tuple[dict, list[str]]:
-    """Keep an external Lead organisation out of ERPNext's internal link.
+_EMAIL_RE = re.compile(
+    r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+"
+    r"[A-Z]{2,63}$",
+    re.IGNORECASE,
+)
 
-    ``Lead.company`` is a Link to an existing internal ``Company`` document.
-    A company found by the crawler (for example, Tata Motors) is normally
-    the prospective customer's organisation and belongs in ``company_name``.
+
+def _is_valid_email(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    email = value.strip()
+    return bool(email and len(email) <= 254 and ".." not in email and _EMAIL_RE.fullmatch(email))
+
+
+def _existing_link_value(target_doctype: str, value) -> bool:
+    """Return whether a Link value names a real ERPNext document."""
+    if value in (None, ""):
+        return False
+    matches = erp_client.get_list(
+        target_doctype,
+        fields=["name"],
+        filters=[["name", "=", str(value)]],
+        limit=1,
+        use_cache=False,
+    )
+    return bool(matches)
+
+
+def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[str]]:
+    """Validate model-produced values against the live ERPNext schema.
+
+    Optional invalid Link/Select values are omitted instead of allowing a
+    predictable Frappe validation exception. Required values are also omitted,
+    which makes the existing required-field flow ask for a valid replacement.
+    Lead.company is special: it means the user's internal ERP company, while a
+    researched employer belongs in Lead.company_name.
     """
     cleaned = dict(data or {})
     warnings: list[str] = []
-    external_company = cleaned.get("company")
-    if not isinstance(external_company, str) or not external_company.strip():
-        return cleaned, warnings
+    meta = erp_client.get_meta(doctype)
+    fields = {
+        field.get("fieldname"): field
+        for field in meta.get("fields", []) or []
+        if field.get("fieldname")
+    }
 
-    try:
-        matches = erp_client.get_list(
-            "Company",
-            fields=["name"],
-            filters=[["name", "=", external_company.strip()]],
-            limit=1,
-            use_cache=False,
+    if doctype.strip().lower() == "lead" and cleaned.get("company"):
+        internal_company = cleaned["company"]
+        try:
+            company_exists = _existing_link_value("Company", internal_company)
+        except Exception:  # Let generic validation/ERP expose connection issues.
+            company_exists = True
+        if not company_exists:
+            cleaned.setdefault("company_name", internal_company)
+            cleaned.pop("company", None)
+            warnings.append(
+                f"Moved '{internal_company}' from company to company_name because "
+                "Lead.company only accepts an existing internal ERP Company."
+            )
+
+    for fieldname, value in list(cleaned.items()):
+        if value in (None, "", [], {}):
+            continue
+        field = fields.get(fieldname)
+        if not field:
+            continue
+
+        fieldtype = field.get("fieldtype")
+        is_email_field = (
+            "email" in fieldname.lower()
+            or str(field.get("options") or "").strip().lower() == "email"
         )
-    except Exception:
-        # Do not disguise an ERP connection or permission failure as an
-        # invalid company value; the normal create call will report it.
-        return cleaned, warnings
+        if is_email_field:
+            if not _is_valid_email(value):
+                cleaned.pop(fieldname, None)
+                warnings.append(
+                    f"Omitted {fieldname} because '{value}' is not a valid email address."
+                )
+            else:
+                cleaned[fieldname] = value.strip()
+            continue
 
-    if matches:
-        return cleaned, warnings
+        if fieldtype == "Link" and field.get("options"):
+            try:
+                valid = _existing_link_value(field["options"], value)
+            except Exception:
+                # Do not disguise authentication/network problems as bad data.
+                raise
+            if not valid:
+                cleaned.pop(fieldname, None)
+                warnings.append(
+                    f"Omitted {fieldname}='{value}' because no matching "
+                    f"{field['options']} exists in ERPNext."
+                )
 
-    cleaned.pop("company", None)
-    cleaned.setdefault("company_name", external_company.strip())
-    warnings.append(
-        f"Moved '{external_company.strip()}' from company to company_name because "
-        "it is not an existing internal ERP Company."
-    )
+        if fieldtype == "Select" and field.get("options"):
+            choices = [choice.strip() for choice in str(field["options"]).split("\n") if choice.strip()]
+            if choices and str(value) not in choices:
+                cleaned.pop(fieldname, None)
+                warnings.append(
+                    f"Omitted {fieldname}='{value}' because it is not an allowed option."
+                )
+
     return cleaned, warnings
+
+
+def _with_warnings(message: str, warnings: list[str]) -> str:
+    if not warnings:
+        return message
+    return message + "\nValidation adjustments: " + " ".join(warnings)
+
+
+_OPERATOR_MAP = {
+    "greaterthan": ">",
+    "greaterthanorequalto": ">=",
+    "greaterthanorequal": ">=",
+    "gt": ">",
+    "gte": ">=",
+    "ge": ">=",
+    "lessthan": "<",
+    "lessthanorequalto": "<=",
+    "lessthanorequal": "<=",
+    "lt": "<",
+    "lte": "<=",
+    "le": "<=",
+    "equal": "=",
+    "equalto": "=",
+    "equals": "=",
+    "eq": "=",
+    "notequal": "!=",
+    "notequalto": "!=",
+    "notequals": "!=",
+    "neq": "!=",
+    "ne": "!=",
+}
+
+
+def _normalize_filters(filters: Optional[list]) -> Optional[list]:
+    """Convert natural language comparison operators ('greater than', 'greaterthan', 'less than')
+    to standard SQL/Frappe comparison operators ('>', '<', '>=', etc.)."""
+    if not filters:
+        return filters
+    normalized = []
+    for f in filters:
+        if isinstance(f, (list, tuple)) and len(f) >= 3:
+            field, raw_op, val = f[0], str(f[1]), f[2]
+            key = raw_op.lower().replace(" ", "").replace("_", "").replace("-", "")
+            clean_op = _OPERATOR_MAP.get(key, raw_op)
+            normalized.append([field, clean_op, val])
+        else:
+            normalized.append(f)
+    return normalized
 
 
 @tool
@@ -137,7 +255,8 @@ def erp_data_tool(
     `operation` selects the action:
       - 'list'   : list/search records. Use `fields` (list of field
                    names), `filters` (ERPNext filter format, e.g.
-                   [["status", "=", "Open"]]), `order_by`, and `limit`.
+                   [["status", "=", "Open"]], [["transaction_date", ">=", "2026-01-01"]]),
+                   `order_by`, and `limit`. Note: Always use standard operators ('>=', '>', '<=', '<', '=', '!=') in filters.
       - 'get'    : fetch one full record by `name` (the document ID).
       - 'create' : create a new record. Pass whatever fields the user
                    has already given in `data` (can be partial or
@@ -186,11 +305,26 @@ def erp_data_tool(
 
     def run():
         if op in LIST_OPERATIONS:
+            req_fields = fields
+            clean_filters = _normalize_filters(filters)
+            if not req_fields:
+                dt_lower = (doctype or "").strip().lower()
+                if dt_lower == "sales order":
+                    req_fields = ["name", "customer", "transaction_date", "grand_total", "status"]
+                elif dt_lower == "work order":
+                    req_fields = ["name", "production_item", "qty", "produced_qty", "status", "planned_start_date"]
+                elif dt_lower == "purchase order":
+                    req_fields = ["name", "supplier", "transaction_date", "grand_total", "status"]
+                elif dt_lower == "item":
+                    req_fields = ["name", "item_name", "item_group", "stock_uom"]
+                elif dt_lower == "customer":
+                    req_fields = ["name", "customer_name", "customer_group", "territory"]
+
             return str(
                 erp_client.get_list(
                     doctype,
-                    fields=fields,
-                    filters=filters,
+                    fields=req_fields,
+                    filters=clean_filters,
                     order_by=order_by,
                     limit=limit,
                 )
@@ -206,7 +340,14 @@ def erp_data_tool(
                 return f"A document name/ID is required to update a {doctype} record."
             if not data:
                 return f"No `data` provided to update {doctype} {name}."
-            return str(erp_client.update_doc(doctype, name, data))
+            prepared, warnings = _prepare_write_data(doctype, data)
+            if not prepared:
+                return _with_warnings(
+                    f"No valid fields remain to update {doctype} {name}.", warnings
+                )
+            return _with_warnings(
+                str(erp_client.update_doc(doctype, name, prepared)), warnings
+            )
 
         if op in SUBMIT_OPERATIONS:
             if not name:
@@ -244,14 +385,22 @@ def _run_create(
     pending = _PENDING_CREATES.get(key, {})
     merged = {**pending, **(data or {})}
     warnings: list[str] = []
-
-    if (doctype or "").strip().lower() == "lead":
-        merged, warnings = _prepare_lead_company(merged)
-
     if web_enriched:
         _PENDING_WEB_REVIEWS.add(key)
 
     try:
+        merged, warnings = _prepare_write_data(doctype, merged)
+        if (
+            doctype.strip().lower() == "lead"
+            and merged.get("first_name")
+            and merged.get("company_name")
+            and str(merged["first_name"]).strip().casefold()
+            == str(merged["company_name"]).strip().casefold()
+        ):
+            return (
+                "I cannot create this Lead because the person's first name was mapped "
+                "to the organization name. Please provide or research the person's name again."
+            )
         merged = apply_default_values(doctype, merged)
         missing = missing_required_fields(doctype, merged)
     except Exception as exc:  # noqa: BLE001
@@ -269,7 +418,7 @@ def _run_create(
             f"operation='create', doctype='{doctype}', session_id='{session_id}', "
             f"and data={{'{next_field['fieldname']}': <answer>}}."
         )
-        return ("Validation adjustment: " + " ".join(warnings) + "\n" if warnings else "") + message
+        return _with_warnings(message, warnings)
 
     if key in _PENDING_WEB_REVIEWS and approved is not True:
         _PENDING_CREATES[key] = merged
@@ -280,7 +429,7 @@ def _run_create(
             "Do you want to create this record using this data? Reply yes to approve, "
             "or tell me which field is incorrect and what to look for instead."
         )
-        return ("Validation adjustment: " + " ".join(warnings) + "\n" if warnings else "") + message
+        return _with_warnings(message, warnings)
 
     # Nothing missing — safe to actually create the record now.
     def run():
@@ -293,9 +442,7 @@ def _run_create(
                 return str(result) + f" (created as draft; submit failed: {explain_erp_error(exc)})"
         return str(result)
 
-    outcome = _safe_call(f"create {doctype}", run)
-    if warnings:
-        outcome = "Validation adjustment: " + " ".join(warnings) + "\n" + outcome
+    outcome = _with_warnings(_safe_call(f"create {doctype}", run), warnings)
     # Whether it succeeded or failed, this attempt is done — clear the
     # pending state so a retry (e.g. after fixing a bad link value)
     # starts from the fields the user already gave rather than getting
@@ -309,21 +456,26 @@ def _run_create(
 
 @tool
 def erp_describe_fields(doctype: str) -> str:
-    """Looks up, LIVE from ERPNext's own schema, which fields are
-    required to create a record of `doctype` (any ERPNext doctype).
-    Use this when the user asks something like 'what do you need to
-    create a <doctype>?' or before starting a multi-field create so you
-    know what to ask for — though calling erp_data_tool with
-    operation='create' directly will also surface missing fields one at
-    a time on its own."""
+    """Looks up the LIVE ERPNext schema for a doctype. Use this before
+    list/search calls whenever you are not certain of exact fieldnames,
+    filter fields, or date fields. It returns every queryable field plus
+    the subset required for creation. Never invent fieldnames."""
 
     def run():
-        from ERP.dynamic_fields import get_required_fields
+        from ERP.dynamic_fields import get_available_fields, get_required_fields
 
+        available = get_available_fields(doctype)
         req = get_required_fields(doctype)
+        lines = [f"Queryable fields for {doctype} (label: fieldname [type]):"]
+        lines.extend(
+            f"- {f['label']}: {f['fieldname']} [{f['fieldtype']}]"
+            for f in available
+        )
+        lines.append("")
         if not req:
-            return f"ERPNext doesn't mark any field as required to create a {doctype}."
-        lines = [f"To create a {doctype}, ERPNext requires:"]
+            lines.append("ERPNext does not mark any user-supplied field as required for creation.")
+            return "\n".join(lines)
+        lines.append("Required fields for creation:")
         for f in req:
             note = " (structured line items, not a single answer)" if f["is_table"] else ""
             lines.append(f"- {f['label']} ({f['fieldname']}){note}: {field_question(f)}")

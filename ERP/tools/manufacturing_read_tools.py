@@ -1,0 +1,801 @@
+"""
+ERP/tools/manufacturing_read_tools.py
+
+Look-up/list tools for the Manufacturing module, on ERPNext's DEFAULT
+REST API (GET /api/resource/<Doctype>) via erp_client.get_list() /
+get_doc(). Pairs with manufacturing_write_tools.py's create_/update_
+tools for the same doctypes (Work Order, Production Plan, Job Card,
+Stock Entry, Bin).
+
+NOTE ON PROJECT CONVENTIONS: none of the existing domain modules
+(sales_write_tools.py, inventory_write_tools.py, etc.) have a read-side
+counterpart yet — they're write-only. This module establishes the
+read-side pattern for the project; the same shape (get_<doc>/list_<docs>
+using erp_client.get_list()/get_doc(), _format_records() for readable
+output, _safe_call() for error handling) can be copied to build
+sales_read_tools.py / inventory_read_tools.py / etc. later.
+
+Field mapping notes (stock ERPNext v16 fieldnames — same doctypes as
+manufacturing_write_tools.py; see that file's docstring for the fuller
+per-doctype notes):
+
+  Work Order     name, production_item, qty, produced_qty, status,
+                 planned_start_date, wip_warehouse, fg_warehouse
+  Production Plan name, posting_date, status, docstatus
+  Job Card       name, work_order, operation, workstation, status,
+                 for_quantity
+  Stock Entry    name, stock_entry_type, work_order, posting_date,
+                 docstatus (filtered to work-order-linked entries here,
+                 since general stock movements are inventory_write_tools'
+                 territory)
+  Bin            item_code, warehouse, actual_qty, reserved_qty,
+                 projected_qty — ERPNext's live stock-balance doctype
+                 (one row per item+warehouse combination), used here for
+                 "how much of X do we have" style questions.
+
+Same conventions as the write-tools modules:
+  - specific, natural-language docstrings (ToolRAG embeds these, and the
+    LLM reads them to decide when to call the tool).
+  - never raises — failures are caught and turned into a short string the
+    LLM can relay honestly.
+  - optional args are typed Optional[...] = None and only added to the
+    filter list when actually given, so an unfiltered list_* call just
+    returns the most recent records instead of an empty result.
+  - erp_client caches GETs for a short TTL by default (see
+    DEFAULT_CACHE_TTL_SECONDS in erp_client.py), so rapid repeat lookups
+    (e.g. the LLM checking the same Work Order twice in one turn) don't
+    re-hit ERPNext every time.
+
+Add this list to ERP/tools/__init__.py:
+    from .manufacturing_read_tools import MANUFACTURING_READ_TOOLS
+    ALL_TOOLS = [..., *MANUFACTURING_READ_TOOLS]
+"""
+
+from typing import Optional
+
+from langchain_core.tools import tool
+
+from ERP.erp_client import erp_client
+
+
+def _safe_call(label, fn):
+    """Runs `fn`, returning a clean error string instead of raising if the
+    ERP call fails for any reason (network, auth, validation, etc.)."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not {label} in ERPNext right now ({exc})."
+
+
+def _filters(**kwargs):
+    """Builds an ERPNext filters list (e.g. [["status", "=", "Open"]])
+    from keyword args, skipping any that are None so an unfiltered
+    list_* call doesn't accidentally filter on an empty/absent value."""
+    return [[key, "=", value] for key, value in kwargs.items() if value is not None]
+
+
+def _format_records(records, empty_message):
+    """Turns a list of dicts from get_list() into a short, readable
+    bullet list instead of dumping raw Python dict reprs at the user —
+    each record renders as its `name` followed by its other fields."""
+    if not records:
+        return empty_message
+
+    lines = []
+    for record in records:
+        name = record.get("name", "?")
+        rest = ", ".join(
+            f"{k}: {v}" for k, v in record.items() if k != "name" and v not in (None, "")
+        )
+        lines.append(f"- {name}" + (f" ({rest})" if rest else ""))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------
+# Item (look up by ID/name, or list with filters)
+# ---------------------------------------------------------------------
+
+@tool
+def get_item(item_ref: str):
+    """Look up a single Item by its Item Code (ID) or Item Name — returns
+    its item code, item name, item group, stock UOM, standard selling
+    rate, valuation rate, description, default BOM, and manufacturing /
+    stock flags. The `item_ref` can be either the Item Code (e.g.
+    'SKU001') or the Item Name (e.g. 'Laptop', 'T-shirt') — the backend
+    resolver will find the correct item automatically. Use for requests
+    like 'show me item SKU001', 'what is the rate of Laptop?', or 'get
+    details of T-shirt'."""
+
+    def run():
+        doc = erp_client.get_doc("Item", item_ref)
+        # Return only the most useful fields instead of the full 100+ field doc
+        useful = {
+            "item_code": doc.get("name"),
+            "item_name": doc.get("item_name"),
+            "item_group": doc.get("item_group"),
+            "description": doc.get("description"),
+            "stock_uom": doc.get("stock_uom"),
+            "standard_rate": doc.get("standard_rate"),
+            "valuation_rate": doc.get("valuation_rate"),
+            "is_stock_item": doc.get("is_stock_item"),
+            "include_item_in_manufacturing": doc.get("include_item_in_manufacturing"),
+            "default_bom": doc.get("default_bom"),
+            "brand": doc.get("brand"),
+            "has_serial_no": doc.get("has_serial_no"),
+            "has_batch_no": doc.get("has_batch_no"),
+            "lead_time_days": doc.get("lead_time_days"),
+            "safety_stock": doc.get("safety_stock"),
+            "disabled": doc.get("disabled"),
+        }
+        return str(useful)
+
+    return _safe_call(f"look up item '{item_ref}'", run)
+
+
+@tool
+def list_items(
+    item_group: Optional[str] = None,
+    is_stock_item: Optional[int] = None,
+    include_item_in_manufacturing: Optional[int] = None,
+    brand: Optional[str] = None,
+    limit: int = 20,
+):
+    """List Items in the ERP system, optionally filtered by `item_group`
+    (e.g. 'Raw Material', 'Products', 'Consulting Services'),
+    `is_stock_item` (1 for stock items, 0 for non-stock/service items),
+    `include_item_in_manufacturing` (1 for items used in manufacturing),
+    or `brand`. Returns the most recent `limit` matches (default 20) with
+    item code, item name, item group, UOM, standard rate, and stock flag.
+    Use for requests like 'list all items', 'show me stock items', 'what
+    items are in the Raw Material group?', or 'show me manufacturing
+    items'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Item",
+            fields=[
+                "name",
+                "item_name",
+                "item_group",
+                "stock_uom",
+                "standard_rate",
+                "is_stock_item",
+                "include_item_in_manufacturing",
+                "default_bom",
+            ],
+            filters=_filters(
+                item_group=item_group,
+                is_stock_item=is_stock_item,
+                include_item_in_manufacturing=include_item_in_manufacturing,
+                brand=brand,
+            ),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No items found matching that criteria.")
+
+    return _safe_call("list items", run)
+
+
+# ---------------------------------------------------------------------
+# Work Order
+# ---------------------------------------------------------------------
+
+@tool
+def get_work_order(work_order_id: str):
+    """Look up a single Work Order by its ID (e.g. 'WO-00001') — returns
+    its item, quantity, produced quantity, status, warehouses, and
+    planned start date. Use for requests like 'what's the status of
+    WO-00001?' or 'how much has been produced on WO-00001?'."""
+
+    def run():
+        doc = erp_client.get_doc("Work Order", work_order_id)
+        return str(doc)
+
+    return _safe_call(f"look up work order {work_order_id}", run)
+
+
+@tool
+def list_work_orders(
+    status: Optional[str] = None,
+    production_item: Optional[str] = None,
+    limit: int = 20,
+):
+    """List Work Orders, optionally filtered by `status` (one of 'Draft',
+    'Not Started', 'In Process', 'Completed', 'Stopped', 'Closed') and/or
+    `production_item` (an Item code). Returns the most recent `limit`
+    matches (default 20) with quantity, produced quantity, and status.
+    Use for requests like 'what work orders are in process?' or 'show me
+    work orders for ITEM-FG-001'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Work Order",
+            fields=[
+                "name",
+                "production_item",
+                "qty",
+                "produced_qty",
+                "status",
+                "planned_start_date",
+            ],
+            filters=_filters(status=status, production_item=production_item),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No work orders found matching that criteria.")
+
+    return _safe_call("list work orders", run)
+
+
+# ---------------------------------------------------------------------
+# Production Plan
+# ---------------------------------------------------------------------
+
+@tool
+def get_production_plan(production_plan_id: str):
+    """Look up a single Production Plan by its ID (e.g.
+    'MFG-PP-2026-00001') — returns its posting date, status, and planned
+    items. Use for requests like 'what's on production plan MFG-PP-2026-
+    00001?'."""
+
+    def run():
+        doc = erp_client.get_doc("Production Plan", production_plan_id)
+        return str(doc)
+
+    return _safe_call(f"look up production plan {production_plan_id}", run)
+
+
+@tool
+def list_production_plans(status: Optional[str] = None, limit: int = 20):
+    """List Production Plans, optionally filtered by `status` (one of
+    'Draft', 'Submitted', 'Not Started', 'In Process', 'Completed',
+    'Cancelled'). Returns the most recent `limit` matches (default 20).
+    Use for requests like 'show me open production plans'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Production Plan",
+            fields=["name", "posting_date", "status", "docstatus"],
+            filters=_filters(status=status),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No production plans found matching that criteria.")
+
+    return _safe_call("list production plans", run)
+
+
+# ---------------------------------------------------------------------
+# Job Card
+# ---------------------------------------------------------------------
+
+@tool
+def get_job_card(job_card_id: str):
+    """Look up a single Job Card by its ID (e.g. 'JOB-CARD-00001') —
+    returns its work order, operation, workstation, status, and
+    quantity. Use for requests like 'what's the status of job card
+    JOB-CARD-00001?'."""
+
+    def run():
+        doc = erp_client.get_doc("Job Card", job_card_id)
+        return str(doc)
+
+    return _safe_call(f"look up job card {job_card_id}", run)
+
+
+@tool
+def list_job_cards(
+    work_order: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 20,
+):
+    """List Job Cards, optionally filtered by `work_order` (a Work Order
+    ID) and/or `status` (one of 'Open', 'Work In Progress', 'On Hold',
+    'Completed'). Returns the most recent `limit` matches (default 20).
+    Use for requests like 'what job cards are open for WO-00001?' or
+    'show me job cards still in progress'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Job Card",
+            fields=[
+                "name",
+                "work_order",
+                "operation",
+                "workstation",
+                "status",
+                "for_quantity",
+            ],
+            filters=_filters(work_order=work_order, status=status),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No job cards found matching that criteria.")
+
+    return _safe_call("list job cards", run)
+
+
+# ---------------------------------------------------------------------
+# Stock (manufacturing-linked movements + live stock balance)
+# ---------------------------------------------------------------------
+
+@tool
+def list_manufacture_stock_entries(
+    work_order: Optional[str] = None,
+    stock_entry_type: Optional[str] = None,
+    limit: int = 20,
+):
+    """List manufacturing-related Stock Entries (material transfers into
+    WIP, or finished-goods receipts out of manufacturing), optionally
+    filtered by `work_order` (a Work Order ID) and/or `stock_entry_type`
+    (one of 'Material Transfer for Manufacture', 'Manufacture'). Returns
+    the most recent `limit` matches (default 20). Use for requests like
+    'what stock entries have been made for WO-00001?'."""
+
+    def run():
+        filters = _filters(work_order=work_order, stock_entry_type=stock_entry_type)
+        records = erp_client.get_list(
+            "Stock Entry",
+            fields=["name", "stock_entry_type", "work_order", "posting_date", "docstatus"],
+            filters=filters,
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No matching stock entries found.")
+
+    return _safe_call("list manufacturing stock entries", run)
+
+
+@tool
+def get_stock_balance(item_code: str, warehouse: Optional[str] = None):
+    """Look up the current stock balance (actual/reserved/projected
+    quantity) for an Item, optionally narrowed to one `warehouse`. Reads
+    from ERPNext's live Bin doctype, so this reflects real-time stock
+    levels rather than a point-in-time report. Use for requests like
+    'how much of ITEM-001 do we have?' or 'what's the stock of ITEM-001
+    in the Finished Goods warehouse?'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Bin",
+            fields=["item_code", "warehouse", "actual_qty", "reserved_qty", "projected_qty"],
+            filters=_filters(item_code=item_code, warehouse=warehouse),
+            limit=50,
+        )
+        return _format_records(
+            records, f"No stock balance found for {item_code}" + (f" in {warehouse}." if warehouse else ".")
+        )
+
+    return _safe_call(f"look up stock balance for {item_code}", run)
+
+
+# ---------------------------------------------------------------------
+# Item Lead Time
+# ---------------------------------------------------------------------
+
+@tool
+def get_item_lead_time(item_lead_time_id: str):
+    """Look up a single Item Lead Time record by its ID — returns the
+    item, shift time, number of shifts, number of workstations, and
+    manufacturing time. Use for requests like 'what's the lead time
+    setup for ITEM-FG-001?' (if you don't have the record ID, use
+    list_item_lead_times with an item_code filter instead)."""
+
+    def run():
+        doc = erp_client.get_doc("Item Lead Time", item_lead_time_id)
+        return str(doc)
+
+    return _safe_call(f"look up item lead time {item_lead_time_id}", run)
+
+
+@tool
+def list_item_lead_times(item_code: Optional[str] = None, limit: int = 20):
+    """List Item Lead Time records, optionally filtered by `item_code`.
+    Returns the most recent `limit` matches (default 20). Use for
+    requests like 'show me the lead time records for ITEM-FG-001' or
+    'list all item lead times'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Item Lead Time",
+            fields=[
+                "name",
+                "item_code",
+                "shift_time_in_hours",
+                "no_of_shift",
+                "no_of_workstations",
+                "total_workstation_time",
+                "manufacturing_time_in_mins",
+            ],
+            filters=_filters(item_code=item_code),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No item lead time records found matching that criteria.")
+
+    return _safe_call("list item lead times", run)
+
+
+# ---------------------------------------------------------------------
+# Master Production Schedule
+# ---------------------------------------------------------------------
+
+@tool
+def get_master_production_schedule(master_production_schedule_id: str):
+    """Look up a single Master Production Schedule by its ID — returns
+    its company, from/to dates, and status. Use for requests like
+    'what's on master production schedule MPS-00001?'."""
+
+    def run():
+        doc = erp_client.get_doc("Master Production Schedule", master_production_schedule_id)
+        return str(doc)
+
+    return _safe_call(f"look up master production schedule {master_production_schedule_id}", run)
+
+
+@tool
+def list_master_production_schedules(company: Optional[str] = None, limit: int = 20):
+    """List Master Production Schedules, optionally filtered by
+    `company`. Returns the most recent `limit` matches (default 20).
+    Use for requests like 'show me production schedules for Acme
+    Corp'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Master Production Schedule",
+            fields=["name", "company", "from_date", "to_date", "docstatus"],
+            filters=_filters(company=company),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(
+            records, "No master production schedules found matching that criteria."
+        )
+
+    return _safe_call("list master production schedules", run)
+
+
+# ---------------------------------------------------------------------
+# Downtime Entry
+# ---------------------------------------------------------------------
+
+@tool
+def get_downtime_entry(downtime_entry_id: str):
+    """Look up a single Downtime Entry by its ID — returns the
+    workstation, operator, start/end time, stop reason, and total
+    downtime. Use for requests like 'what caused downtime entry
+    DT-00001?'."""
+
+    def run():
+        doc = erp_client.get_doc("Downtime Entry", downtime_entry_id)
+        return str(doc)
+
+    return _safe_call(f"look up downtime entry {downtime_entry_id}", run)
+
+
+@tool
+def list_downtime_entries(
+    workstation: Optional[str] = None,
+    operator: Optional[str] = None,
+    limit: int = 20,
+):
+    """List Downtime Entries, optionally filtered by `workstation`
+    and/or `operator` (an Employee ID). Returns the most recent `limit`
+    matches (default 20). Use for requests like 'show me downtime on
+    Assembly Line 1' or 'how much downtime has HR-EMP-00007 logged?'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Downtime Entry",
+            fields=["name", "workstation", "operator", "from_time", "to_time", "stop_reason"],
+            filters=_filters(workstation=workstation, operator=operator),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No downtime entries found matching that criteria.")
+
+    return _safe_call("list downtime entries", run)
+
+
+# ---------------------------------------------------------------------
+# Sales Forecast
+# ---------------------------------------------------------------------
+
+@tool
+def get_sales_forecast(sales_forecast_id: str):
+    """Look up a single Sales Forecast by its ID — returns the forecast
+    items, demand quantities, and parent warehouse. Use for requests
+    like 'what's on sales forecast SF-00001?'."""
+
+    def run():
+        doc = erp_client.get_doc("Sales Forecast", sales_forecast_id)
+        return str(doc)
+
+    return _safe_call(f"look up sales forecast {sales_forecast_id}", run)
+
+
+@tool
+def list_sales_forecasts(parent_warehouse: Optional[str] = None, limit: int = 20):
+    """List Sales Forecasts, optionally filtered by `parent_warehouse`.
+    Returns the most recent `limit` matches (default 20). Use for
+    requests like 'show me sales forecasts for the Main Warehouse'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Sales Forecast",
+            fields=["name", "parent_warehouse", "docstatus"],
+            filters=_filters(parent_warehouse=parent_warehouse),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No sales forecasts found matching that criteria.")
+
+    return _safe_call("list sales forecasts", run)
+
+
+# ---------------------------------------------------------------------
+# BOM (Bill of Materials)
+# ---------------------------------------------------------------------
+
+@tool
+def get_bom(bom_id: str):
+    """Look up a single Bill of Materials (BOM) by its ID — returns the item
+    to manufacture, operations list, raw materials list, operating cost,
+    raw material cost, and total cost. Use for requests like 'show details
+    for BOM BOM-ITEM-FG-001-001'."""
+
+    def run():
+        doc = erp_client.get_doc("BOM", bom_id)
+        return str(doc)
+
+    return _safe_call(f"look up BOM {bom_id}", run)
+
+
+@tool
+def list_boms(item_code: Optional[str] = None, is_active: Optional[bool] = None, is_default: Optional[bool] = None, limit: int = 20):
+    """List Bills of Materials (BOMs), optionally filtered by `item_code`,
+    `is_active`, or `is_default`. Returns the most recent `limit` matches
+    (default 20). Use for requests like 'show all active BOMs' or 'list BOMs
+    for item SKU002'."""
+
+    def run():
+        # Convert bools to integers (Check fields in Frappe are 0 or 1)
+        active_val = (1 if is_active else 0) if is_active is not None else None
+        default_val = (1 if is_default else 0) if is_default is not None else None
+        
+        records = erp_client.get_list(
+            "BOM",
+            fields=["name", "item", "item_name", "is_active", "is_default", "total_cost"],
+            filters=_filters(item=item_code, is_active=active_val, is_default=default_val),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No BOMs found matching that criteria.")
+
+    return _safe_call("list BOMs", run)
+
+
+# ---------------------------------------------------------------------
+# Workstation Type
+# ---------------------------------------------------------------------
+
+@tool
+def get_workstation_type(workstation_type_id: str):
+    """Look up a single Workstation Type by its ID/Name — returns its hourly
+    rate, description, and operating costs. Use for requests like 'what is
+    the workstation type Assembly?'."""
+
+    def run():
+        doc = erp_client.get_doc("Workstation Type", workstation_type_id)
+        return str(doc)
+
+    return _safe_call(f"look up workstation type {workstation_type_id}", run)
+
+
+@tool
+def list_workstation_types(limit: int = 20):
+    """List Workstation Types. Returns the most recent `limit` matches
+    (default 20). Use for requests like 'show all workstation types'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Workstation Type",
+            fields=["name", "hour_rate"],
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No workstation types found.")
+
+    return _safe_call("list workstation types", run)
+
+
+# ---------------------------------------------------------------------
+# Workstation
+# ---------------------------------------------------------------------
+
+@tool
+def get_workstation(workstation_id: str):
+    """Look up a single Workstation by its name (ID) — returns its hourly
+    rate, workstation type, production capacity, status, and warehouse.
+    Use for requests like 'show details for workstation Workstation-001'."""
+
+    def run():
+        doc = erp_client.get_doc("Workstation", workstation_id)
+        return str(doc)
+
+    return _safe_call(f"look up workstation {workstation_id}", run)
+
+
+@tool
+def list_workstations(workstation_type: Optional[str] = None, limit: int = 20):
+    """List Workstations, optionally filtered by `workstation_type`.
+    Returns the most recent `limit` matches (default 20). Use for
+    requests like 'list all workstations' or 'show workstations of type
+    Assembly'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Workstation",
+            fields=["name", "workstation_type", "hour_rate", "status"],
+            filters=_filters(workstation_type=workstation_type),
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No workstations found matching that criteria.")
+
+    return _safe_call("list workstations", run)
+
+
+# ---------------------------------------------------------------------
+# Operation
+# ---------------------------------------------------------------------
+
+@tool
+def get_operation(operation_id: str):
+    """Look up a single Operation by its name (ID) — returns its default
+    workstation, description, batch size, and other settings. Use for
+    requests like 'show details for operation Cutting'."""
+
+    def run():
+        doc = erp_client.get_doc("Operation", operation_id)
+        return str(doc)
+
+    return _safe_call(f"look up operation {operation_id}", run)
+
+
+@tool
+def list_operations(limit: int = 20):
+    """List Operations. Returns the most recent `limit` matches (default
+    20). Use for requests like 'show me all operations'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Operation",
+            fields=["name", "workstation"],
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No operations found.")
+
+    return _safe_call("list operations", run)
+
+
+# ---------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------
+
+@tool
+def get_routing(routing_id: str):
+    """Look up a single Routing by its name (ID) — returns the routing operations
+    and default workstation settings. Use for requests like 'show details
+    for routing ROUT-00001'."""
+
+    def run():
+        doc = erp_client.get_doc("Routing", routing_id)
+        return str(doc)
+
+    return _safe_call(f"look up routing {routing_id}", run)
+
+
+@tool
+def list_routings(limit: int = 20):
+    """List Routings. Returns the most recent `limit` matches (default 20).
+    Use for requests like 'show all routings'."""
+
+    def run():
+        records = erp_client.get_list(
+            "Routing",
+            fields=["name", "routing_name", "disabled"],
+            order_by="modified desc",
+            limit=limit,
+        )
+        return _format_records(records, "No routings found.")
+
+    return _safe_call("list routings", run)
+
+
+MANUFACTURING_READ_TOOLS = [
+    get_item,
+    list_items,
+    get_work_order,
+    list_work_orders,
+    get_production_plan,
+    list_production_plans,
+    get_job_card,
+    list_job_cards,
+    list_manufacture_stock_entries,
+    get_stock_balance,
+    get_item_lead_time,
+    list_item_lead_times,
+    get_master_production_schedule,
+    list_master_production_schedules,
+    get_downtime_entry,
+    list_downtime_entries,
+    get_sales_forecast,
+    list_sales_forecasts,
+    get_bom,
+    list_boms,
+    get_workstation_type,
+    list_workstation_types,
+    get_workstation,
+    list_workstations,
+    get_operation,
+    list_operations,
+    get_routing,
+    list_routings,
+]
+
+
+# ---------------------------------------------------------------------
+# Slot-filling metadata (consumed by ERP/server.py)
+# ---------------------------------------------------------------------
+REQUIRED_FIELDS = {
+    "get_item": [
+        ("item_ref", "Which item? (its Item Code e.g. SKU001, or Item Name e.g. Laptop)"),
+    ],
+    "get_work_order": [
+        ("work_order_id", "Which work order? (its ID, e.g. WO-00001)"),
+    ],
+    "get_production_plan": [
+        ("production_plan_id", "Which production plan? (its ID, e.g. MFG-PP-2026-00001)"),
+    ],
+    "get_job_card": [
+        ("job_card_id", "Which job card? (its ID, e.g. JOB-CARD-00001)"),
+    ],
+    "get_stock_balance": [
+        ("item_code", "Which item's stock balance do you want to check?"),
+    ],
+    "get_item_lead_time": [
+        ("item_lead_time_id", "Which item lead time record? (its ID)"),
+    ],
+    "get_master_production_schedule": [
+        ("master_production_schedule_id", "Which master production schedule? (its ID)"),
+    ],
+    "get_downtime_entry": [
+        ("downtime_entry_id", "Which downtime entry? (its ID)"),
+    ],
+    "get_sales_forecast": [
+        ("sales_forecast_id", "Which sales forecast? (its ID)"),
+    ],
+    "get_bom": [
+        ("bom_id", "Which BOM? (its ID, e.g. BOM-ITEM-001)"),
+    ],
+    "get_workstation_type": [
+        ("workstation_type_id", "Which workstation type? (its ID/Name)"),
+    ],
+    "get_workstation": [
+        ("workstation_id", "Which workstation? (its ID/Name)"),
+    ],
+    "get_operation": [
+        ("operation_id", "Which operation? (its ID/Name)"),
+    ],
+    "get_routing": [
+        ("routing_id", "Which routing? (its ID/Name)"),
+    ],
+}
+
+# No read-tool answers need special parsing (unlike create_* tools'
+# `items` fields) — kept here only for consistency with the write-tools
+# modules, since ERP/tools/__init__.py merges every module's FIELD_PARSERS.
+FIELD_PARSERS = {}

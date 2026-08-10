@@ -36,15 +36,6 @@ Add this list to ERP/tools/__init__.py:
     ALL_TOOLS = [*SALES_TOOLS, *SALES_WRITE_TOOLS, *LEAD_TOOLS, *PURCHASE_WRITE_TOOLS]
 """
 
-# Add at Line 1 of ERP/tools/purchase_write_tools.py
-import os
-from pathlib import Path
-from dotenv import load_dotenv
-
-env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-load_dotenv(dotenv_path=env_path)
-load_dotenv()
-
 from datetime import date
 from typing import Optional
 

@@ -19,39 +19,48 @@ echo.
 :: Ask whether setup is already complete
 :: --------------------------------------------------
 choice /C YN /M "Have you already installed the project requirements?"
+
 if errorlevel 2 goto setup
 goto launch
 
 
 :setup
+
+echo.
+echo ==============================
+echo Checking Python 3.10
+echo ==============================
+echo.
+
+py -3.10 --version
+
+if errorlevel 1 (
+    echo.
+    echo ERROR: Python 3.10 was not found.
+    echo.
+    echo Installed Python versions:
+    py -0p
+    echo.
+    pause
+    exit /b 1
+)
+
+set "PYTHON=py -3.10"
+
+echo.
+echo Using:
+%PYTHON% --version
+
 echo.
 echo ==============================
 echo Creating Python Environment
 echo ==============================
 echo.
 
-echo Select Python:
-echo.
-echo [1] Default Python (python)
-echo [2] Specific Python version (py launcher)
-echo.
-
-set /p PYMODE=Choice [1]: 
-
-if "%PYMODE%"=="2" (
-    echo.
-    py -0p
-    echo.
-    set /p PYVER=Enter Python version (example: 3.12)
-    set "PYTHON=py -%PYVER%"
-) else (
-    set "PYTHON=python"
-)
-
 if not exist "%VENV_DIR%" (
-    echo.
-    echo Creating virtual environment...
+    echo Creating virtual environment with Python 3.10...
     %PYTHON% -m venv "%VENV_DIR%"
+
     if errorlevel 1 (
         echo.
         echo ERROR: Failed to create virtual environment.
@@ -66,16 +75,35 @@ call "%VENV_DIR%\Scripts\activate.bat"
 
 echo.
 echo ==============================
+echo Verifying Virtual Environment
+echo ==============================
+echo.
+
+python --version
+python -c "import sys; print('Python executable:'); print(sys.executable)"
+
+echo.
+echo ==============================
 echo Upgrading pip
 echo ==============================
+echo.
+
 python -m pip install --upgrade pip setuptools wheel
+
+if errorlevel 1 (
+    echo.
+    echo ERROR: Failed to upgrade pip.
+    pause
+    exit /b 1
+)
 
 echo.
 echo ==============================
 echo Installing Requirements
 echo ==============================
+echo.
 
-pip install -r "%REQ_FILE%"
+python -m pip install -r "%REQ_FILE%"
 
 if errorlevel 1 (
     echo.
@@ -86,7 +114,7 @@ if errorlevel 1 (
     echo ===============================================
     echo.
 
-    pip install --no-cache-dir -r "%REQ_FILE%"
+    python -m pip install --no-cache-dir -r "%REQ_FILE%"
 )
 
 if errorlevel 1 (
@@ -105,6 +133,7 @@ echo.
 echo ==============================
 echo Downloading AI Models
 echo ==============================
+echo.
 
 python "%MODEL_SCRIPT%" ^
     --tool-rag-dir "%BACKEND_DIR%ERP\models\all-MiniLM-L6-v2"
@@ -123,7 +152,6 @@ echo ==========================================
 echo Setup Completed Successfully.
 echo ==========================================
 echo.
-
 
 :launch
 
