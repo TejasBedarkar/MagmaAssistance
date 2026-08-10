@@ -190,7 +190,7 @@ from ERP.tool_rag import ToolRAG
 # (which only had entries keyed by those old tool names) aren't needed
 # either; erp_data_tool does its own missing-field prompting internally
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
-from ERP_Unified.tools import ERP_UNIFIED_TOOLS
+from ERP_Unified.tools import ERP_UNIFIED_TOOLS, pending_web_review_doctype
 
 # Generic internet-access tools (web_search, web_fetch_page, web_crawl) --
 # not tied to ERPNext, let the agent look things up on the open internet
@@ -745,11 +745,17 @@ async def _execute_tool(
             )
         return result
     try:
+        effective_args = _sanitize_tool_args(tool_name, args) or {}
+        # The generic ERP tool keeps multi-turn create state by session.
+        # Bind tool calls to the real chat session rather than letting the
+        # model omit it and fall back to the shared "default" bucket.
+        if tool_name == "erp_data_tool" and session_id:
+            effective_args = {**effective_args, "session_id": session_id}
         with audit_log.time_tool_call() as elapsed:
-            result = await tool.ainvoke(_sanitize_tool_args(tool_name, args) or {})
+            result = await tool.ainvoke(effective_args)
         if session_id:
             audit_log.log_turn(
-                session_id, "tool", str(result), tool_name=tool_name, tool_args=args,
+                session_id, "tool", str(result), tool_name=tool_name, tool_args=effective_args,
                 user_id=user_id, prompt_text=prompt_text, tool_status="success",
                 duration_ms=elapsed(),
             )
@@ -928,6 +934,16 @@ def _plain_reply(history, task_context: Optional[str] = None) -> str:
     return response.content
 
 
+def _is_unqualified_approval(message: str) -> bool:
+    """Recognise an approval without treating a correction as consent."""
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    if re.search(r"\b(no|wrong|incorrect|change|correct|instead|but|except|update|modify|add)\b", text):
+        return False
+    return bool(re.search(r"\b(yes|approve|approved|proceed|continue|go ahead|create)\b", text))
+
+
 async def agent_node(state: ChatState) -> dict:
     """Retrieve-tools -> call-LLM -> call-tool turn, same logic as the
     original generate_reply, now working off the trimmed short-term
@@ -936,6 +952,28 @@ async def agent_node(state: ChatState) -> dict:
     write-tool call is missing required info."""
     last_user_msg = _last_human_message(state["messages"]) or ""
     task_context = state.get("current_task")
+
+    # A review was already shown to the user. Handle their plain-language
+    # approval directly so "yes" cannot fall back into another review merely
+    # because the model omitted erp_data_tool's approved=True argument.
+    review_doctype = pending_web_review_doctype(state.get("session_id") or "default")
+    if review_doctype and _is_unqualified_approval(last_user_msg):
+        result = await _execute_tool(
+            "erp_data_tool",
+            {"operation": "create", "doctype": review_doctype, "approved": True},
+            session_id=state.get("session_id"),
+            user_id=state.get("user_id"),
+            prompt_text=last_user_msg,
+        )
+        if str(result).lower().startswith(("couldn't", "could not", "i need", "review_required")):
+            reply = f"I couldn't create the {review_doctype}: {result}"
+        else:
+            reply = (
+                f"{review_doctype} created successfully. {result}\n\n"
+                f"Next: Would you like to view this {review_doctype}, update its details, "
+                "or create a related Opportunity?"
+            )
+        return {"messages": [AIMessage(content=reply)]}
 
     history = trim_messages(
         state["messages"],

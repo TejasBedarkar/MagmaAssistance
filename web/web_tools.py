@@ -331,10 +331,12 @@ def _find_contact_page_link(soup: BeautifulSoup, base_url: str) -> Optional[str]
 # search. Cleared on process restart, same tradeoff as every other
 # in-memory store in this app (_PENDING_CREATES, MemorySaver, etc.).
 _LOOKUP_CACHE: dict[str, str] = {}
+_LOOKUP_ATTEMPTS: dict[str, int] = {}
+_MAX_RESEARCH_ATTEMPTS = 3
 
 
 @tool
-def web_company_lookup(company_name: str) -> str:
+def web_company_lookup(company_name: str, search_hint: Optional[str] = None, refresh: bool = False) -> str:
     """Looks up a real company's PUBLIC contact info on the web to help
     pre-fill an ERP record (Lead, Customer, etc.) when the user gives
     just a company name -- e.g. 'create a lead for Infosys'. Finds the
@@ -353,15 +355,37 @@ def web_company_lookup(company_name: str) -> str:
     erp_data_tool's `data`, tell the user which fields were auto-filled
     from the web, and ask the user directly for whatever it reports as
     'not found' -- report 'not found' as exactly that, never rephrase it
-    into something that sounds like a real answer."""
+    into something that sounds like a real answer. If the user says the
+    previous result was wrong, call again with their correction in
+    `search_hint` and `refresh=True` (for example, search_hint='India
+    corporate office phone'). It performs at most three researched attempts
+    for the same company; after that it asks the user directly for the
+    unresolved value instead of repeatedly searching."""
 
     name = (company_name or "").strip()
     if not name:
         return "Please provide a company name to look up."
 
-    cache_key = name.lower()
-    if cache_key in _LOOKUP_CACHE:
+    hint = (search_hint or "").strip()
+    cache_key = f"{name.lower()}|{hint.lower()}"
+    company_key = name.lower()
+    if not refresh and cache_key in _LOOKUP_CACHE:
         return _LOOKUP_CACHE[cache_key]
+
+    attempts = _LOOKUP_ATTEMPTS.get(company_key, 0)
+    if not refresh:
+        # The original lookup is research attempt one. Subsequent corrected
+        # searches may run twice more before we ask the user directly.
+        _LOOKUP_ATTEMPTS.setdefault(company_key, 1)
+        attempts = _LOOKUP_ATTEMPTS[company_key]
+    if refresh and attempts >= _MAX_RESEARCH_ATTEMPTS:
+        return (
+            f"Web research for '{name}' has already been refined {_MAX_RESEARCH_ATTEMPTS} times. "
+            f"Please ask the user directly for the specific value still needed"
+            f"{f' ({hint})' if hint else ''}."
+        )
+    if refresh:
+        _LOOKUP_ATTEMPTS[company_key] = attempts + 1
 
     def run():
         try:
@@ -371,7 +395,8 @@ def web_company_lookup(company_name: str) -> str:
 
         try:
             with DDGS() as ddgs:
-                results = list(ddgs.text(f"{name} official website", max_results=8))
+                query = f"{name} {hint} official website".strip()
+                results = list(ddgs.text(query, max_results=8))
         except Exception as exc:  # noqa: BLE001
             # Search backend hiccup/rate-limit -- fail soft with a plain
             # sentence instead of letting the raw exception (and a later
