@@ -40,6 +40,7 @@ from ERP.dynamic_fields import (
     apply_default_values,
     safe_call as _safe_call,
 )
+from ERP.tools.project_onboarding_tools import PROJECT_ONBOARDING_TOOLS
 
 BLOCKED_OPERATIONS = {"delete", "remove", "trash", "destroy", "cancel", "purge", "drop"}
 LIST_OPERATIONS = {"list", "get_list", "search", "find", "query"}
@@ -58,6 +59,23 @@ SUBMIT_OPERATIONS = {"submit"}
 # A restart of the process clears it, same tradeoff as server.py's
 # in-memory MemorySaver checkpointer.
 _PENDING_CREATES: dict[tuple, dict] = {}
+
+# Web-derived values are useful suggestions, not authority to write to the
+# ERP. Keep the review requirement alongside the pending create payload so a
+# user must explicitly approve the final assembled record before it is sent.
+_PENDING_WEB_REVIEWS: set[tuple] = set()
+
+
+def pending_web_review_doctype(session_id: str) -> Optional[str]:
+    """Return the one reviewed record awaiting this session's approval.
+
+    The chat server uses this to turn an ordinary human reply such as
+    ``yes, create it`` into a deterministic approved create call instead of
+    relying on the model to reconstruct tool arguments.
+    """
+    pending = [doctype for review_session, doctype in _PENDING_WEB_REVIEWS if review_session == session_id]
+    return pending[0] if len(pending) == 1 else None
+
 
 _EMAIL_RE = re.compile(
     r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
@@ -226,6 +244,8 @@ def erp_data_tool(
     data: Optional[dict] = None,
     submit: bool = False,
     session_id: str = "default",
+    web_enriched: bool = False,
+    approved: Optional[bool] = None,
 ) -> str:
     """Single generic gateway to ERPNext for ANY doctype, instead of a
     separate tool per doctype/action. `doctype` is the exact ERPNext
@@ -261,6 +281,13 @@ def erp_data_tool(
     of filling in one record; a new record for the same doctype should
     use a different session_id (or finish/cancel the current one first).
 
+    For data obtained from web_search, web_fetch_page, web_crawl, or
+    web_company_lookup, set `web_enriched=True`. The tool will collect any
+    remaining required fields, then return a review instead of creating the
+    record. Only call it again with `approved=True` after the user has seen
+    and approved that review. If the user rejects it, leave `approved` unset
+    or false; refine the web search and submit the revised data for review.
+
     This tool never deletes, cancels, or removes any record under any
     circumstance — those operations are permanently disabled here.
     Always use 'update' to change status/fields instead."""
@@ -274,7 +301,7 @@ def erp_data_tool(
         )
 
     if op in CREATE_OPERATIONS:
-        return _run_create(doctype, data, submit, session_id)
+        return _run_create(doctype, data, submit, session_id, web_enriched, approved)
 
     def run():
         if op in LIST_OPERATIONS:
@@ -335,7 +362,20 @@ def erp_data_tool(
     return _safe_call(f"{op or 'process'} {doctype}", run)
 
 
-def _run_create(doctype: str, data: Optional[dict], submit: bool, session_id: str) -> str:
+def _review_text(doctype: str, data: dict) -> str:
+    """Render a concise, non-ambiguous review payload for user approval."""
+    visible = [f"- {field}: {value}" for field, value in data.items() if value not in (None, "", [], {})]
+    return "\n".join(visible) if visible else "- No fields were supplied"
+
+
+def _run_create(
+    doctype: str,
+    data: Optional[dict],
+    submit: bool,
+    session_id: str,
+    web_enriched: bool = False,
+    approved: Optional[bool] = None,
+) -> str:
     """Implements the dynamic, one-field-at-a-time create flow described
     in erp_data_tool's docstring. Kept separate from the generic `run()`
     closure above because, unlike list/get/update/submit, this needs
@@ -345,6 +385,8 @@ def _run_create(doctype: str, data: Optional[dict], submit: bool, session_id: st
     pending = _PENDING_CREATES.get(key, {})
     merged = {**pending, **(data or {})}
     warnings: list[str] = []
+    if web_enriched:
+        _PENDING_WEB_REVIEWS.add(key)
 
     try:
         merged, warnings = _prepare_write_data(doctype, merged)
@@ -367,7 +409,7 @@ def _run_create(doctype: str, data: Optional[dict], submit: bool, session_id: st
     if missing:
         _PENDING_CREATES[key] = merged
         next_field = missing[0]
-        return _with_warnings((
+        message = (
             f"I need a bit more information to create this {doctype}. "
             f"{field_question(next_field)} "
             f"(field: {next_field['fieldname']}; {len(missing)} field(s) still "
@@ -375,7 +417,19 @@ def _run_create(doctype: str, data: Optional[dict], submit: bool, session_id: st
             f"Once you have the answer, call erp_data_tool again with "
             f"operation='create', doctype='{doctype}', session_id='{session_id}', "
             f"and data={{'{next_field['fieldname']}': <answer>}}."
-        ), warnings)
+        )
+        return _with_warnings(message, warnings)
+
+    if key in _PENDING_WEB_REVIEWS and approved is not True:
+        _PENDING_CREATES[key] = merged
+        message = (
+            f"REVIEW_REQUIRED: I gathered some of this {doctype} data from the web. "
+            "Please review it before anything is created:\n"
+            f"{_review_text(doctype, merged)}\n\n"
+            "Do you want to create this record using this data? Reply yes to approve, "
+            "or tell me which field is incorrect and what to look for instead."
+        )
+        return _with_warnings(message, warnings)
 
     # Nothing missing — safe to actually create the record now.
     def run():
@@ -396,6 +450,7 @@ def _run_create(doctype: str, data: Optional[dict], submit: bool, session_id: st
     # the caller still has `merged` available to retry manually with
     # corrections if needed.
     _PENDING_CREATES.pop(key, None)
+    _PENDING_WEB_REVIEWS.discard(key)
     return outcome
 
 
@@ -429,4 +484,4 @@ def erp_describe_fields(doctype: str) -> str:
     return _safe_call(f"look up required fields for {doctype}", run)
 
 
-ERP_UNIFIED_TOOLS = [erp_data_tool, erp_describe_fields]
+ERP_UNIFIED_TOOLS = [erp_data_tool, erp_describe_fields, *PROJECT_ONBOARDING_TOOLS]

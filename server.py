@@ -250,9 +250,9 @@ from ERP.tool_rag import ToolRAG
 # (which only had entries keyed by those old tool names) aren't needed
 # either; erp_data_tool does its own missing-field prompting internally
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
-from ERP_Unified.tools import ERP_UNIFIED_TOOLS
+from ERP_Unified.tools import ERP_UNIFIED_TOOLS, pending_web_review_doctype
 from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
-from Web.web_tool import WEB_TOOLS
+from web.web_tool import WEB_TOOLS
 
 ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
@@ -846,10 +846,13 @@ async def _execute_tool(
         return result
     try:
         effective_args = _sanitize_tool_args(tool_name, args) or {}
-
+        # The generic ERP tool keeps multi-turn create state by session.
+        # Bind tool calls to the real chat session rather than letting the
+        # model omit it and fall back to the shared "default" bucket.
+        if tool_name == "erp_data_tool" and session_id:
+            effective_args = {**effective_args, "session_id": session_id}
         with audit_log.time_tool_call() as elapsed:
             result = await tool.ainvoke(effective_args)
-
         if session_id:
             audit_log.log_turn(
                 session_id, "tool", str(result), tool_name=tool_name, tool_args=effective_args,
@@ -1197,6 +1200,15 @@ def _plain_reply(history, task_context: Optional[str] = None) -> str:
     return response.content
 
 
+def _is_unqualified_approval(message: str) -> bool:
+    """Recognise an approval without treating a correction as consent."""
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    if re.search(r"\b(no|wrong|incorrect|change|correct|instead|but|except|update|modify|add)\b", text):
+        return False
+    return bool(re.search(r"\b(yes|approve|approved|proceed|continue|go ahead|create)\b", text))
+
 def _build_fallback_chart(results: list, query_lower: str) -> Optional[str]:
     """Generic, zero-hardcode fallback chart generator: parses ANY list of records
     returned by erp_data_tool, detects category/label keys and numeric/status keys,
@@ -1243,15 +1255,15 @@ def _build_fallback_chart(results: list, query_lower: str) -> Optional[str]:
 
             # Prioritize standard ERP label fields over generic text
             priority_cat = [
-                "customer", "customer_name", "supplier", "supplier_name", 
-                "item_code", "item_name", "production_item", "warehouse", 
+                "customer", "customer_name", "supplier", "supplier_name",
+                "item_code", "item_name", "production_item", "warehouse",
                 "territory", "item_group", "posting_date", "transaction_date"
             ]
             best_cat = next((k for p in priority_cat for k in cat_keys if k.lower() == p or p in k.lower()), cat_keys[0] if cat_keys else None)
 
             # Prioritize standard ERP financial & quantity fields over generic numbers
             priority_num = [
-                "grand_total", "total", "net_total", "amount", 
+                "grand_total", "total", "net_total", "amount",
                 "qty", "produced_qty", "stock_qty", "rate", "valuation_rate"
             ]
             best_num = next((k for p in priority_num for k in num_keys if k.lower() == p or p in k.lower()), num_keys[0] if num_keys else None)
@@ -1333,6 +1345,28 @@ async def agent_node(state: ChatState) -> dict:
     write-tool call is missing required info."""
     last_user_msg = _last_human_message(state["messages"]) or ""
     task_context = state.get("current_task")
+
+    # A review was already shown to the user. Handle their plain-language
+    # approval directly so "yes" cannot fall back into another review merely
+    # because the model omitted erp_data_tool's approved=True argument.
+    review_doctype = pending_web_review_doctype(state.get("session_id") or "default")
+    if review_doctype and _is_unqualified_approval(last_user_msg):
+        result = await _execute_tool(
+            "erp_data_tool",
+            {"operation": "create", "doctype": review_doctype, "approved": True},
+            session_id=state.get("session_id"),
+            user_id=state.get("user_id"),
+            prompt_text=last_user_msg,
+        )
+        if str(result).lower().startswith(("couldn't", "could not", "i need", "review_required")):
+            reply = f"I couldn't create the {review_doctype}: {result}"
+        else:
+            reply = (
+                f"{review_doctype} created successfully. {result}\n\n"
+                f"Next: Would you like to view this {review_doctype}, update its details, "
+                "or create a related Opportunity?"
+            )
+        return {"messages": [AIMessage(content=reply)]}
 
     history = trim_messages(
         state["messages"],
@@ -1857,4 +1891,3 @@ if __name__ == "__main__":
     logger.info(f"Starting server on port {port}...")
 
     uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
-    
