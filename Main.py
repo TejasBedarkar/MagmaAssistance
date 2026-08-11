@@ -23,12 +23,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
 
-from LLM.LLM import LLM, DEFAULT_SYSTEM_PROMPT
+from LLM.LLM import LLM, GENERAL_ERP_PROMPT
 from TTS.TTS import OpenAITTS
 from TTS.STT import OpenAISTT
 
 class VoiceAssistant:
-    def __init__(self, whisper_model: str = None, llm_model: str = "gpt-4o-mini", system_prompt: str = DEFAULT_SYSTEM_PROMPT, record_duration: int = 5, tts_voice: str = "alloy", speak_replies: bool = True,):
+    def __init__(self, whisper_model: str = None, llm_model: str = "gpt-4o-mini", system_prompt: str = GENERAL_ERP_PROMPT, record_duration: int = 5, tts_voice: str = "alloy", speak_replies: bool = True,):
         self.record_duration = record_duration
         self.speak_replies = speak_replies
 

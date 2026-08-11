@@ -239,3 +239,24 @@ CREATE TRIGGER trg_file_uploads_touch
     EXECUTE FUNCTION touch_updated_at();
 
 COMMIT;
+-- ---------------------------------------------------------------------
+-- LONG_TERM_MEMORY -- LangGraph Memory Store backend
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS long_term_memory (
+    id                BIGSERIAL PRIMARY KEY,
+    user_id           TEXT NOT NULL,
+    memory_type       TEXT NOT NULL, -- 'semantic', 'episodic', 'procedural'
+    memory_key        TEXT NOT NULL,
+    memory_value      TEXT NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, memory_type, memory_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ltm_user ON long_term_memory (user_id, memory_type);
+
+DROP TRIGGER IF EXISTS trg_ltm_touch ON long_term_memory;
+CREATE TRIGGER trg_ltm_touch
+    BEFORE UPDATE ON long_term_memory
+    FOR EACH ROW
+    EXECUTE FUNCTION touch_updated_at();
