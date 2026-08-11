@@ -91,4 +91,5 @@ output.wav
 # Cookies/Local session files
 cookies.txt
 
-*.dbcheckpoints.sqlite*
+*.db
+checkpoints.sqlite*

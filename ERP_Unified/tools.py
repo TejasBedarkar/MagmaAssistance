@@ -28,7 +28,7 @@ sentence they can act on rather than a stack trace.
 """
 
 import re
-from typing import Optional
+from typing import Optional, Union
 
 from langchain_core.tools import tool
 
@@ -42,23 +42,17 @@ from ERP.dynamic_fields import (
 )
 from ERP.tools.project_onboarding_tools import PROJECT_ONBOARDING_TOOLS
 
-BLOCKED_OPERATIONS = {"delete", "remove", "trash", "destroy", "cancel", "purge", "drop"}
+BLOCKED_OPERATIONS = {"trash", "destroy", "cancel", "purge", "drop"}
 LIST_OPERATIONS = {"list", "get_list", "search", "find", "query"}
 GET_OPERATIONS = {"get", "get_doc", "fetch", "detail", "details", "view"}
 CREATE_OPERATIONS = {"create", "insert", "add", "new"}
 UPDATE_OPERATIONS = {"update", "edit", "modify", "set"}
+DELETE_OPERATIONS = {"delete", "remove"}
 SUBMIT_OPERATIONS = {"submit"}
 
-# In-memory store of in-progress creates, keyed by (session_id, doctype),
-# so a create that's missing fields can be resumed across multiple tool
-# calls without the caller having to resend everything collected so far.
-# This is the same "ask one field at a time, remember the answers"
-# pattern ERP/server.py implements for the per-domain tools via
-# task_slots/pending_tool — reimplemented locally here since this
-# module isn't wired into that LangGraph state machine (see README.md).
-# A restart of the process clears it, same tradeoff as server.py's
-# in-memory MemorySaver checkpointer.
 _PENDING_CREATES: dict[tuple, dict] = {}
+_PENDING_UPDATES: dict[tuple, dict] = {}
+_PENDING_DELETES: set[tuple] = set()
 
 # Web-derived values are useful suggestions, not authority to write to the
 # ERP. Keep the review requirement alongside the pending create payload so a
@@ -73,7 +67,7 @@ def pending_web_review_doctype(session_id: str) -> Optional[str]:
     ``yes, create it`` into a deterministic approved create call instead of
     relying on the model to reconstruct tool arguments.
     """
-    pending = [doctype for review_session, doctype in _PENDING_WEB_REVIEWS if review_session == session_id]
+    pending = [doctype for review_session, doctype in _PENDING_CREATES if review_session == session_id]
     return pending[0] if len(pending) == 1 else None
 
 
@@ -238,7 +232,7 @@ def erp_data_tool(
     doctype: str,
     name: Optional[str] = None,
     fields: Optional[list] = None,
-    filters: Optional[list] = None,
+    filters: Optional[Union[list, dict]] = None,
     order_by: Optional[str] = None,
     limit: int = 20,
     data: Optional[dict] = None,
@@ -281,15 +275,14 @@ def erp_data_tool(
     of filling in one record; a new record for the same doctype should
     use a different session_id (or finish/cancel the current one first).
 
-    For data obtained from web_search, web_fetch_page, web_crawl, or
-    web_company_lookup, set `web_enriched=True`. The tool will collect any
-    remaining required fields, then return a review instead of creating the
-    record. Only call it again with `approved=True` after the user has seen
-    and approved that review. If the user rejects it, leave `approved` unset
-    or false; refine the web search and submit the revised data for review.
+    For ALL create operations, the tool will collect any remaining required fields, 
+    then return a review instead of immediately creating the record. 
+    You MUST output this review to the user. Only call the tool again with 
+    `approved=True` AFTER the user has seen and explicitly approved that review. 
+    If the user rejects it or provides corrections, leave `approved` unset, 
+    update the `data`, and submit the revised data for review.
 
-    This tool never deletes, cancels, or removes any record under any
-    circumstance — those operations are permanently disabled here.
+    This tool never trashes, cancels, or destroys records.
     Always use 'update' to change status/fields instead."""
 
     op = (operation or "").strip().lower()
@@ -297,11 +290,17 @@ def erp_data_tool(
     if op in BLOCKED_OPERATIONS:
         return (
             f"The '{operation}' operation is not permitted through this tool. "
-            "Only read, create, and update operations are allowed on ERPNext data."
+            "Only read, create, update, and delete operations are allowed on ERPNext data."
         )
 
     if op in CREATE_OPERATIONS:
         return _run_create(doctype, data, submit, session_id, web_enriched, approved)
+
+    if op in DELETE_OPERATIONS:
+        return _run_delete(doctype, name, session_id, approved)
+
+    if op in UPDATE_OPERATIONS:
+        return _run_update(doctype, name, data, session_id, approved)
 
     def run():
         if op in LIST_OPERATIONS:
@@ -335,20 +334,6 @@ def erp_data_tool(
                 return f"A document name/ID is required to fetch a {doctype} record."
             return str(erp_client.get_doc(doctype, name))
 
-        if op in UPDATE_OPERATIONS:
-            if not name:
-                return f"A document name/ID is required to update a {doctype} record."
-            if not data:
-                return f"No `data` provided to update {doctype} {name}."
-            prepared, warnings = _prepare_write_data(doctype, data)
-            if not prepared:
-                return _with_warnings(
-                    f"No valid fields remain to update {doctype} {name}.", warnings
-                )
-            return _with_warnings(
-                str(erp_client.update_doc(doctype, name, prepared)), warnings
-            )
-
         if op in SUBMIT_OPERATIONS:
             if not name:
                 return f"A document name/ID is required to submit a {doctype} record."
@@ -368,6 +353,67 @@ def _review_text(doctype: str, data: dict) -> str:
     return "\n".join(visible) if visible else "- No fields were supplied"
 
 
+def _run_delete(doctype: str, name: Optional[str], session_id: str, approved: Optional[bool]) -> str:
+    if not name:
+        return f"A document name/ID is required to delete a {doctype} record."
+    
+    key = (session_id, doctype, name)
+    is_new = key not in _PENDING_DELETES
+
+    if is_new or approved is not True:
+        _PENDING_DELETES.add(key)
+        return (
+            f"REVIEW_REQUIRED: You have requested to delete {doctype} '{name}'.\n"
+            "This action cannot be undone.\n\n"
+            "Do you want to proceed? Reply 'yes' to approve the deletion, or 'no' to cancel."
+        )
+        
+    _PENDING_DELETES.discard(key)
+    def run():
+        return erp_client.call_method_post(f"frappe.client.delete", {"doctype": doctype, "name": name})
+    
+    result = _safe_call(f"delete {doctype} {name}", run)
+    return str(result) if result else f"Successfully deleted {doctype} '{name}'."
+
+
+def _run_update(doctype: str, name: Optional[str], data: Optional[dict], session_id: str, approved: Optional[bool]) -> str:
+    if not name:
+        return f"A document name/ID is required to update a {doctype} record."
+        
+    key = (session_id, doctype, name)
+    is_new = key not in _PENDING_UPDATES
+    
+    if is_new and not data:
+        return f"No `data` provided to update {doctype} '{name}'."
+        
+    try:
+        prepared, warnings = _prepare_write_data(doctype, data or {})
+    except Exception as exc:
+        return explain_erp_error(exc, context=f"prepare update data for {doctype}")
+        
+    pending = _PENDING_UPDATES.get(key, {})
+    merged = {**pending, **prepared}
+    
+    if not merged:
+        return _with_warnings(f"No valid fields remain to update {doctype} '{name}'.", warnings)
+
+    if is_new or approved is not True:
+        _PENDING_UPDATES[key] = merged
+        message = (
+            f"REVIEW_REQUIRED: Please review the updates to {doctype} '{name}':\n"
+            f"{_review_text(doctype, merged)}\n\n"
+            "Do you want to commit these updates? Reply 'yes' to approve, or tell me what to change."
+        )
+        return _with_warnings(message, warnings)
+        
+    _PENDING_UPDATES.pop(key, None)
+    def run():
+        return erp_client.update_doc(doctype, name, merged)
+        
+    result = _safe_call(f"update {doctype} {name}", run)
+    return _with_warnings(str(result), warnings)
+
+
 def _run_create(
     doctype: str,
     data: Optional[dict],
@@ -382,8 +428,16 @@ def _run_create(
     multiple ERPNext calls (a metadata lookup, then possibly the actual
     create) and its own control flow for the missing-fields case."""
     key = (session_id, doctype)
+    is_new = key not in _PENDING_CREATES
     pending = _PENDING_CREATES.get(key, {})
-    merged = {**pending, **(data or {})}
+    
+    # If explicitly approved and data is provided, trust the data (batch mode).
+    # Otherwise, merge with the cache for sequential field gathering.
+    if approved is True and data:
+        merged = data.copy()
+    else:
+        merged = {**pending, **(data or {})}
+        
     warnings: list[str] = []
     if web_enriched:
         _PENDING_WEB_REVIEWS.add(key)
@@ -420,15 +474,24 @@ def _run_create(
         )
         return _with_warnings(message, warnings)
 
-    if key in _PENDING_WEB_REVIEWS and approved is not True:
+    # Force a review if not explicitly approved
+    if approved is not True:
         _PENDING_CREATES[key] = merged
-        message = (
-            f"REVIEW_REQUIRED: I gathered some of this {doctype} data from the web. "
-            "Please review it before anything is created:\n"
-            f"{_review_text(doctype, merged)}\n\n"
-            "Do you want to create this record using this data? Reply yes to approve, "
-            "or tell me which field is incorrect and what to look for instead."
-        )
+        if key in _PENDING_WEB_REVIEWS:
+            message = (
+                f"REVIEW_REQUIRED: I gathered some of this {doctype} data from the web. "
+                "Please review it before anything is created:\n"
+                f"{_review_text(doctype, merged)}\n\n"
+                "Do you want to create this record using this data? Reply yes to approve, "
+                "or tell me which field is incorrect and what to look for instead."
+            )
+        else:
+            message = (
+                f"REVIEW_REQUIRED: Please review this {doctype} before it is created:\n"
+                f"{_review_text(doctype, merged)}\n\n"
+                "Do you want to create this record? Reply yes to approve, "
+                "or tell me which field is incorrect."
+            )
         return _with_warnings(message, warnings)
 
     # Nothing missing — safe to actually create the record now.
