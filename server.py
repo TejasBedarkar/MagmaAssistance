@@ -1533,6 +1533,16 @@ async def agent_node(state: ChatState) -> dict:
 
         # 1. Auto-append executed chart tool result if missing from final response
         chart_tool_names = {"create_bar_chart", "create_line_chart", "create_pie_chart"}
+        if any(tool_call["name"] in chart_tool_names for tool_call, _ in results):
+            # A chart tool returns a compact JSON chart block for the UI. Some
+            # models nevertheless try to reproduce it as a huge base64 PNG;
+            # that output is often truncated and is wasteful even when valid.
+            final_response.content = re.sub(
+                r'!\[[^\]]*\]\(data:image/[^\n]*',
+                '',
+                final_response.content or '',
+                flags=re.IGNORECASE,
+            ).strip()
         for tool_call, result in results:
             if tool_call["name"] in chart_tool_names:
                 res_str = str(result)
