@@ -252,7 +252,7 @@ from ERP.tool_rag import ToolRAG
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS
 from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
-from Web.web_tool import WEB_TOOLS
+from web.web_tool import WEB_TOOLS
 
 ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
@@ -1857,4 +1857,3 @@ if __name__ == "__main__":
     logger.info(f"Starting server on port {port}...")
 
     uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
-    
