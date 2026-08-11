@@ -252,7 +252,7 @@ from ERP.tool_rag import ToolRAG
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS, pending_web_review_doctype
 from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
-from web.web_tool import WEB_TOOLS
+from Web.web_tool import WEB_TOOLS
 
 ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
@@ -1426,6 +1426,8 @@ async def agent_node(state: ChatState) -> dict:
         "- For timeline trends over months/dates, call `create_line_chart` with x_axis_data (dates/months) and series_data (amounts).",
         "- Always retrieve real records from ERPNext using `erp_data_tool` first before generating charts or summaries.",
         "- When querying sales data with `erp_data_tool`, ALWAYS use `doctype='Sales Order'` (do NOT pass fieldnames like 'transaction_date' or 'grand_total' as the doctype parameter).",
+        "- After calling a chart tool, paste its returned ```chart JSON block into your answer EXACTLY as returned, verbatim, with no edits.",
+        "- NEVER draw, render, or invent a chart image yourself. NEVER output a Markdown image tag or a `data:image/...;base64,...` string of any kind — you cannot generate real image bytes, and attempting to do so only produces corrupted, unusable text. The ```chart``` block is the only valid chart output.",
         "\nPUBLIC-WEB RESEARCH DIRECTIVE:",
         "- For current public-web information, call `web_search`, then `web_fetch_page` when a full source page is needed.",
         "- For a company's verified public website or contact details, call `web_company_lookup`; never guess missing values.",
@@ -1538,13 +1540,21 @@ async def agent_node(state: ChatState) -> dict:
         if any(tool_call["name"] in chart_tool_names for tool_call, _ in results):
             # A chart tool returns a compact JSON chart block for the UI. Some
             # models nevertheless try to reproduce it as a huge base64 PNG;
-            # that output is often truncated and is wasteful even when valid.
-            final_response.content = re.sub(
-                r'!\[[^\]]*\]\(data:image/[^\n]*',
-                '',
-                final_response.content or '',
+            # that output is often malformed or truncated (missing the closing
+            # `)`, or split across lines) so a regex that requires a complete,
+            # well-formed data URI never matches and the raw base64 leaks into
+            # the chat as plain text. Instead, find the *start* of any
+            # image-markdown / data-URI attempt and drop everything from there
+            # onward — this catches partial/truncated output too.
+            content = final_response.content or ""
+            cutoff_match = re.search(
+                r'!\[[^\]]*\]\s*\(\s*data:image/|data:image/(?:png|jpe?g|webp|gif);base64,',
+                content,
                 flags=re.IGNORECASE,
-            ).strip()
+            )
+            if cutoff_match:
+                content = content[:cutoff_match.start()].rstrip()
+            final_response.content = content
         for tool_call, result in results:
             if tool_call["name"] in chart_tool_names:
                 res_str = str(result)

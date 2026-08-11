@@ -15,13 +15,25 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 # requires the client to detect speech/silence itself and explicitly call
 # input_audio_buffer.commit. Tuned for 24kHz 16-bit mono mic input; override
 # via env if a mic/room needs different sensitivity.
-VAD_ENERGY_THRESHOLD = float(os.environ.get("STT_VAD_ENERGY_THRESHOLD", "650"))
-VAD_SILENCE_MS = float(os.environ.get("STT_VAD_SILENCE_MS", "500"))
-VAD_MIN_SPEECH_MS = float(os.environ.get("STT_VAD_MIN_SPEECH_MS", "450"))
+#
+# Defaults tightened (previously 650 / 3.2x / +220 / 450ms) after reports of
+# background noise (fan/AC hum, distant TV/voices) being picked up as
+# speech. Two changes: (1) the floor and adaptive multiplier/margin are all
+# raised, so it takes a clearly-louder-than-ambient sound to cross the
+# threshold at all; (2) VAD_MAX_NOISE_FLOOR caps how far continuous loud
+# background noise can drag the adaptive threshold up, so a noisy room
+# doesn't eventually swallow normal speech too. Energy-based VAD still can't
+# distinguish "your voice" from "another voice/TV at similar volume" --
+# that needs OS/mic-level noise suppression or a directional mic, not
+# threshold tuning.
+VAD_ENERGY_THRESHOLD = float(os.environ.get("STT_VAD_ENERGY_THRESHOLD", "875"))
+VAD_SILENCE_MS = float(os.environ.get("STT_VAD_SILENCE_MS", "650"))
+VAD_MIN_SPEECH_MS = float(os.environ.get("STT_VAD_MIN_SPEECH_MS", "600"))
 VAD_CALIBRATION_MS = float(os.environ.get("STT_VAD_CALIBRATION_MS", "500"))
-VAD_NOISE_MULTIPLIER = float(os.environ.get("STT_VAD_NOISE_MULTIPLIER", "3.2"))
-VAD_NOISE_MARGIN = float(os.environ.get("STT_VAD_NOISE_MARGIN", "220"))
-VAD_DEBUG = os.environ.get("STT_VAD_DEBUG", "0") == "1"
+VAD_NOISE_MULTIPLIER = float(os.environ.get("STT_VAD_NOISE_MULTIPLIER", "4.0"))
+VAD_NOISE_MARGIN = float(os.environ.get("STT_VAD_NOISE_MARGIN", "350"))
+VAD_MAX_NOISE_FLOOR = float(os.environ.get("STT_VAD_MAX_NOISE_FLOOR", "1800"))
+VAD_DEBUG = os.environ.get("STT_VAD_DEBUG", "1") == "0"
 
 
 def _rms(pcm_bytes: bytes) -> float:
@@ -128,7 +140,10 @@ class RealtimeTranscriber:
         if self._noise_floor is None:
             self._noise_floor = energy
         elif not self._speaking and self._speech_ms == 0:
-            self._noise_floor = self._noise_floor * 0.95 + energy * 0.05
+            self._noise_floor = min(
+                self._noise_floor * 0.95 + energy * 0.05,
+                VAD_MAX_NOISE_FLOOR,
+            )
         adaptive_threshold = max(
             VAD_ENERGY_THRESHOLD,
             self._noise_floor * VAD_NOISE_MULTIPLIER + VAD_NOISE_MARGIN,

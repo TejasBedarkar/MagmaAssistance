@@ -53,7 +53,7 @@ def _load_dotenv(path: str = ".env") -> None:
 
 _load_dotenv()
 
-DEFAULT_WS_URL = os.environ.get("MAGMA_WS_URL", "ws://localhost:8050/ws/voice")
+DEFAULT_WS_URL = os.environ.get("MAGMA_WS_URL", "ws://localhost:8005/ws/voice")
 DEFAULT_SESSION = os.environ.get("MAGMA_SESSION_ID", "voice-cli")
 
 
