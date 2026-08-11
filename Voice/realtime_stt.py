@@ -15,9 +15,12 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 # requires the client to detect speech/silence itself and explicitly call
 # input_audio_buffer.commit. Tuned for 24kHz 16-bit mono mic input; override
 # via env if a mic/room needs different sensitivity.
-VAD_ENERGY_THRESHOLD = float(os.environ.get("STT_VAD_ENERGY_THRESHOLD", "500"))
+VAD_ENERGY_THRESHOLD = float(os.environ.get("STT_VAD_ENERGY_THRESHOLD", "650"))
 VAD_SILENCE_MS = float(os.environ.get("STT_VAD_SILENCE_MS", "500"))
-VAD_MIN_SPEECH_MS = float(os.environ.get("STT_VAD_MIN_SPEECH_MS", "200"))
+VAD_MIN_SPEECH_MS = float(os.environ.get("STT_VAD_MIN_SPEECH_MS", "450"))
+VAD_CALIBRATION_MS = float(os.environ.get("STT_VAD_CALIBRATION_MS", "500"))
+VAD_NOISE_MULTIPLIER = float(os.environ.get("STT_VAD_NOISE_MULTIPLIER", "3.2"))
+VAD_NOISE_MARGIN = float(os.environ.get("STT_VAD_NOISE_MARGIN", "220"))
 VAD_DEBUG = os.environ.get("STT_VAD_DEBUG", "0") == "1"
 
 
@@ -62,6 +65,9 @@ class RealtimeTranscriber:
         self._speaking = False
         self._speech_ms = 0.0
         self._silence_ms = 0.0
+        self._observed_ms = 0.0
+        self._noise_floor = None
+        self._candidate_audio = bytearray()
 
     async def connect(self):
         if not self.api_key:
@@ -114,24 +120,47 @@ class RealtimeTranscriber:
 
         frame_ms = (len(pcm_bytes) / 2) / self.sample_rate * 1000.0
         energy = _rms(pcm_bytes)
+        self._observed_ms += frame_ms
+
+        # Learn the room level while the mic opens and continue adapting
+        # slowly whenever no speech is active. A fixed threshold alone makes
+        # fans, traffic and laptop hum look like continuous speech.
+        if self._noise_floor is None:
+            self._noise_floor = energy
+        elif not self._speaking and self._speech_ms == 0:
+            self._noise_floor = self._noise_floor * 0.95 + energy * 0.05
+        adaptive_threshold = max(
+            VAD_ENERGY_THRESHOLD,
+            self._noise_floor * VAD_NOISE_MULTIPLIER + VAD_NOISE_MARGIN,
+        )
 
         if VAD_DEBUG:
             import sys
             bar = "#" * min(int(energy / 50), 60)
-            print(f"\r[vad] energy={energy:7.1f} thresh={VAD_ENERGY_THRESHOLD:.0f} speaking={self._speaking} {bar}", end="", file=sys.stderr, flush=True)
+            print(f"\r[vad] energy={energy:7.1f} noise={self._noise_floor:7.1f} thresh={adaptive_threshold:.0f} speaking={self._speaking} {bar}", end="", file=sys.stderr, flush=True)
 
-        if energy >= VAD_ENERGY_THRESHOLD:
+        if self._observed_ms < VAD_CALIBRATION_MS:
+            self._candidate_audio.clear()
+            return
+
+        if energy >= adaptive_threshold:
             self._silence_ms = 0.0
             self._speech_ms += frame_ms
-            if not self._speaking and self._speech_ms >= VAD_MIN_SPEECH_MS:
-                self._speaking = True
-                await self._events.put({"type": "speech_started"})
-            await self._append(pcm_bytes)
+            if not self._speaking:
+                self._candidate_audio.extend(pcm_bytes)
+                if self._speech_ms >= VAD_MIN_SPEECH_MS:
+                    self._speaking = True
+                    await self._append(bytes(self._candidate_audio))
+                    self._candidate_audio.clear()
+                    await self._events.put({"type": "speech_started"})
+            else:
+                await self._append(pcm_bytes)
             return
 
         # Quiet frame.
         self._speech_ms = 0.0
         if not self._speaking:
+            self._candidate_audio.clear()
             return  # nothing buffered yet, no point sending silence
 
         await self._append(pcm_bytes)
@@ -139,6 +168,7 @@ class RealtimeTranscriber:
         if self._silence_ms >= VAD_SILENCE_MS:
             self._speaking = False
             self._silence_ms = 0.0
+            self._candidate_audio.clear()
             await self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await self._events.put({"type": "speech_stopped"})
 
