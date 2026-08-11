@@ -9,7 +9,8 @@ the answer isn't in the ERP system.
 
 Four tools are exposed:
 
-  - web_search        : DuckDuckGo text search, no API key required.
+  - web_search        : Tavily AI-optimized search (primary), falls
+                        back to local SearXNG if Tavily is unavailable.
   - web_fetch_page     : fetch one URL and return its readable text.
   - web_crawl         : fetch a start URL, follow its links (same-domain
                         by default) and gather text from several pages
@@ -21,14 +22,14 @@ Four tools are exposed:
                         the user only gives a company name.
 
 Requirements (see requirements.txt):
-    pip install ddgs beautifulsoup4 lxml
+    pip install tavily-python beautifulsoup4 lxml
 
-Nothing here needs an API key. web_search shells out to the `ddgs`
-package (the actively-maintained fork of duckduckgo_search) purely for
-network access -- it does not send anything to OpenAI/Anthropic.
+Set TAVILY_API_KEY in your .env file to enable Tavily search.
+If not set, falls back to local SearXNG at http://localhost:8080.
 """
 
 import logging
+import os
 import re
 import time
 from typing import Optional
@@ -37,9 +38,31 @@ import urllib.robotparser as robotparser
 
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from langchain_core.tools import tool
 
+load_dotenv()
+
 logger = logging.getLogger("web-tools")
+
+# ---------------------------------------------------------------------------
+# Tavily client (primary search engine)
+# ---------------------------------------------------------------------------
+_TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+_tavily_client = None
+if _TAVILY_API_KEY:
+    try:
+        from tavily import TavilyClient
+        _tavily_client = TavilyClient(api_key=_TAVILY_API_KEY)
+        logger.info("Tavily search client initialized (primary search engine).")
+    except Exception as _e:
+        logger.warning("Tavily import failed (%s) — falling back to SearXNG.", _e)
+else:
+    logger.info("TAVILY_API_KEY not set — using SearXNG as primary search engine.")
+
+# SearXNG fallback URL
+_SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://localhost:8080")
+
 
 _HEADERS = {
     "User-Agent": (
@@ -105,36 +128,77 @@ def _allowed_by_robots(url: str) -> bool:
 
 @tool
 def web_search(query: str, max_results: int = 5) -> str:
-    """Searches the public internet (DuckDuckGo, no API key needed) for
-    up-to-date information that isn't in the ERP system -- news, product
-    specs, general knowledge, current events, company/person lookups,
-    documentation, etc. Returns a numbered list of results, each with a
-    title, URL, and short snippet. Call web_fetch_page on a specific URL
-    from the results afterwards if you need the full page content rather
-    than just the snippet. Keep `query` short and specific, like a real
-    search-box query, not a full sentence."""
+    """Searches the public internet for up-to-date information that isn't
+    in the ERP system -- news, product specs, general knowledge, current
+    events, company/person lookups, documentation, etc.
+
+    Uses Tavily (AI-optimized search) as the primary engine when
+    TAVILY_API_KEY is set; falls back to the local SearXNG instance
+    automatically.
+
+    Returns a numbered list of results with title, URL, and snippet.
+    Call web_fetch_page on a specific URL afterwards if you need the
+    full page content. Keep `query` short and specific."""
 
     n = max(1, min(int(max_results or 5), _MAX_SEARCH_RESULTS))
 
     def run():
-        from ddgs import DDGS  # imported lazily so the rest of the app
-                                # still works even if ddgs isn't installed
+        # ── Primary: Tavily ──────────────────────────────────────────────
+        if _tavily_client:
+            try:
+                resp = _tavily_client.search(
+                    query=query,
+                    max_results=n,
+                    include_answer=True,          # Tavily synthesizes a direct answer
+                    include_raw_content=False,
+                    search_depth="advanced",      # deeper crawl for better coverage
+                )
+                results = resp.get("results", [])
+                answer = resp.get("answer", "")
 
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=n))
+                if not results:
+                    return f"No web results found for '{query}'."
+
+                lines = [f"Web search results for '{query}':"]
+                if answer:
+                    lines.append(f"\n📋 Direct answer: {answer}\n")
+                for i, r in enumerate(results, start=1):
+                    title = r.get("title", "(no title)")
+                    url = r.get("url") or ""
+                    snippet = (r.get("content") or "").strip()[:400]
+                    score = r.get("score", 0)
+                    lines.append(f"{i}. {title}\n   {url}\n   {snippet}")
+                return "\n".join(lines)
+            except Exception as exc:
+                logger.warning("Tavily search failed (%s) — falling back to SearXNG.", exc)
+
+        # ── Fallback: SearXNG ────────────────────────────────────────────
+        try:
+            resp = requests.get(
+                f"{_SEARXNG_URL}/search",
+                params={"q": query, "format": "json"},
+                timeout=_REQUEST_TIMEOUT
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])[:n]
+        except Exception as exc:
+            logger.error("SearXNG web_search also failed: %s", exc)
+            return f"Web search is temporarily unavailable. Could not search for '{query}'."
 
         if not results:
             return f"No web results found for '{query}'."
 
-        lines = [f"Web search results for '{query}':"]
+        lines = [f"Web search results for '{query}' (via SearXNG):"]
         for i, r in enumerate(results, start=1):
             title = r.get("title", "(no title)")
-            url = r.get("href") or r.get("link") or ""
-            snippet = (r.get("body") or "").strip()
+            url = r.get("url") or ""
+            snippet = (r.get("content") or "").strip()
             lines.append(f"{i}. {title}\n   {url}\n   {snippet}")
         return "\n".join(lines)
 
     return _safe_call(f"search the web for '{query}'", run)
+
 
 
 @tool
@@ -388,27 +452,52 @@ def web_company_lookup(company_name: str, search_hint: Optional[str] = None, ref
         _LOOKUP_ATTEMPTS[company_key] = attempts + 1
 
     def run():
-        try:
-            from ddgs import DDGS
-        except ImportError:
-            return "Web lookup is unavailable (the 'ddgs' package isn't installed). Ask the user for details directly."
+        query = f"{name} {hint} official website contact email phone".strip()
 
-        try:
-            with DDGS() as ddgs:
-                query = f"{name} {hint} official website".strip()
-                results = list(ddgs.text(query, max_results=8))
-        except Exception as exc:  # noqa: BLE001
-            # Search backend hiccup/rate-limit -- fail soft with a plain
-            # sentence instead of letting the raw exception (and a later
-            # retry hitting the same failure) confuse the conversation.
-            logger.warning("web_company_lookup search failed for %r: %s", name, exc)
-            return f"Web search is temporarily unavailable. Ask the user for {name}'s contact details directly."
+        # ── Primary: Tavily company search ───────────────────────────────
+        search_results_urls = []
+        if _tavily_client:
+            try:
+                resp = _tavily_client.search(
+                    query=query,
+                    max_results=8,
+                    include_answer=False,
+                    search_depth="advanced",
+                )
+                search_results_urls = [
+                    r.get("url") for r in resp.get("results", []) if r.get("url")
+                ]
+                logger.info("Tavily returned %d URLs for '%s'", len(search_results_urls), name)
+            except Exception as exc:
+                logger.warning("Tavily company lookup failed (%s) — falling back to SearXNG.", exc)
+
+        # ── Fallback: SearXNG ────────────────────────────────────────────
+        if not search_results_urls:
+            try:
+                resp = requests.get(
+                    f"{_SEARXNG_URL}/search",
+                    params={"q": query, "format": "json"},
+                    timeout=_REQUEST_TIMEOUT
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                search_results_urls = [
+                    r.get("url") for r in data.get("results", [])[:8] if r.get("url")
+                ]
+            except Exception as exc:
+                logger.warning("web_company_lookup SearXNG fallback also failed for %r: %s", name, exc)
+                return f"Web search is temporarily unavailable. Ask the user for {name}'s contact details directly."
+
+        if not search_results_urls:
+            return f"No official website found for '{name}'. Ask the user for contact details directly."
+
+        results = [{"url": u} for u in search_results_urls]
 
         # Drop directories/social/news/reference hosts outright -- these
         # rank highly for almost any company but are never its own site.
         results = [
             r for r in results
-            if not _is_non_official_host(urlparse(r.get("href") or r.get("link") or "").netloc)
+            if not _is_non_official_host(urlparse(r.get("url") or "").netloc)
         ]
         if not results:
             return f"No official website found for '{name}'. Ask the user for contact details directly."
@@ -419,7 +508,7 @@ def web_company_lookup(company_name: str, search_hint: Optional[str] = None, ref
         target_slug = _slug(name)
 
         def score(r):
-            netloc = urlparse(r.get("href") or r.get("link") or "").netloc
+            netloc = urlparse(r.get("url") or "").netloc
             domain = _slug(_registrable_domain(netloc))
             if target_slug and (domain == target_slug or domain.startswith(target_slug[:6])):
                 return 0
@@ -427,9 +516,9 @@ def web_company_lookup(company_name: str, search_hint: Optional[str] = None, ref
 
         results.sort(key=score)
         candidates = [
-            (r.get("href") or r.get("link"))
+            r.get("url")
             for r in results[:_LOOKUP_CANDIDATE_PAGES]
-            if r.get("href") or r.get("link")
+            if r.get("url")
         ]
 
         emails, phones = [], []
