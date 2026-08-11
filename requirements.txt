@@ -7,6 +7,7 @@ requests
 httpx
 websockets
 python-dotenv
+tavily-python>=0.7.0
 # LLM/LLM.py imports fitz for PDF OCR/rendering.
 PyMuPDF
 
@@ -56,5 +57,5 @@ playsound==1.2.2
 ddgs
 beautifulsoup4
 lxml
-psycopg2
+psycopg2-binary
 boto3
