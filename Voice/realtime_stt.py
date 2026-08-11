@@ -26,7 +26,7 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 # distinguish "your voice" from "another voice/TV at similar volume" --
 # that needs OS/mic-level noise suppression or a directional mic, not
 # threshold tuning.
-VAD_ENERGY_THRESHOLD = float(os.environ.get("STT_VAD_ENERGY_THRESHOLD", "875"))
+VAD_ENERGY_THRESHOLD = float(os.environ.get("STT_VAD_ENERGY_THRESHOLD", "900"))
 VAD_SILENCE_MS = float(os.environ.get("STT_VAD_SILENCE_MS", "650"))
 VAD_MIN_SPEECH_MS = float(os.environ.get("STT_VAD_MIN_SPEECH_MS", "600"))
 VAD_CALIBRATION_MS = float(os.environ.get("STT_VAD_CALIBRATION_MS", "500"))
