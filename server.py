@@ -398,7 +398,21 @@ async def lifespan(app: FastAPI):
             "PGPASSWORD/PGDATABASE in .env. Audit logging will fail until this is fixed."
         )
 
-    yield
+    # Initialize AsyncSqliteSaver for persistent LangGraph memory
+    import aiosqlite
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    
+    global agent_graph
+    # We maintain a connection pool for the lifespan of the server
+    conn = await aiosqlite.connect("checkpoints.sqlite", check_same_thread=False)
+    try:
+        saver = AsyncSqliteSaver(conn)
+        await saver.setup()
+        agent_graph = build_agent_graph(checkpointer=saver)
+        logger.info("AsyncSqliteSaver persistent memory ready.")
+        yield
+    finally:
+        await conn.close()
 
 
 app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
@@ -917,7 +931,7 @@ async def _stream_chat_completion(messages, tools=None):
     tool_acc = {}
     content = ""
     finish_reason = None
-    async with httpx.AsyncClient(timeout=httpx.Timeout(LLM_REQUEST_TIMEOUT_SECONDS, connect=10.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(LLM_REQUEST_TIMEOUT_SECONDS, connect=30.0)) as client:
         async with client.stream("POST", url, json=data, headers=headers) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -1537,7 +1551,9 @@ async def general_node(state: ChatState) -> dict:
         f"\nCURRENT SYSTEM DATE: {current_date_str}",
         "\nSENIOR ERP EXPERT & BUSINESS INTELLIGENCE DIRECTIVE:",
         "- You are an expert ERP Analyst. Automatically generate charts for tabular data without asking.",
-        "- ALWAYS retrieve records using erp_data_tool before charting."
+        "- ALWAYS retrieve records using erp_data_tool before charting.",
+        "- PROACTIVE PROPOSALS: When the user describes a business scenario (e.g., building a dashboard), proactively extract details into structured fields (Project, Objective, Technology), present a formatted proposal, and ask 'Should I create this Project?'. Do NOT call the tool during the proposal.",
+        "- FAST-TRACK CREATION: When the user confirms your proposal, you MUST call erp_data_tool with the extracted data and set `approved=True` to create it immediately without a second review."
     ]
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
@@ -1646,15 +1662,12 @@ def build_agent_graph(checkpointer=None, use_platform_persistence=False):
         return graph.compile()
         
     if checkpointer is None:
-        import sqlite3
-        from langgraph.checkpoint.sqlite import SqliteSaver
-        conn = sqlite3.connect("checkpoints.sqlite", check_same_thread=False)
-        checkpointer = SqliteSaver(conn)
-        checkpointer.setup()
+        from langgraph.checkpoint.memory import MemorySaver
+        checkpointer = MemorySaver()
         
     return graph.compile(checkpointer=checkpointer)
 
-agent_graph = build_agent_graph()  # used by your FastAPI server, unchanged
+agent_graph = build_agent_graph()  # defaults to MemorySaver until lifespan overrides it
 
 
 def build_studio_graph():
@@ -1804,21 +1817,42 @@ async def chat(req: ChatRequest):
 
     return {"reply": reply, "audio": audio_b64}
 
-_stream_histories: dict = {}
+async def load_stream_history(session_id: str) -> list:
+    import aiosqlite, json
+    from langchain_core.messages import messages_from_dict
+    async with aiosqlite.connect("stream_history.sqlite") as conn:
+        await conn.execute("CREATE TABLE IF NOT EXISTS stream_history (session_id TEXT PRIMARY KEY, history TEXT)")
+        async with conn.execute("SELECT history FROM stream_history WHERE session_id = ?", (session_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                try:
+                    return messages_from_dict(json.loads(row[0]))
+                except Exception:
+                    pass
+    return []
+
+async def save_stream_history(session_id: str, history: list):
+    import aiosqlite, json
+    from langchain_core.messages import messages_to_dict
+    async with aiosqlite.connect("stream_history.sqlite") as conn:
+        await conn.execute("CREATE TABLE IF NOT EXISTS stream_history (session_id TEXT PRIMARY KEY, history TEXT)")
+        hist_str = json.dumps(messages_to_dict(history))
+        await conn.execute("INSERT OR REPLACE INTO stream_history (session_id, history) VALUES (?, ?)", (session_id, hist_str))
+        await conn.commit()
 
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest):
     """SSE variant of /api/chat for token-by-token terminal streaming with
     inline tool-call/tool_result markers, same event shape /ws/voice uses.
-    Keeps its own per-session_id history (separate from the LangGraph
-    checkpointer /api/chat uses) so this is purely additive."""
+    Keeps its own per-session_id history (backed by stream_history.sqlite) 
+    so this is purely additive."""
     from fastapi.responses import StreamingResponse
 
     text = (req.message or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="message is required")
 
-    history = _stream_histories.setdefault(req.session_id, [])
+    history = await load_stream_history(req.session_id)
 
     async def event_gen():
         try:
@@ -1827,6 +1861,9 @@ async def chat_stream(req: ChatRequest):
         except Exception as exc:  # noqa: BLE001
             logger.exception("Streaming agent turn failed: %s", text)
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+        finally:
+            await save_stream_history(req.session_id, history)
+            
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
