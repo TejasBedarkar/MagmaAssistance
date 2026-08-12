@@ -13,12 +13,33 @@ def register_voice_ws(app, stream_agent_turn, tts, logger):
     async def ws_voice(ws: WebSocket, session_id: str = "voice-default", user_id: str = None):
         await ws.accept()
 
+        class ConnectionClosed(Exception):
+            """Raised when a background task tries to use a closed websocket."""
+
+        connected = True
+
+        async def send(message):
+            nonlocal connected
+            if not connected:
+                raise ConnectionClosed
+            try:
+                await ws.send(message)
+            except (WebSocketDisconnect, RuntimeError, OSError) as exc:
+                connected = False
+                raise ConnectionClosed from exc
+
+        async def send_json(payload):
+            await send({"type": "websocket.send", "text": json.dumps(payload)})
+
         stt = RealtimeTranscriber()
         try:
             await stt.connect()
         except Exception as e:
-            await ws.send_text(json.dumps({"type": "error", "message": f"STT connect failed: {e}"}))
-            await ws.close()
+            try:
+                await send_json({"type": "error", "message": f"STT connect failed: {e}"})
+                await ws.close()
+            except (ConnectionClosed, RuntimeError, OSError):
+                pass
             return
 
         history = []
@@ -41,7 +62,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger):
             if not text_chunk.strip():
                 return
             for audio_bytes in tts.synthesize_stream(text_chunk):
-                await ws.send_bytes(audio_bytes)
+                await send({"type": "websocket.send", "bytes": audio_bytes})
 
         async def run_turn(text: str):
             state["speaking"] = True
@@ -50,7 +71,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger):
                 async for event in stream_agent_turn(text, session_id=session_id, user_id=user_id, history=history):
                     etype = event["type"]
                     if etype == "token":
-                        await ws.send_text(json.dumps({"type": "token", "text": event["text"]}))
+                        await send_json({"type": "token", "text": event["text"]})
                         buffer += event["text"]
                         parts = _SENTENCE_BOUNDARY_RE.split(buffer)
                         if len(parts) > 1:
@@ -58,20 +79,22 @@ def register_voice_ws(app, stream_agent_turn, tts, logger):
                                 await speak_chunk(chunk)
                             buffer = parts[-1]
                     elif etype == "tool_call":
-                        await ws.send_text(json.dumps({"type": "tool_call", "name": event["name"], "args": event["args"]}))
+                        await send_json({"type": "tool_call", "name": event["name"], "args": event["args"]})
                     elif etype == "tool_result":
-                        await ws.send_text(json.dumps({"type": "tool_result", "name": event["name"], "result": str(event["result"])}))
+                        await send_json({"type": "tool_result", "name": event["name"], "result": str(event["result"])})
                     elif etype == "done":
                         await speak_chunk(buffer)
                         buffer = ""
-                        await ws.send_text(json.dumps({"type": "done"}))
+                        await send_json({"type": "done"})
             except asyncio.CancelledError:
                 raise
+            except ConnectionClosed:
+                pass
             except Exception as e:
                 logger.exception("Voice turn failed")
                 try:
-                    await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
-                except Exception:
+                    await send_json({"type": "error", "message": str(e)})
+                except ConnectionClosed:
                     pass
             finally:
                 state["speaking"] = False
@@ -83,18 +106,20 @@ def register_voice_ws(app, stream_agent_turn, tts, logger):
                     if etype == "speech_started":
                         if state["speaking"] or state["turn_task"]:
                             await cancel_turn()
-                            await ws.send_text(json.dumps({"type": "interrupted"}))
+                            await send_json({"type": "interrupted"})
                     elif etype == "transcript_delta":
-                        await ws.send_text(json.dumps({"type": "partial_transcript", "text": event["text"]}))
+                        await send_json({"type": "partial_transcript", "text": event["text"]})
                     elif etype == "transcript_done":
                         text = (event.get("text") or "").strip()
                         if not text:
                             continue
-                        await ws.send_text(json.dumps({"type": "final_transcript", "text": text}))
+                        await send_json({"type": "final_transcript", "text": text})
                         await cancel_turn()
                         state["turn_task"] = asyncio.create_task(run_turn(text))
                     elif etype == "error":
-                        await ws.send_text(json.dumps({"type": "error", "message": str(event.get("error"))}))
+                        await send_json({"type": "error", "message": str(event.get("error"))})
+            except (asyncio.CancelledError, ConnectionClosed):
+                pass
             except Exception:
                 logger.exception("Realtime STT event loop failed")
 
@@ -103,6 +128,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger):
             while True:
                 message = await ws.receive()
                 if message.get("type") == "websocket.disconnect":
+                    connected = False
                     break
                 audio_bytes = message.get("bytes")
                 if audio_bytes is not None:
@@ -118,12 +144,17 @@ def register_voice_ws(app, stream_agent_turn, tts, logger):
                 if control.get("type") == "interrupt":
                     if state["speaking"] or state["turn_task"]:
                         await cancel_turn()
-                        await ws.send_text(json.dumps({"type": "interrupted"}))
+                        await send_json({"type": "interrupted"})
                 elif control.get("type") == "end":
                     break
-        except WebSocketDisconnect:
-            pass
+        except (WebSocketDisconnect, ConnectionClosed):
+            connected = False
         finally:
+            connected = False
             stt_task.cancel()
+            try:
+                await stt_task
+            except asyncio.CancelledError:
+                pass
             await cancel_turn()
             await stt.close()

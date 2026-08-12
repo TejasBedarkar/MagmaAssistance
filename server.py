@@ -421,7 +421,9 @@ app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # The browser API calls do not use cookies. Combining credentials with a
+    # wildcard origin is needlessly fragile across browsers/proxies.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1858,6 +1860,11 @@ async def chat_stream(req: ChatRequest):
     history = await load_stream_history(req.session_id)
 
     async def event_gen():
+        # Flush the SSE response and its CORS headers through Dev Tunnels
+        # before the agent/tool pipeline starts. Visualisation tools can take
+        # long enough that the tunnel otherwise produces its own timeout
+        # response, which the browser misleadingly reports as a CORS failure.
+        yield ": connected\n\n"
         try:
             async for event in stream_agent_turn(text, session_id=req.session_id, user_id=req.user_id, history=history):
                 yield f"data: {json.dumps(event)}\n\n"
@@ -1869,7 +1876,14 @@ async def chat_stream(req: ChatRequest):
             
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 @app.post("/query")
 async def handle_query(
