@@ -1060,11 +1060,14 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
 
         ai_msg = AIMessage(content=content, tool_calls=tool_calls)
         call_messages.append(ai_msg)
+        history.append(ai_msg)
         for tc in tool_calls:
             yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
             result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
             yield {"type": "tool_result", "name": tc["name"], "result": result}
-            call_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+            t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
+            call_messages.append(t_msg)
+            history.append(t_msg)
 
     content = ""
     async for event in _stream_full_reply(call_messages, tools=None):

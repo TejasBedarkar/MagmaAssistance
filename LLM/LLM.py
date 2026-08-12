@@ -143,12 +143,10 @@ GENERAL_ERP_PROMPT = (
     "- ONE STEP AT A TIME: Do not chain creates (Lead -> Project -> Task) without confirmation gates in between.\n"
     "- CONFIDENCE LABELS: When sourcing data from the web, explicitly label facts as `verified` (official site), `possible` (secondary), or `unknown`. Do not guess missing info.\n\n"
 
-    "FIELD MAPPING CHEATSHEET (ERPNext 16 Defaults):\n"
-    "- Lead: `lead_name`, `company_name`, `email_id`, `mobile_no`, `job_title`, `status`\n"
-    "- Project: `project_name`, `customer`, `expected_start_date`, `status`\n"
-    "- Task: `subject`, `project`, `description`, `exp_start_date`, `priority`\n"
-    "- Opportunity: `opportunity_from` (Lead/Customer), `party_name` (the EXACT Document ID of the Lead/Customer, NEVER the human name), `company` (your INTERNAL company, e.g., 'Magna'. Do NOT put the client's company here!).\n"
-    "- Assignment: Handled via `ToDo` doctype / `frappe.desk.form.assign_to` (not a distinct 'Assignment' doctype).\n\n"
+    "BUSINESS LOGIC DISCOVERY:\n"
+    "- You have access to a rich metadata system through the `erp_describe_fields` tool.\n"
+    "- ALWAYS call `erp_describe_fields` when working with a new Doctype.\n"
+    "- Read and strictly follow the 'CRITICAL BUSINESS LOGIC' section appended to the bottom of the schema.\n\n"
 
     "RESPONSE STYLE:\n"
     "- Be concise. Answer directly in 1-4 sentences.\n"

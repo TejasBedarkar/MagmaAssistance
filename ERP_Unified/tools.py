@@ -92,18 +92,60 @@ def _is_valid_email(value) -> bool:
     return bool(email and len(email) <= 254 and ".." not in email and _EMAIL_RE.fullmatch(email))
 
 
-def _existing_link_value(target_doctype: str, value) -> bool:
-    """Return whether a Link value names a real ERPNext document."""
+def _resolve_link_value(target_doctype: str, value) -> str | None:
+    """Return the exact ERPNext document name (ID) if it exists, matching exactly or fuzzy."""
     if value in (None, ""):
-        return False
+        return None
+        
+    value_str = str(value)
+    
+    # 1. Try exact match on 'name'
     matches = erp_client.get_list(
         target_doctype,
         fields=["name"],
-        filters=[["name", "=", str(value)]],
+        filters=[["name", "=", value_str]],
         limit=1,
         use_cache=False,
     )
-    return bool(matches)
+    if matches:
+        return matches[0]["name"]
+        
+    # 2. Try fuzzy lookup using common search fields
+    try:
+        meta = erp_client.get_meta(target_doctype)
+        title_field = meta.get("title_field")
+        search_fields = [sf.strip() for sf in (meta.get("search_fields") or "").split(",") if sf.strip()]
+        
+        fields_to_search = set()
+        if title_field:
+            fields_to_search.add(title_field)
+        fields_to_search.update(search_fields)
+        
+        # Fallback to common naming fields
+        common = {
+            f"{target_doctype.lower()}_name", "title", "company_name", 
+            "first_name", "full_name", "party_name", "customer_name", "lead_name"
+        }
+        meta_fields = {f.get("fieldname") for f in meta.get("fields", []) if f.get("fieldname")}
+        fields_to_search.update(common.intersection(meta_fields))
+        fields_to_search.add("name")
+        
+        or_filters = [[f, "like", f"%{value_str}%"] for f in fields_to_search]
+        
+        fuzzy_matches = erp_client.get_list(
+            target_doctype,
+            fields=["name"],
+            or_filters=or_filters,
+            limit=2,
+            use_cache=False,
+        )
+        # Only auto-resolve if exactly ONE record matches the fuzzy search
+        if len(fuzzy_matches) == 1:
+            return fuzzy_matches[0]["name"]
+    except Exception:
+        pass # Ignore meta/fuzzy fetch errors and fall back to None
+        
+    return None
 
 
 def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[str]]:
@@ -127,10 +169,11 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
     if doctype.strip().lower() == "lead" and cleaned.get("company"):
         internal_company = cleaned["company"]
         try:
-            company_exists = _existing_link_value("Company", internal_company)
+            resolved_company = _resolve_link_value("Company", internal_company)
         except Exception:  # Let generic validation/ERP expose connection issues.
-            company_exists = True
-        if not company_exists:
+            resolved_company = internal_company
+            
+        if not resolved_company:
             cleaned.setdefault("company_name", internal_company)
             cleaned.pop("company", None)
             warnings.append(
@@ -160,17 +203,44 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
                 cleaned[fieldname] = value.strip()
             continue
 
-        if fieldtype == "Link" and field.get("options"):
+        if fieldtype in ("Date", "Datetime"):
             try:
-                valid = _existing_link_value(field["options"], value)
+                from dateutil import parser
+                parsed_date = parser.parse(str(value))
+                if fieldtype == "Date":
+                    cleaned[fieldname] = parsed_date.strftime("%Y-%m-%d")
+                else:
+                    cleaned[fieldname] = parsed_date.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
-                # Do not disguise authentication/network problems as bad data.
-                raise
-            if not valid:
                 cleaned.pop(fieldname, None)
                 warnings.append(
-                    f"Omitted {fieldname}='{value}' because no matching "
-                    f"{field['options']} exists in ERPNext."
+                    f"Omitted {fieldname}='{value}' because it could not be recognized as a valid date."
+                )
+            continue
+
+        if fieldtype in ("Link", "Dynamic Link") and field.get("options"):
+            target_doctype = field["options"]
+            if fieldtype == "Dynamic Link":
+                target_doctype = cleaned.get(field["options"])
+                
+            if target_doctype:
+                try:
+                    resolved_id = _resolve_link_value(target_doctype, value)
+                except Exception:
+                    # Do not disguise authentication/network problems as bad data.
+                    raise
+                if not resolved_id:
+                    cleaned.pop(fieldname, None)
+                    warnings.append(
+                        f"Omitted {fieldname}='{value}' because no matching "
+                        f"{target_doctype} exists in ERPNext."
+                    )
+                else:
+                    cleaned[fieldname] = resolved_id
+            elif fieldtype == "Dynamic Link":
+                cleaned.pop(fieldname, None)
+                warnings.append(
+                    f"Omitted {fieldname}='{value}' because its reference field '{field['options']}' was not provided."
                 )
 
         if fieldtype == "Select" and field.get("options"):
@@ -333,26 +403,35 @@ def erp_data_tool(
         if op in GET_OPERATIONS:
             if not name:
                 return f"A document name/ID is required to fetch a {doctype} record."
-            return str(erp_client.get_doc(doctype, name))
+            resolved_name = _resolve_link_value(doctype, name)
+            if not resolved_name:
+                return f"Could not find any exact or uniquely matching {doctype} for '{name}'."
+            return str(erp_client.get_doc(doctype, resolved_name))
 
         if op in UPDATE_OPERATIONS:
             if not name:
                 return f"A document name/ID is required to update a {doctype} record."
+            resolved_name = _resolve_link_value(doctype, name)
+            if not resolved_name:
+                return f"Could not find any exact or uniquely matching {doctype} for '{name}'."
             if not data:
-                return f"No `data` provided to update {doctype} {name}."
+                return f"No `data` provided to update {doctype} '{name}'."
             prepared, warnings = _prepare_write_data(doctype, data)
             if not prepared:
                 return _with_warnings(
-                    f"No valid fields remain to update {doctype} {name}.", warnings
+                    f"No valid fields remain to update {doctype} '{resolved_name}'.", warnings
                 )
             return _with_warnings(
-                str(erp_client.update_doc(doctype, name, prepared)), warnings
+                str(erp_client.update_doc(doctype, resolved_name, prepared)), warnings
             )
 
         if op in SUBMIT_OPERATIONS:
             if not name:
                 return f"A document name/ID is required to submit a {doctype} record."
-            return str(erp_client.submit_doc(doctype, name))
+            resolved_name = _resolve_link_value(doctype, name)
+            if not resolved_name:
+                return f"Could not find any exact or uniquely matching {doctype} for '{name}'."
+            return str(erp_client.submit_doc(doctype, resolved_name))
 
         return (
             f"Unknown operation '{operation}'. Use one of: "
@@ -440,18 +519,17 @@ def _run_create(
             try:
                 result = erp_client.submit_doc(doctype, created_name)
             except Exception as exc:  # noqa: BLE001
+                # On submit failure, doc is still created, so we still pop state
+                _PENDING_CREATES.pop(key, None)
+                _PENDING_WEB_REVIEWS.discard(key)
                 return str(result) + f" (created as draft; submit failed: {explain_erp_error(exc)})"
+        
+        # On success, clear the pending state
+        _PENDING_CREATES.pop(key, None)
+        _PENDING_WEB_REVIEWS.discard(key)
         return str(result)
 
     outcome = _with_warnings(_safe_call(f"create {doctype}", run), warnings)
-    # Whether it succeeded or failed, this attempt is done — clear the
-    # pending state so a retry (e.g. after fixing a bad link value)
-    # starts from the fields the user already gave rather than getting
-    # stuck re-asking things that were fine. On a genuine ERPNext error
-    # the caller still has `merged` available to retry manually with
-    # corrections if needed.
-    _PENDING_CREATES.pop(key, None)
-    _PENDING_WEB_REVIEWS.discard(key)
     return outcome
 
 
@@ -476,11 +554,18 @@ def erp_describe_fields(doctype: str) -> str:
         lines.append("")
         if not req:
             lines.append("ERPNext does not mark any user-supplied field as required for creation.")
-            return "\n".join(lines)
-        lines.append("Required fields for creation:")
-        for f in req:
-            note = " (structured line items, not a single answer)" if f["is_table"] else ""
-            lines.append(f"- {f['label']} ({f['fieldname']}){note}: {field_question(f)}")
+        else:
+            lines.append("Required fields for creation:")
+            for f in req:
+                note = " (structured line items, not a single answer)" if f["is_table"] else ""
+                lines.append(f"- {f['label']} ({f['fieldname']}){note}: {field_question(f)}")
+
+        from ERP.doctype_knowledge import KNOWLEDGE_BASE
+        if doctype in KNOWLEDGE_BASE:
+            lines.append("")
+            lines.append(f"### CRITICAL BUSINESS LOGIC FOR {doctype.upper()} ###")
+            lines.append(KNOWLEDGE_BASE[doctype])
+            
         return "\n".join(lines)
 
     return _safe_call(f"look up required fields for {doctype}", run)
