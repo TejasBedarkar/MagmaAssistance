@@ -26,13 +26,13 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 # distinguish "your voice" from "another voice/TV at similar volume" --
 # that needs OS/mic-level noise suppression or a directional mic, not
 # threshold tuning.
-VAD_ENERGY_THRESHOLD = float(os.environ.get("STT_VAD_ENERGY_THRESHOLD", "900"))
+VAD_ENERGY_THRESHOLD = float(os.environ.get("STT_VAD_ENERGY_THRESHOLD", "500"))
 VAD_SILENCE_MS = float(os.environ.get("STT_VAD_SILENCE_MS", "650"))
-VAD_MIN_SPEECH_MS = float(os.environ.get("STT_VAD_MIN_SPEECH_MS", "600"))
+VAD_MIN_SPEECH_MS = float(os.environ.get("STT_VAD_MIN_SPEECH_MS", "300"))
 VAD_CALIBRATION_MS = float(os.environ.get("STT_VAD_CALIBRATION_MS", "500"))
-VAD_NOISE_MULTIPLIER = float(os.environ.get("STT_VAD_NOISE_MULTIPLIER", "4.0"))
-VAD_NOISE_MARGIN = float(os.environ.get("STT_VAD_NOISE_MARGIN", "350"))
-VAD_MAX_NOISE_FLOOR = float(os.environ.get("STT_VAD_MAX_NOISE_FLOOR", "1800"))
+VAD_NOISE_MULTIPLIER = float(os.environ.get("STT_VAD_NOISE_MULTIPLIER", "3.0"))
+VAD_NOISE_MARGIN = float(os.environ.get("STT_VAD_NOISE_MARGIN", "250"))
+VAD_MAX_NOISE_FLOOR = float(os.environ.get("STT_VAD_MAX_NOISE_FLOOR", "1200"))
 VAD_DEBUG = os.environ.get("STT_VAD_DEBUG", "1") == "0"
 
 
