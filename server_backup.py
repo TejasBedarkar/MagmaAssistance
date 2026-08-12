@@ -12,16 +12,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage, BaseMessage, trim_messages, RemoveMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage, BaseMessage, trim_messages
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.outputs import ChatResult, ChatGeneration
-from typing import List, Optional, Any, Sequence, Dict, Union, Callable, Annotated, TypedDict, Literal
+from typing import List, Optional, Any, Sequence, Dict, Union, Callable, Annotated, TypedDict
 import requests
-import sqlite3
+
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 
 from LLM.LLM import LLM
 import db.postgres_audit_log as audit_log
@@ -355,7 +355,7 @@ TOOL_RAG_MIN_SCORE = float(os.environ.get("TOOL_RAG_MIN_SCORE", "0.25"))
 # erp_data_tool) just because recent conversation text skewed the
 # embedding toward something else. Keep this comfortably above
 # len(ALL_TOOLS) unless you register many more tools later.
-TOOL_RAG_BYPASS_THRESHOLD = int(os.environ.get("TOOL_RAG_BYPASS_THRESHOLD", "100"))
+TOOL_RAG_BYPASS_THRESHOLD = int(os.environ.get("TOOL_RAG_BYPASS_THRESHOLD", "10"))
 
 # ERP_Unified's erp_data_tool/erp_describe_fields are plain LangChain
 # @tool functions (ERP_Unified/tools.py calls erp_client directly, no
@@ -367,12 +367,9 @@ logger.info("Using ERP_Unified as the sole ERP tool source (erp_data_tool / erp_
 tool_rag = None
 tool_map = {}
 if ALL_TOOLS:
+    logger.info("Indexing %d local agent tool(s) for retrieval...", len(ALL_TOOLS))
+    tool_rag = ToolRAG(ALL_TOOLS, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
     tool_map = {tool.name: tool for tool in ALL_TOOLS}
-    if len(ALL_TOOLS) > TOOL_RAG_BYPASS_THRESHOLD:
-        logger.info("Indexing %d local agent tool(s) for retrieval...", len(ALL_TOOLS))
-        tool_rag = ToolRAG(ALL_TOOLS, top_k=TOOL_RAG_TOP_K, min_score=TOOL_RAG_MIN_SCORE)
-    else:
-        logger.info("Skipping HuggingFace ToolRAG indexing (only %d tools).", len(ALL_TOOLS))
 else:
     logger.info("No ERP tools registered.")
 
@@ -398,21 +395,7 @@ async def lifespan(app: FastAPI):
             "PGPASSWORD/PGDATABASE in .env. Audit logging will fail until this is fixed."
         )
 
-    # Initialize AsyncSqliteSaver for persistent LangGraph memory
-    import aiosqlite
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-    
-    global agent_graph
-    # We maintain a connection pool for the lifespan of the server
-    conn = await aiosqlite.connect("checkpoints.sqlite", check_same_thread=False)
-    try:
-        saver = AsyncSqliteSaver(conn)
-        await saver.setup()
-        agent_graph = build_agent_graph(checkpointer=saver)
-        logger.info("AsyncSqliteSaver persistent memory ready.")
-        yield
-    finally:
-        await conn.close()
+    yield
 
 
 app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
@@ -421,9 +404,7 @@ app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    # The browser API calls do not use cookies. Combining credentials with a
-    # wildcard origin is needlessly fragile across browsers/proxies.
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -460,20 +441,12 @@ MAX_HISTORY_MESSAGES = 12  # messages, not tokens -- len() is used as the counte
 
 class ChatState(TypedDict):
     messages: Annotated[list, add_messages]
-    summary: str           # Rolling memory summary
     current_task: Optional[str]
     task_slots: dict
     pending_tool: Optional[str]
     pending_missing: list  # ordered [(field, question), ...] still to collect
     session_id: str        # thread id, passed through so nodes can attribute audit_log entries
     user_id: Optional[str] # who prompted this turn, passed through for the same reason
-    
-    # Multi-Agent Workflow State
-    intent_category: Optional[str]
-    extracted_entities: dict
-    research_context: Optional[str]
-    erp_context: Optional[str]
-    proposal: Optional[str]
 
 
 # Values a model sometimes invents in place of a real answer when it
@@ -933,7 +906,7 @@ async def _stream_chat_completion(messages, tools=None):
     tool_acc = {}
     content = ""
     finish_reason = None
-    async with httpx.AsyncClient(timeout=httpx.Timeout(LLM_REQUEST_TIMEOUT_SECONDS, connect=30.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(LLM_REQUEST_TIMEOUT_SECONDS, connect=10.0)) as client:
         async with client.stream("POST", url, json=data, headers=headers) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -1062,14 +1035,11 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
 
         ai_msg = AIMessage(content=content, tool_calls=tool_calls)
         call_messages.append(ai_msg)
-        history.append(ai_msg)
         for tc in tool_calls:
             yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
             result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
             yield {"type": "tool_result", "name": tc["name"], "result": result}
-            t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
-            call_messages.append(t_msg)
-            history.append(t_msg)
+            call_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
 
     content = ""
     async for event in _stream_full_reply(call_messages, tools=None):
@@ -1367,216 +1337,123 @@ def _build_fallback_chart(results: list, query_lower: str) -> Optional[str]:
     return None
 
 
-
-# --- 1. Summarize Node (Rolling Memory) ---
-def summarize_node(state: ChatState) -> dict:
-    messages = state.get("messages", [])
-    summary = state.get("summary", "")
-    
-    # If messages exceed threshold
-    if len(messages) > 10:
-        # Keep last 4 messages, summarize the rest
-        to_summarize = messages[:-4]
-        
-        prompt = (
-            f"Summarize the following conversation history. "
-            f"Include any important entities, facts, or context.\n"
-            f"Previous Summary: {summary}\n"
-            f"New Messages: {to_summarize}"
-        )
-        new_summary_msg = assistant.llm.model.invoke(prompt)
-        new_summary = new_summary_msg.content
-        
-        # Remove old messages from state
-        delete_messages = [RemoveMessage(id=m.id) for m in to_summarize if getattr(m, 'id', None)]
-        return {"summary": new_summary, "messages": delete_messages}
-    return {}
-
-# --- 2. Supervisor Node ---
-from pydantic import BaseModel
-class IntentOutput(BaseModel):
-    category: Literal["chitchat", "erp_query", "erp_write", "web_search"]
-    record_type: Optional[str]
-    entities: Dict[str, str]
-
-def supervisor_node(state: ChatState) -> dict:
-    last_user_msg = _last_human_message(state["messages"]) or ""
-    summary = state.get("summary", "")
-    
-    context_msg = f"Context: {summary}\n" if summary else ""
-    
-    from LLM.LLM import INTENT_SYSTEM_PROMPT
-    llm_intent = assistant.llm.model.with_structured_output(IntentOutput)
-    
-    intent = llm_intent.invoke([
-        SystemMessage(content=INTENT_SYSTEM_PROMPT),
-        HumanMessage(content=context_msg + last_user_msg)
-    ])
-    
-    logger.info("Intent classified: category=%s, entities=%s", intent.category, intent.entities)
-    
-    return {
-        "intent_category": intent.category,
-        "extracted_entities": intent.entities
-    }
-
-def route_from_supervisor(state: ChatState) -> str:
-    cat = state.get("intent_category")
-    if cat in ("erp_write", "web_search"):
-        return "web_research_node"
-    else:
-        return "general_node"
-
-# --- 3. Web Research Node ---
-async def web_research_node(state: ChatState) -> dict:
-    from LLM.LLM import RESEARCH_SYSTEM_PROMPT
-    entities = state.get("extracted_entities", {})
-    last_user_msg = _last_human_message(state["messages"]) or ""
-    
-    web_tools = [t for t in ALL_TOOLS if t.name in ("web_search", "web_company_lookup", "web_fetch_page")]
-    search_llm = assistant.llm.model.bind_tools(web_tools)
-    
-    call_messages = [
-        SystemMessage(content=RESEARCH_SYSTEM_PROMPT), 
-        HumanMessage(content=f"Research these entities: {entities}. Original request: {last_user_msg}")
-    ]
-    
-    for _ in range(2):
-        response = search_llm.invoke(call_messages)
-        if not response.tool_calls:
-            break
-            
-        call_messages.append(response)
-        for tc in response.tool_calls:
-            result = await _execute_tool(
-                tc["name"], tc.get("args") or {},
-                session_id=state.get("session_id"), user_id=state.get("user_id"),
-                prompt_text=last_user_msg
-            )
-            call_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-            
-    final_response = search_llm.invoke(call_messages)
-    
-    if state.get("intent_category") == "web_search":
-        return {"messages": [AIMessage(content=final_response.content)], "research_context": final_response.content}
-    return {"research_context": final_response.content}
-
-def route_after_research(state: ChatState) -> str:
-    if state.get("intent_category") == "web_search":
-        return END
-    return "erp_context_node"
-
-# --- 4. ERP Context Node ---
-async def erp_context_node(state: ChatState) -> dict:
-    entities = state.get("extracted_entities", {})
-    if not entities:
-        return {"erp_context": "No entities to lookup"}
-        
-    erp_tools = [t for t in ALL_TOOLS if t.name in ("erp_data_tool", "erp_describe_fields")]
-    context_llm = assistant.llm.model.bind_tools(erp_tools)
-    
-    prompt = (
-        "You are an internal ERP Researcher. Query the ERP system to gather context. "
-        "For example, if creating a Task assigned to a person, find their Employee ID. "
-        f"Entities: {entities}\n"
-        "Return a summary of what you found."
-    )
-    
-    call_messages = [SystemMessage(content=prompt), HumanMessage(content="Gather internal ERP context.")]
-    response = context_llm.invoke(call_messages)
-    
-    if response.tool_calls:
-        call_messages.append(response)
-        for tc in response.tool_calls:
-            result = await _execute_tool(
-                tc["name"], tc.get("args") or {},
-                session_id=state.get("session_id"), user_id=state.get("user_id")
-            )
-            call_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-        final = context_llm.invoke(call_messages)
-        return {"erp_context": final.content}
-    return {"erp_context": response.content}
-
-# --- 5. Proposal Node ---
-def proposal_node(state: ChatState) -> dict:
-    from LLM.LLM import PROPOSAL_SYSTEM_PROMPT
-    entities = state.get("extracted_entities", {})
-    research = state.get("research_context", "")
-    erp_ctx = state.get("erp_context", "")
-    
-    prop_msgs = [
-        SystemMessage(content=PROPOSAL_SYSTEM_PROMPT),
-        HumanMessage(content=f"Entities: {entities}\nWeb Research: {research}\nERP Context: {erp_ctx}")
-    ]
-    prop_response = assistant.llm.model.invoke(prop_msgs)
-    
-    doctype = entities.get("record_type", "Lead")
-    args = {"operation": "create", "doctype": doctype, "approved": True}
-    if "person" in entities: args["lead_name"] = entities["person"]
-    if "company" in entities: args["company_name"] = entities["company"]
-    if doctype == "Task" and "project" in entities: args["project"] = entities["project"]
-    
-    return {
-        "pending_tool": "erp_data_tool",
-        "task_slots": args,
-        "pending_missing": [("approval", prop_response.content)],
-        "messages": [AIMessage(content=prop_response.content)]
-    }
-
-# --- 6. General Node (Fallback / Chitchat / ERP Query) ---
-from langchain_core.messages import trim_messages
-async def general_node(state: ChatState) -> dict:
+async def agent_node(state: ChatState) -> dict:
+    """Retrieve-tools -> call-LLM -> call-tool turn, same logic as the
+    original generate_reply, now working off the trimmed short-term
+    history in state['messages'] and carrying pending_tool / task_slots
+    slot-filling flow (via state) instead of a global dict when a
+    write-tool call is missing required info."""
     last_user_msg = _last_human_message(state["messages"]) or ""
     task_context = state.get("current_task")
-    
+
+    # A review was already shown to the user. Handle their plain-language
+    # approval directly so "yes" cannot fall back into another review merely
+    # because the model omitted erp_data_tool's approved=True argument.
+    review_doctype = pending_web_review_doctype(state.get("session_id") or "default")
+    if review_doctype and _is_unqualified_approval(last_user_msg):
+        result = await _execute_tool(
+            "erp_data_tool",
+            {"operation": "create", "doctype": review_doctype, "approved": True},
+            session_id=state.get("session_id"),
+            user_id=state.get("user_id"),
+            prompt_text=last_user_msg,
+        )
+        if str(result).lower().startswith(("couldn't", "could not", "i need", "review_required")):
+            reply = f"I couldn't create the {review_doctype}: {result}"
+        else:
+            reply = (
+                f"{review_doctype} created successfully. {result}\n\n"
+                f"Next: Would you like to view this {review_doctype}, update its details, "
+                "or create a related Opportunity?"
+            )
+        return {"messages": [AIMessage(content=reply)]}
+
     history = trim_messages(
         state["messages"],
         max_tokens=MAX_HISTORY_MESSAGES,
-        token_counter=len,
+        token_counter=len,  # counts messages, not tokens -- a cheap, adequate proxy here
         strategy="last",
         include_system=False,
     )
-    
+
     if not tool_rag:
         reply = _plain_reply(history, task_context)
         return {"messages": [AIMessage(content=reply)]}
-        
-    candidate_tools = list(ALL_TOOLS) if len(ALL_TOOLS) <= TOOL_RAG_BYPASS_THRESHOLD else tool_rag.retrieve(last_user_msg)
-    
-    intent_cat = state.get("intent_category")
-    if intent_cat in ("chitchat", "erp_query"):
-        _WEB = {"web_search", "web_fetch_page", "web_crawl", "web_company_lookup"}
-        candidate_tools = [t for t in candidate_tools if t.name not in _WEB]
-        
+
+    # With only a handful of tools registered (as with ERP_Unified's
+    # erp_data_tool / erp_describe_fields), similarity-threshold retrieval
+    # does more harm than good: erp_data_tool's description is a broad,
+    # generic, multi-doctype gateway, so its embedding similarity to any
+    # ONE specific request ("create a lead for X") can dip below
+    # min_score even though it's exactly the tool needed — which then
+    # sends the turn to _plain_reply with NO tools bound at all, and the
+    # model correctly (but unhelpfully) says it can't perform actions.
+    # ToolRAG's filtering was built for larger tool lists where binding
+    # everything confuses smaller local models; below this threshold just
+    # bind every registered tool every turn instead of retrieving.
+    if len(ALL_TOOLS) <= TOOL_RAG_BYPASS_THRESHOLD:
+        candidate_tools = list(ALL_TOOLS)
+    else:
+        retrieval_query = f"{task_context}. {last_user_msg}" if task_context else last_user_msg
+        candidate_tools = tool_rag.retrieve(retrieval_query)
+    if not candidate_tools:
+        reply = _plain_reply(history, task_context)
+        return {"messages": [AIMessage(content=reply)]}
+
+    logger.info("Tools selected for query: %s", [t.name for t in candidate_tools])
+
     llm_with_tools = assistant.llm.model.bind_tools(candidate_tools)
     import datetime
     current_date_str = datetime.date.today().strftime("%Y-%m-%d")
     system_parts = [
         assistant.llm.system_prompt,
-        f"\nCURRENT SYSTEM DATE: {current_date_str}",
+        f"\nCURRENT SYSTEM DATE: {current_date_str}. Use this date when calculating date ranges for 'last 3 months', 'this month', or 'recent' records.",
         "\nSENIOR ERP EXPERT & BUSINESS INTELLIGENCE DIRECTIVE:",
-        "- You are an expert ERP Analyst. Automatically generate charts for tabular data without asking.",
-        "- ALWAYS retrieve records using erp_data_tool before charting.",
-        "- PROACTIVE PROPOSALS: When the user describes a business scenario (e.g., building a dashboard), proactively extract details into structured fields (Project, Objective, Technology), present a formatted proposal, and ask 'Should I create this Project?'. Do NOT call the tool during the proposal.",
-        "- FAST-TRACK CREATION: When the user confirms your proposal, you MUST call erp_data_tool with the extracted data and set `approved=True` to create it immediately without a second review."
+        "- You are an expert ERP & Data Analyst. Think contextually about when visual charts add true executive value.",
+        "- PROACTIVELY & AUTOMATICALLY generate visual charts (`create_bar_chart`, `create_pie_chart`, or `create_line_chart`) whenever the query involves tabular datasets, list overviews, status breakdowns, multi-record sales/purchase summaries, inventory counts, or financial trends — WITHOUT requiring the user to explicitly ask for 'chart' or 'graph'.",
+        "- For single-record lookups (e.g. details of one specific order 'SAL-ORD-2026-00001'), single entity details, or general guidance questions, provide a clean executive response without forcing an unnecessary chart.",
+        "\nEXECUTIVE REPORTING & FORMATTING STANDARDS:",
+        "For all multi-record data responses, structure your output with clear headers:",
+        "1. ### Executive Summary: High-level narrative with total metrics in bold (e.g. **₹6,43,000** or **6 orders**), completion percentages (e.g. **83%**), top customer/item contribution with percentage share, and operational insights.",
+        "2. ### Order Breakdown (or ### Data Table): Clean, aligned Markdown table. All financial columns MUST include currency symbols (e.g. **₹20,000**), and dates MUST be cleanly formatted (e.g. 2026-08-05).",
+        "3. Interactive Visual Spec: Embed the matching ```chart JSON block for any summary, list, or status comparison query.",
+        "\nCHARTING & DATA REPORTING INSTRUCTIONS:",
+        "- When generating charts, call the appropriate chart tool (`create_bar_chart`, `create_line_chart`, or `create_pie_chart`).",
+        "- For bar charts (e.g. comparing sales revenue by customer), call `create_bar_chart` with x_axis_data (customer names) and series_data (revenue values).",
+        "- For status distributions, call `create_pie_chart` with labels (status names) and values (counts).",
+        "- For timeline trends over months/dates, call `create_line_chart` with x_axis_data (dates/months) and series_data (amounts).",
+        "- Always retrieve real records from ERPNext using `erp_data_tool` first before generating charts or summaries.",
+        "- When querying sales data with `erp_data_tool`, ALWAYS use `doctype='Sales Order'` (do NOT pass fieldnames like 'transaction_date' or 'grand_total' as the doctype parameter).",
+        "\nPUBLIC-WEB RESEARCH DIRECTIVE:",
+        "- For current public-web information, call `web_search`, then `web_fetch_page` when a full source page is needed.",
+        "- For a company's verified public website or contact details, call `web_company_lookup`; never guess missing values.",
+        "- Use `web_crawl` only when the user asks to inspect several related pages from a site."
     ]
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
-        
     call_messages = [SystemMessage(content="\n".join(system_parts)), *history]
-    
+
     response = llm_with_tools.invoke(call_messages)
-    if not response.tool_calls:
-        # Check for fake tool calls
+
+    tool_calls = response.tool_calls
+    is_recovered = False
+    if not tool_calls:
         recovered = _extract_fake_tool_call(response.content)
         if not recovered:
             return {"messages": [response]}
-        response.tool_calls = [recovered]
-        
+        logger.warning(
+            "Model returned a text-shaped fake tool call instead of a real "
+            "one; recovered '%s' from it: %s", recovered["name"], recovered["args"]
+        )
+        tool_calls = [recovered]
+        is_recovered = True
+
     call_messages.append(response)
-    results = []
-    
-    for tool_call in response.tool_calls:
+
+    # If a write-tool call is missing required info, open a slot-filling
+    # flow instead of calling it or letting the model guess a value. Only
+    # one flow runs at a time, so the first offending call wins.
+    for tool_call in tool_calls:
         tool_name = tool_call["name"]
         if tool_name in ALL_REQUIRED_FIELDS:
             args = _sanitize_tool_args(tool_name, tool_call.get("args") or {})
@@ -1589,19 +1466,99 @@ async def general_node(state: ChatState) -> dict:
                     "pending_missing": missing,
                     "messages": [AIMessage(content=missing[0][1])],
                 }
-    
-    for tool_call in response.tool_calls:
+
+    results = []
+    for tool_call in tool_calls:
         result = await _execute_tool(
             tool_call["name"], tool_call.get("args") or {},
-            session_id=state.get("session_id"), user_id=state.get("user_id"), prompt_text=last_user_msg
+            session_id=state.get("session_id"), user_id=state.get("user_id"),
+            prompt_text=last_user_msg,
         )
+        logger.info("Tool '%s' raw result: %s", tool_call["name"], result)
         results.append((tool_call, result))
-        call_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
-        
-    final_response = llm_with_tools.invoke(call_messages)
-    return {"messages": [final_response]}
 
-# --- 7. Graph Definition ---
+    if not is_recovered:
+        # Keep tools available while processing their results. Some requests
+        # legitimately need more than one step, for example:
+        # erp_describe_fields -> erp_data_tool(list). Execute every emitted
+        # call before returning and persist only the final text response, so
+        # short-term history can never contain an orphaned tool call.
+        for tool_call, result in results:
+            call_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
+
+        max_followup_rounds = 4
+        for round_number in range(max_followup_rounds + 1):
+            final_response = llm_with_tools.invoke(call_messages)
+            followup_calls = final_response.tool_calls
+            if not followup_calls:
+                break
+
+            if round_number == max_followup_rounds:
+                logger.warning("Tool-call round limit reached; composing a final response.")
+                final_response = assistant.llm.model.invoke(call_messages)
+                break
+
+            call_messages.append(final_response)
+            for tool_call in followup_calls:
+                result = await _execute_tool(
+                    tool_call["name"], tool_call.get("args") or {},
+                    session_id=state.get("session_id"), user_id=state.get("user_id"),
+                    prompt_text=last_user_msg,
+                )
+                logger.info("Tool '%s' raw result: %s", tool_call["name"], result)
+                results.append((tool_call, result))
+                call_messages.append(
+                    ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+                )
+
+        # Clean up any raw tool-argument JSON leaks (e.g. {"type": "bar", "x_axis_data": [...], "series_data": [...]})
+        if final_response.content:
+            cleaned_content = re.sub(
+                r'```(?:json)?\s*\{[\s\S]*?"(?:x_axis_data|series_data)"[\s\S]*?\}\s*```',
+                '',
+                final_response.content
+            )
+            lines = []
+            in_chart_block = False
+            for line in cleaned_content.splitlines():
+                if "```chart" in line:
+                    in_chart_block = True
+                elif "```" in line and in_chart_block:
+                    in_chart_block = False
+
+                if not in_chart_block and ('"x_axis_data"' in line or '"series_data"' in line):
+                    continue
+                lines.append(line)
+            final_response.content = "\n".join(lines).strip()
+
+        # 1. Auto-append executed chart tool result if missing from final response
+        chart_tool_names = {"create_bar_chart", "create_line_chart", "create_pie_chart"}
+        for tool_call, result in results:
+            if tool_call["name"] in chart_tool_names:
+                res_str = str(result)
+                if "```chart" in res_str and "```chart" not in (final_response.content or ""):
+                    final_response.content = (final_response.content or "").strip() + "\n\n" + res_str.strip()
+
+        # 2. Fallback guarantee: if list/summary query produced data but no chart block, build one automatically
+        if "```chart" not in (final_response.content or ""):
+            fallback = _build_fallback_chart(results, last_user_msg.lower())
+            if fallback:
+                logger.info("Auto-charting fallback injected chart into final response.")
+                final_response.content = (final_response.content or "").strip() + fallback
+
+        return {"messages": [final_response]}
+
+    # Recovered fake tool call: there's no real AIMessage.tool_calls entry
+    # to attach a ToolMessage to. Summarize the result directly instead —
+    # same approach used to close out a slot-filling flow.
+    summary_prompt = "\n".join(
+        f"The '{tc['name']}' tool was just called with {tc.get('args')} and returned: {result}"
+        for tc, result in results
+    ) + "\nGive the user a short, professional confirmation (1-2 sentences)."
+    summary = text_chain.invoke({"input": summary_prompt})
+    return {"messages": [AIMessage(content=summary)]}
+
+
 async def execute_pending_node(state: ChatState) -> dict:
     """Runs the write tool once every required field has been collected
     across turns, then clears the slot-filling state (current_task is
@@ -1629,50 +1586,30 @@ async def execute_pending_node(state: ChatState) -> dict:
         "pending_missing": [],
     }
 
+
 def build_agent_graph(checkpointer=None, use_platform_persistence=False):
     graph = StateGraph(ChatState)
     graph.add_node("intake", intake_node)
     graph.add_node("classify_task", classify_task_node)
-    
-    graph.add_node("summarize_node", summarize_node)
-    graph.add_node("supervisor_node", supervisor_node)
-    graph.add_node("web_research_node", web_research_node)
-    graph.add_node("erp_context_node", erp_context_node)
-    graph.add_node("proposal_node", proposal_node)
-    graph.add_node("general_node", general_node)
-    
+    graph.add_node("agent", agent_node)
     graph.add_node("execute_pending", execute_pending_node)
 
     graph.set_entry_point("intake")
-    
-    def route_intake(state):
-        if state.get("pending_missing"):
-            return "execute_pending"
-        return "classify_task"
-        
-    graph.add_conditional_edges("intake", route_intake, {"execute_pending": "execute_pending", "classify_task": "classify_task"})
-    graph.add_edge("classify_task", "summarize_node")
-    graph.add_edge("summarize_node", "supervisor_node")
-    
-    graph.add_conditional_edges("supervisor_node", route_from_supervisor, {"web_research_node": "web_research_node", "general_node": "general_node"})
-    
-    graph.add_conditional_edges("web_research_node", route_after_research, {END: END, "erp_context_node": "erp_context_node"})
-    graph.add_edge("erp_context_node", "proposal_node")
-    
-    graph.add_edge("proposal_node", END)
-    graph.add_edge("general_node", END)
+    graph.add_conditional_edges(
+        "intake", _route_after_intake, {END: END, "execute_pending": "execute_pending", "classify_task": "classify_task"}
+    )
+    graph.add_edge("classify_task", "agent")
+    graph.add_edge("agent", END)
     graph.add_edge("execute_pending", END)
 
     if use_platform_persistence:
+        # LangGraph Studio / `langgraph dev` manage checkpointing
+        # themselves and error out if the graph already has one baked in.
         return graph.compile()
-        
-    if checkpointer is None:
-        from langgraph.checkpoint.memory import MemorySaver
-        checkpointer = MemorySaver()
-        
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile(checkpointer=checkpointer or MemorySaver())
 
-agent_graph = build_agent_graph()  # defaults to MemorySaver until lifespan overrides it
+
+agent_graph = build_agent_graph()  # used by your FastAPI server, unchanged
 
 
 def build_studio_graph():
@@ -1822,68 +1759,32 @@ async def chat(req: ChatRequest):
 
     return {"reply": reply, "audio": audio_b64}
 
-async def load_stream_history(session_id: str) -> list:
-    import aiosqlite, json
-    from langchain_core.messages import messages_from_dict
-    async with aiosqlite.connect("stream_history.sqlite") as conn:
-        await conn.execute("CREATE TABLE IF NOT EXISTS stream_history (session_id TEXT PRIMARY KEY, history TEXT)")
-        async with conn.execute("SELECT history FROM stream_history WHERE session_id = ?", (session_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                try:
-                    return messages_from_dict(json.loads(row[0]))
-                except Exception:
-                    pass
-    return []
-
-async def save_stream_history(session_id: str, history: list):
-    import aiosqlite, json
-    from langchain_core.messages import messages_to_dict
-    async with aiosqlite.connect("stream_history.sqlite") as conn:
-        await conn.execute("CREATE TABLE IF NOT EXISTS stream_history (session_id TEXT PRIMARY KEY, history TEXT)")
-        hist_str = json.dumps(messages_to_dict(history))
-        await conn.execute("INSERT OR REPLACE INTO stream_history (session_id, history) VALUES (?, ?)", (session_id, hist_str))
-        await conn.commit()
+_stream_histories: dict = {}
 
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest):
     """SSE variant of /api/chat for token-by-token terminal streaming with
     inline tool-call/tool_result markers, same event shape /ws/voice uses.
-    Keeps its own per-session_id history (backed by stream_history.sqlite) 
-    so this is purely additive."""
+    Keeps its own per-session_id history (separate from the LangGraph
+    checkpointer /api/chat uses) so this is purely additive."""
     from fastapi.responses import StreamingResponse
 
     text = (req.message or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="message is required")
 
-    history = await load_stream_history(req.session_id)
+    history = _stream_histories.setdefault(req.session_id, [])
 
     async def event_gen():
-        # Flush the SSE response and its CORS headers through Dev Tunnels
-        # before the agent/tool pipeline starts. Visualisation tools can take
-        # long enough that the tunnel otherwise produces its own timeout
-        # response, which the browser misleadingly reports as a CORS failure.
-        yield ": connected\n\n"
         try:
             async for event in stream_agent_turn(text, session_id=req.session_id, user_id=req.user_id, history=history):
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as exc:  # noqa: BLE001
             logger.exception("Streaming agent turn failed: %s", text)
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
-        finally:
-            await save_stream_history(req.session_id, history)
-            
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(
-        event_gen(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 @app.post("/query")
 async def handle_query(

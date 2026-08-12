@@ -199,6 +199,17 @@ def _resolve_assignee(identifier: str) -> Dict[str, Any]:
     if _EMAIL_RE.match(identifier):
         return {"user": identifier}
 
+    # 1. Try fetching exact Employee by ID (e.g. HR-EMP-0001)
+    try:
+        emp = erp_client.get_doc("Employee", identifier)
+        if emp and emp.get("user_id"):
+            return {"user": emp["user_id"]}
+        elif emp:
+            return {"error": f"Employee '{identifier}' found but has no linked User ID (system login)."}
+    except Exception:
+        pass  # Not an exact Employee ID, proceed to search
+
+    # 2. Try searching User by full name
     try:
         matches = erp_client.get_list(
             "User",
@@ -210,13 +221,35 @@ def _resolve_assignee(identifier: str) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         return {"error": f"could not look up ERPNext user '{identifier}': {exc}"}
 
-    if not matches:
-        return {"error": f"no ERPNext user found matching '{identifier}'"}
-    if len(matches) > 1:
-        names = ", ".join(f"{m.get('full_name')} <{m.get('name')}>" for m in matches)
-        return {"error": f"'{identifier}' matches more than one ERPNext user ({names}) -- use their exact email instead"}
+    if matches:
+        if len(matches) > 1:
+            names = ", ".join(f"{m.get('full_name')} <{m.get('name')}>" for m in matches)
+            return {"error": f"'{identifier}' matches more than one ERPNext user ({names}) -- use exact email"}
+        return {"user": matches[0]["name"]}
 
-    return {"user": matches[0]["name"]}
+    # 3. If no User matches, try searching Employee by employee_name
+    try:
+        emp_matches = erp_client.get_list(
+            "Employee",
+            fields=["name", "employee_name", "user_id"],
+            filters=[["employee_name", "like", f"%{identifier}%"], ["status", "=", "Active"]],
+            limit=5,
+            use_cache=False,
+        )
+    except Exception as exc:
+        return {"error": f"no User found, and Employee lookup failed: {exc}"}
+
+    if not emp_matches:
+        return {"error": f"no ERPNext User or active Employee found matching '{identifier}'"}
+    if len(emp_matches) > 1:
+        names = ", ".join(f"{m.get('employee_name')} <{m.get('name')}>" for m in emp_matches)
+        return {"error": f"'{identifier}' matches more than one Employee ({names})"}
+    
+    user_id = emp_matches[0].get("user_id")
+    if not user_id:
+        return {"error": f"Employee '{emp_matches[0].get('employee_name')}' found but has no linked User ID."}
+        
+    return {"user": user_id}
 
 
 def _check_required(doctype: str, data: dict) -> Optional[str]:
@@ -475,7 +508,154 @@ def onboard_new_lead(
         else:
             summary.append(f"- Client email sent to {', '.join(recipients)}.")
 
+
+@tool
+def batch_manage_project_tasks(
+    project_name: str,
+    tasks: List[Dict[str, Any]],
+    notify_assignees: bool = True,
+    dry_run: bool = True,
+) -> str:
+    """Creates and assigns multiple Tasks to an existing ERPNext Project in one action.
+    Use this to assign tasks in batch rather than calling erp_data_tool iteratively.
+
+    `project_name` is the exact Project ID/name (e.g. 'PROJ-0001').
+
+    `tasks` is a list of dicts, one per Task to create, each with:
+      - "subject" (required): short task title, e.g. "Kickoff call".
+      - "assigned_to" (required): the team member's exact ERPNext email,
+        OR a plain name (e.g. "Rahul Sharma") which this tool will try
+        to resolve to exactly one matching ERPNext user.
+      - "due_date" (optional, YYYY-MM-DD): sets the task's exp_end_date
+        and the assignment's ToDo due date.
+      - "priority" (optional): "Low" | "Medium" | "High" | "Urgent",
+        defaults to "Medium".
+      - "description" (optional): longer note, becomes both the Task
+        description and the assignee's ToDo note.
+
+    IMPORTANT: `dry_run` defaults to True. A dry run validates every Task and
+    assignee and returns a full preview WITHOUT creating or assigning anything.
+    Show this preview to the user first. Only call again with dry_run=False
+    after explicit confirmation to actually perform it."""
+
+    if not project_name or not project_name.strip():
+        return "A Project name/ID is required."
+    if not tasks:
+        return "At least one task is required (each with 'subject' and 'assigned_to')."
+
+    # 1. Resolve Project
+    p_name = project_name.strip()
+    try:
+        # First try fetching by the exact ID (e.g., PROJ-0001)
+        project = erp_client.get_doc("Project", p_name)
+    except Exception:
+        # If that fails, try searching by the readable project_name
+        try:
+            matches = erp_client.get_list(
+                "Project",
+                fields=["name"],
+                filters=[["project_name", "like", f"%{p_name}%"]],
+                limit=2,
+            )
+            if not matches:
+                return f"Could not find any Project matching '{p_name}'."
+            if len(matches) > 1:
+                return f"Found multiple Projects matching '{p_name}'. Please provide the exact Project ID (e.g. PROJ-XXXX)."
+            project = erp_client.get_doc("Project", matches[0]["name"])
+        except Exception as search_exc:
+            return explain_erp_error(search_exc, context=f"search for Project '{p_name}'")
+    
+    project_company = project.get("company")
+
+    # 2. Resolve every assignee up front
+    resolved_tasks = []
+    for i, t in enumerate(tasks, start=1):
+        if not (t or {}).get("subject"):
+            return f"Task #{i} is missing 'subject'."
+        if not (t or {}).get("assigned_to"):
+            return f"Task #{i} ('{t.get('subject')}') is missing 'assigned_to'."
+
+        assignee = _resolve_assignee(str(t["assigned_to"]))
+        task_data = {
+            "subject": t["subject"],
+            "priority": t.get("priority") or "Medium",
+            "description": t.get("description") or "",
+            "project": project.get("name"),
+        }
+        if t.get("due_date"):
+            task_data["exp_end_date"] = t["due_date"]
+        if project_company:
+            task_data["company"] = project_company
+        task_data = _fill_default_company("Task", task_data)
+        
+        task_issue = _check_required("Task", task_data)
+        resolved_tasks.append({
+            "input": t, "task_data": task_data,
+            "assignee": assignee, "task_issue": task_issue,
+        })
+
+    # 3. Dry run
+    if dry_run:
+        lines = [f"DRY RUN -- nothing has been created or assigned yet. Plan for Project '{project.get('name')}':", ""]
+        for i, rt in enumerate(resolved_tasks, start=1):
+            td, a, issue = rt["task_data"], rt["assignee"], rt["task_issue"]
+            line = f"{i}. Create Task '{td['subject']}'"
+            if issue:
+                line += f" -- WILL FAIL: {issue}"
+            elif "error" in a:
+                line += f" -- will be created UNASSIGNED ({a['error']})"
+            else:
+                due = f", due {td.get('exp_end_date')}" if td.get("exp_end_date") else ""
+                line += f", assign to {a['user']}{due}, priority {td['priority']}"
+            lines.append(line)
+        lines.append("")
+        lines.append("Call this again with dry_run=False (after confirming with the user) to actually run it.")
+        return "\n".join(lines)
+
+    # 4. Real run
+    summary = [f"Batch task creation for Project '{project.get('name')}' completed:"]
+    for rt in resolved_tasks:
+        td, a, issue = rt["task_data"], rt["assignee"], rt["task_issue"]
+        subject = td["subject"]
+
+        if issue:
+            summary.append(f"- Task '{subject}' NOT created: {issue}")
+            continue
+
+        def create_task(td=td):
+            return erp_client.create_doc("Task", td)
+
+        task_result = _safe_call(f"create Task '{subject}'", create_task)
+        if isinstance(task_result, str):
+            summary.append(f"- Task '{subject}' NOT created: {task_result}")
+            continue
+        task_id = task_result.get("name")
+
+        if "error" in a:
+            summary.append(f"- Task '{subject}' ({task_id}) created but NOT assigned: {a['error']}")
+            continue
+
+        def do_assign(task_id=task_id, td=td, a=a):
+            payload = {
+                "assign_to": [a["user"]],
+                "doctype": "Task",
+                "name": task_id,
+                "description": td.get("description") or "",
+                "priority": td.get("priority") or "Medium",
+                "notify": 1 if notify_assignees else 0,
+            }
+            if td.get("exp_end_date"):
+                payload["date"] = td["exp_end_date"]
+            return erp_client.call_method_post("frappe.desk.form.assign_to.add", payload)
+
+        assign_result = _safe_call(f"assign Task '{subject}' to {a['user']}", do_assign)
+        if isinstance(assign_result, str) and assign_result.startswith("Couldn't"):
+            summary.append(f"- Task '{subject}' ({task_id}) created but assignment FAILED: {assign_result}")
+        else:
+            due_note = f", due {td['exp_end_date']}" if td.get("exp_end_date") else ""
+            summary.append(f"- Task '{subject}' ({task_id}) created and assigned to {a['user']}{due_note}.")
+
     return "\n".join(summary)
 
 
-PROJECT_ONBOARDING_TOOLS = [onboard_new_lead]
+PROJECT_ONBOARDING_TOOLS = [onboard_new_lead, batch_manage_project_tasks]

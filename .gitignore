@@ -92,3 +92,4 @@ output.wav
 cookies.txt
 
 *.db
+checkpoints.sqlite*

@@ -269,7 +269,7 @@ class ERPClient:
     # Low-level requests
     # ---------------------------------------------------------------
 
-    def get_list(self, doctype, fields=None, filters=None, order_by=None, limit=20, use_cache=True):
+    def get_list(self, doctype, fields=None, filters=None, or_filters=None, order_by=None, limit=20, use_cache=True):
         """Fetch a list of documents for a doctype:
         GET /api/resource/<Doctype>?fields=[...]&filters=[...]&limit_page_length=N
 
@@ -280,7 +280,7 @@ class ERPClient:
         if not self.base_url:
             raise RuntimeError("ERP_URL is not configured.")
 
-        cache_key = ("list", self._identity_tag(), doctype, json.dumps(fields), json.dumps(filters), order_by, limit)
+        cache_key = ("list", self._identity_tag(), doctype, json.dumps(fields), json.dumps(filters), json.dumps(or_filters), order_by, limit)
         if use_cache:
             cached = self._cache_get(cache_key)
             if cached is not None:
@@ -291,6 +291,8 @@ class ERPClient:
             params["fields"] = json.dumps(fields)
         if filters:
             params["filters"] = json.dumps(filters)
+        if or_filters:
+            params["or_filters"] = json.dumps(or_filters)
         if order_by:
             params["order_by"] = order_by
 
