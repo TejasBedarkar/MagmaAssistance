@@ -3,7 +3,7 @@ name: Deploy MagmaAssistance Backend
 on:
   push:
     branches:
-      - Development
+      - beta
 
 jobs:
   deploy:
@@ -25,15 +25,17 @@ jobs:
             cd /home/ubuntu/MagmaAssistance
 
             git fetch origin
-            git checkout Development
-            git pull origin Development
+            git checkout beta
+            git pull origin beta
 
             source venv/bin/activate
 
             pip install -r requirements.txt
 
             sudo systemctl restart magmaassistance.service
+            sudo systemctl restart magma-voice.service
 
             sudo systemctl status magmaassistance.service --no-pager
+            sudo systemctl status magma-voice.service --no-pager
 
-            echo "Deployment completed successfully."
+            echo "MagmaAssistance beta deployment completed successfully."
