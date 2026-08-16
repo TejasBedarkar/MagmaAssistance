@@ -18,6 +18,7 @@ import json
 import logging
 from dotenv import load_dotenv
 import fitz  # PyMuPDF: For converting PDF pages to PNG images
+from ERP.doctype_knowledge import KNOWLEDGE_BASE
 
 try:
     from langsmith import traceable
@@ -62,12 +63,14 @@ INTENT_SYSTEM_PROMPT = (
 RESEARCH_SYSTEM_PROMPT = (
     "You are a dedicated Web Research Agent for a business ERP system.\n"
     "Your sole job is to gather COMPREHENSIVE business profiles for Leads, Customers, or Competitors.\n\n"
-    "You have access to: `web_search`, `web_fetch_page`, and `web_company_lookup`.\n\n"
+    "You have access to: `web_search`, `web_fetch_page`, `web_company_search`, and `web_company_extract`.\n\n"
     "RESEARCH STRATEGY (follow this exact sequence):\n"
-    "1. FIRST: Call `web_company_lookup` with the company name to find their official website, email, phone.\n"
-    "2. THEN: Call `web_search` for '[Company Name] [Person Name] designation role' to find the person's position/title.\n"
-    "3. IF NEEDED: Call `web_search` for '[Company Name] industry sector headquarters location' for additional context.\n"
-    "4. IF key info is missing: Call `web_fetch_page` on the company's official website or contact page.\n\n"
+    "1. FIRST: Call `web_company_search` with the company name to find candidate official websites.\n"
+    "2. PRESENT: Ask the user to confirm the correct URL.\n"
+    "3. SECOND: Call `web_company_extract` on the confirmed URL to extract email, phone, and description.\n"
+    "4. IF NEEDED: Call `web_search` for '[Company Name] [Person Name] designation role' to find the person's position/title.\n"
+    "5. IF NEEDED: Call `web_search` for '[Company Name] industry sector headquarters location' for additional context.\n"
+    "6. IF key info is missing: Call `web_fetch_page` on the company's official website or contact page.\n\n"
     "WHAT TO FIND:\n"
     "- Official website URL\n"
     "- Contact email (from mailto: links, not guessed)\n"
@@ -126,7 +129,7 @@ GENERAL_ERP_PROMPT = (
     "- NEVER for greetings, chitchat, unclear phrases, or ambiguous requests.\n"
     "- If the user says something vague like 'search X', ask: 'What specifically about X would you like me to look up?'\n"
     "- Use ERP tools for EVERYTHING about the company's own data.\n"
-    "- **EXCEPTION**: If you are asked to create a Lead, Customer, or Contact, and you lack their website, email, or phone number, YOU MUST USE `web_company_lookup` and `web_search` to find these details BEFORE calling `erp_data_tool`.\n\n"
+    "- **EXCEPTION**: If you are asked to create a Lead, Customer, or Contact, and you lack their website, email, or phone number, YOU MUST USE `web_company_search` and `web_company_extract` to find these details BEFORE calling `erp_data_tool`.\n\n"
 
     "GREETING/CHITCHAT:\n"
     "- If the user says hi, hello, or anything casual, reply warmly in ONE short sentence.\n"
@@ -147,6 +150,9 @@ GENERAL_ERP_PROMPT = (
     "- You have access to a rich metadata system through the `erp_describe_fields` tool.\n"
     "- ALWAYS call `erp_describe_fields` when working with a new Doctype.\n"
     "- Read and strictly follow the 'CRITICAL BUSINESS LOGIC' section appended to the bottom of the schema.\n\n"
+
+    "CRITICAL GLOBAL BUSINESS LOGIC:\n"
+    f"{json.dumps(KNOWLEDGE_BASE, indent=2)}\n\n"
 
     "RESPONSE STYLE:\n"
     "- Be concise. Answer directly in 1-4 sentences.\n"

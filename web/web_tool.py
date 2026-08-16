@@ -387,232 +387,91 @@ def _find_contact_page_link(soup: BeautifulSoup, base_url: str) -> Optional[str]
     return None
 
 
-# Per-process cache keyed by normalized company name, so a rate-limited
-# or already-answered lookup doesn't get re-run (and potentially fail
-# differently) later in the same conversation/flow -- e.g. right after
-# the agent already ran this once and the user then supplies one of the
-# still-missing fields manually, it should NOT trigger a second live
-# search. Cleared on process restart, same tradeoff as every other
-# in-memory store in this app (_PENDING_CREATES, MemorySaver, etc.).
-_LOOKUP_CACHE: dict[str, str] = {}
-_LOOKUP_ATTEMPTS: dict[str, int] = {}
-_MAX_RESEARCH_ATTEMPTS = 3
-
-
 @tool
-def web_company_lookup(company_name: str, search_hint: Optional[str] = None, refresh: bool = False) -> str:
-    """Looks up a real company's PUBLIC contact info on the web to help
-    pre-fill an ERP record (Lead, Customer, etc.) when the user gives
-    just a company name -- e.g. 'create a lead for Infosys'. Finds the
-    company's own official website (never a Wikipedia/LinkedIn/news/
-    directory result), then reads its homepage -- and its "Contact"
-    page too, if the homepage itself has no direct contact link -- for
-    a published email address and phone number (from mailto:/tel: links
-    only, never guessed) plus a short site description. Returns ONLY
-    what it verifiably finds, clearly labeled, and says 'not found' for
-    anything it can't confirm -- it never invents a value or a
-    workaround. Call this AT MOST ONCE per company per task: if it
-    already ran for this company earlier in the conversation, reuse
-    that result instead of calling it again (it's cached automatically
-    either way, but don't rely on that -- treat one lookup as final).
-    After calling this, use only the fields it found to fill in
-    erp_data_tool's `data`, tell the user which fields were auto-filled
-    from the web, and ask the user directly for whatever it reports as
-    'not found' -- report 'not found' as exactly that, never rephrase it
-    into something that sounds like a real answer. If the user says the
-    previous result was wrong, call again with their correction in
-    `search_hint` and `refresh=True` (for example, search_hint='India
-    corporate office phone'). It performs at most three researched attempts
-    for the same company; after that it asks the user directly for the
-    unresolved value instead of repeatedly searching."""
-
+def web_company_search(company_name: str, search_hint: Optional[str] = None) -> str:
+    """Find candidate websites for a company.
+    Uses search to find the official website.
+    You MUST present the top options to the user to confirm the correct one.
+    Do NOT guess. If they all seem wrong, ask the user for an industry or region hint to refine the search.
+    """
     name = (company_name or "").strip()
     if not name:
         return "Please provide a company name to look up."
-
+        
     hint = (search_hint or "").strip()
-    cache_key = f"{name.lower()}|{hint.lower()}"
-    company_key = name.lower()
-    if not refresh and cache_key in _LOOKUP_CACHE:
-        return _LOOKUP_CACHE[cache_key]
+    query = f"{name} {hint} official website".strip()
+    
+    search_results = []
+    if _tavily_client:
+        try:
+            resp = _tavily_client.search(query=query, max_results=5, search_depth="basic")
+            search_results = resp.get("results", [])
+        except Exception:
+            pass
+            
+    if not search_results:
+        try:
+            resp = requests.get(
+                f"{_SEARXNG_URL}/search",
+                params={"q": query, "format": "json"},
+                timeout=_REQUEST_TIMEOUT
+            )
+            resp.raise_for_status()
+            search_results = resp.json().get("results", [])[:5]
+        except Exception:
+            return "Web search unavailable."
+            
+    if not search_results:
+        return f"No websites found for '{name}'."
+        
+    lines = [f"Top candidate websites for '{name}':"]
+    for i, r in enumerate(search_results, 1):
+        url = r.get("url", "")
+        if _is_non_official_host(urlparse(url).netloc):
+            continue
+        lines.append(f"{i}. {r.get('title', '')}\n   URL: {url}\n   {r.get('content', '')[:150]}...")
+        
+    lines.append("\nAsk the user to confirm which URL is correct. Once confirmed, use `web_company_extract` on that URL.")
+    return "\n".join(lines)
 
-    attempts = _LOOKUP_ATTEMPTS.get(company_key, 0)
-    if not refresh:
-        # The original lookup is research attempt one. Subsequent corrected
-        # searches may run twice more before we ask the user directly.
-        _LOOKUP_ATTEMPTS.setdefault(company_key, 1)
-        attempts = _LOOKUP_ATTEMPTS[company_key]
-    if refresh and attempts >= _MAX_RESEARCH_ATTEMPTS:
-        return (
-            f"Web research for '{name}' has already been refined {_MAX_RESEARCH_ATTEMPTS} times. "
-            f"Please ask the user directly for the specific value still needed"
-            f"{f' ({hint})' if hint else ''}."
-        )
-    if refresh:
-        _LOOKUP_ATTEMPTS[company_key] = attempts + 1
-
-    def run():
-        query = f"{name} {hint} official website contact email phone".strip()
-
-        # ── Primary: Tavily company search ───────────────────────────────
-        search_results_urls = []
-        if _tavily_client:
+@tool
+def web_company_extract(url: str) -> str:
+    """Scrape contact details (email, phone, description) from an officially confirmed website URL.
+    Call this ONLY after the user has confirmed the correct company URL from `web_company_search`.
+    """
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except Exception as e:
+        return f"Could not reach {url}: {e}"
+        
+    soup = BeautifulSoup(resp.text, "html.parser")
+    emails, phones = _extract_contacts(soup)
+    
+    description = ""
+    meta = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+    if meta and meta.get("content"):
+        description = meta["content"].strip()[:300]
+        
+    if not emails and not phones:
+        contact_url = _find_contact_page_link(soup, url)
+        if contact_url:
             try:
-                resp = _tavily_client.search(
-                    query=query,
-                    max_results=8,
-                    include_answer=False,
-                    search_depth="advanced",
-                )
-                search_results_urls = [
-                    r.get("url") for r in resp.get("results", []) if r.get("url")
-                ]
-                logger.info("Tavily returned %d URLs for '%s'", len(search_results_urls), name)
-            except Exception as exc:
-                logger.warning("Tavily company lookup failed (%s) — falling back to SearXNG.", exc)
-
-        # ── Fallback: SearXNG ────────────────────────────────────────────
-        if not search_results_urls:
-            try:
-                resp = requests.get(
-                    f"{_SEARXNG_URL}/search",
-                    params={"q": query, "format": "json"},
-                    timeout=_REQUEST_TIMEOUT
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                search_results_urls = [
-                    r.get("url") for r in data.get("results", [])[:8] if r.get("url")
-                ]
-            except Exception as exc:
-                logger.warning("web_company_lookup SearXNG fallback also failed for %r: %s", name, exc)
-                return f"Web search is temporarily unavailable. Ask the user for {name}'s contact details directly."
-
-        if not search_results_urls:
-            return f"No official website found for '{name}'. Ask the user for contact details directly."
-
-        results = [{"url": u} for u in search_results_urls]
-
-        # Drop directories/social/news/reference hosts outright -- these
-        # rank highly for almost any company but are never its own site.
-        results = [
-            r for r in results
-            if not _is_non_official_host(urlparse(r.get("url") or "").netloc)
-        ]
-        if not results:
-            return f"No official website found for '{name}'. Ask the user for contact details directly."
-
-        # Prefer a result whose registrable domain matches the company
-        # name closely (e.g. 'infosys.com' for 'Infosys'), not just any
-        # substring match anywhere in the hostname.
-        target_slug = _slug(name)
-
-        def score(r):
-            netloc = urlparse(r.get("url") or "").netloc
-            domain = _slug(_registrable_domain(netloc))
-            if target_slug and (domain == target_slug or domain.startswith(target_slug[:6])):
-                return 0
-            return 1
-
-        results.sort(key=score)
-        candidates = [
-            r.get("url")
-            for r in results[:_LOOKUP_CANDIDATE_PAGES]
-            if r.get("url")
-        ]
-
-        emails, phones = [], []
-        official_url, description = None, ""
-        pages_checked, unreachable = [], []
-
-        for url in candidates:
-            try:
-                resp = requests.get(url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
-                resp.raise_for_status()
-            except requests.exceptions.RequestException:
-                # Large corporate sites frequently block plain bot
-                # requests (403 / Cloudflare challenge / timeout) even
-                # though the site is perfectly real -- remember it as a
-                # candidate anyway so we can still report a website URL
-                # even if we couldn't read the page.
-                unreachable.append(url)
-                continue
-            if "html" not in resp.headers.get("Content-Type", ""):
-                unreachable.append(url)
-                continue
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            pages_checked.append(url)
-            if official_url is None:
-                official_url = url
-                meta = soup.find("meta", attrs={"name": "description"}) or soup.find(
-                    "meta", attrs={"property": "og:description"}
-                )
-                if meta and meta.get("content"):
-                    description = meta["content"].strip()[:300]
-
-            emails, phones = _extract_contacts(soup)
-
-            # Homepages rarely put mailto:/tel: links front and center --
-            # follow one "Contact"-style link from THIS page if nothing
-            # turned up yet, before moving to the next search candidate.
+                c_resp = requests.get(contact_url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
+                c_resp.raise_for_status()
+                c_soup = BeautifulSoup(c_resp.text, "html.parser")
+                emails, phones = _extract_contacts(c_soup)
+            except Exception:
+                pass
             if not emails and not phones:
-                contact_url = _find_contact_page_link(soup, url)
-                if contact_url and contact_url not in pages_checked:
-                    try:
-                        c_resp = requests.get(contact_url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
-                        c_resp.raise_for_status()
-                        if "html" in c_resp.headers.get("Content-Type", ""):
-                            c_soup = BeautifulSoup(c_resp.text, "html.parser")
-                            pages_checked.append(contact_url)
-                            emails, phones = _extract_contacts(c_soup)
-                    except requests.exceptions.RequestException:
-                        pass
+                return f"Website: {url}\nDescription: {description}\nContact details not found on homepage, but a contact form may be at: {contact_url}"
+                
+    lines = [f"Extracted details from {url}:"]
+    lines.append(f"- Email: {emails[0] if emails else 'not found'}")
+    lines.append(f"- Phone: {phones[0] if phones else 'not found'}")
+    if description:
+        lines.append(f"- Description: {description}")
+        
+    return "\n".join(lines)
 
-            if emails or phones:
-                break  # got contact info, no need to check more candidates
-
-        if not official_url:
-            if unreachable:
-                # We know the likely website (from the search ranking)
-                # even though every candidate blocked our fetch -- still
-                # report that rather than giving up completely, so the
-                # agent doesn't have to ask the user for something we
-                # already found.
-                lines = [f"Web lookup for '{name}':"]
-                lines.append(f"- website: {unreachable[0]} (found via search; page could not be fetched to read further)")
-                lines.append("- email: not found")
-                lines.append("- phone: not found")
-                lines.append(
-                    "Only the website above is verified. Email and phone are "
-                    "genuinely not found -- report them as not found and ask "
-                    "the user directly instead of guessing."
-                )
-                return "\n".join(lines)
-            return f"Could not find or reach any candidate site for '{name}'. Ask the user for contact details directly."
-
-        lines = [f"Web lookup for '{name}' (checked: {', '.join(pages_checked)}):"]
-        lines.append(f"- website: {official_url}")
-        lines.append(f"- email: {emails[0] if emails else 'not found'}")
-        lines.append(f"- phone: {phones[0] if phones else 'not found'}")
-        if description:
-            lines.append(f"- description: {description}")
-        if len(emails) > 1:
-            lines.append(f"  (other emails found on the page: {', '.join(emails[1:])})")
-        if len(phones) > 1:
-            lines.append(f"  (other phones found on the page: {', '.join(phones[1:])})")
-        lines.append(
-            "Only these verified values may be used to fill ERP fields "
-            "(email/phone/website/company/industry hints, etc.). A field "
-            "marked 'not found' means exactly that -- report it to the user "
-            "as not found, do not rephrase it into anything that sounds "
-            "like an answer, and ask the user for it directly instead."
-        )
-        return "\n".join(lines)
-
-    result = _safe_call(f"look up company info for '{name}'", run)
-    _LOOKUP_CACHE[cache_key] = result
-    return result
-
-
-WEB_TOOLS = [web_search, web_fetch_page, web_crawl, web_company_lookup]
+WEB_TOOLS = [web_search, web_fetch_page, web_crawl, web_company_search, web_company_extract]

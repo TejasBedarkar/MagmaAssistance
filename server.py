@@ -933,7 +933,7 @@ async def _stream_chat_completion(messages, tools=None):
     tool_acc = {}
     content = ""
     finish_reason = None
-    async with httpx.AsyncClient(timeout=httpx.Timeout(LLM_REQUEST_TIMEOUT_SECONDS, connect=30.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=60.0)) as client:
         async with client.stream("POST", url, json=data, headers=headers) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -1977,7 +1977,7 @@ def export_audit_json(session_id: str = None):
 
 
 from Voice.ws_voice import register_voice_ws
-register_voice_ws(app, stream_agent_turn, assistant.tts, logger)
+register_voice_ws(app, stream_agent_turn, assistant.tts, logger, load_stream_history, save_stream_history)
 
 
 @app.get("/api/health")

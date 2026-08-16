@@ -8,7 +8,7 @@ from Voice.realtime_stt import RealtimeTranscriber
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?\u0964])\s+")
 
 
-def register_voice_ws(app, stream_agent_turn, tts, logger):
+def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, save_stream_history):
     @app.websocket("/ws/voice")
     async def ws_voice(ws: WebSocket, session_id: str = "voice-default", user_id: str = None):
         await ws.accept()
@@ -42,7 +42,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger):
                 pass
             return
 
-        history = []
+        history = await load_stream_history(session_id)
         state = {"turn_task": None, "speaking": False}
 
         async def cancel_turn():
@@ -84,8 +84,9 @@ def register_voice_ws(app, stream_agent_turn, tts, logger):
                         await send_json({"type": "tool_result", "name": event["name"], "result": str(event["result"])})
                     elif etype == "done":
                         await speak_chunk(buffer)
-                        buffer = ""
                         await send_json({"type": "done"})
+                
+                await save_stream_history(session_id, history)
             except asyncio.CancelledError:
                 raise
             except ConnectionClosed:

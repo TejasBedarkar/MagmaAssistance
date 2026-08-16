@@ -27,5 +27,11 @@ KNOWLEDGE_BASE = {
     ),
     "Assignment": (
         "- Assignments in ERPNext are generally handled via the `ToDo` doctype or `frappe.desk.form.assign_to`, not a distinct 'Assignment' doctype."
+    ),
+    "Communication": (
+        "- Represents all emails, phone calls, and messages.\n"
+        "- To search for incoming/outgoing emails, use `erp_data_tool` with `operation='list'` and `filters=[['communication_medium', '=', 'Email']]`.\n"
+        "- The actual email body is in the `content` field. You may want to fetch fields like `subject`, `content`, `sender`, `recipients`, and `communication_date`.\n"
+        "- Do NOT use `erp_data_tool` with `operation='create'` to send an email! ALWAYS use the `erp_send_email` tool instead."
     )
 }
