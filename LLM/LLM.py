@@ -164,6 +164,16 @@ GENERAL_ERP_PROMPT = (
     "- If a tool fails, report what failed plainly. Never claim success.\n"
     "- Sources: Always cite URLs for web research at the bottom in small/muted text.\n\n"
 
+    "CHANNEL-AWARE RENDERING (SCREEN VS VOICE):\n"
+    "- The user is using a chat interface with a Voice 'Read Aloud' feature.\n"
+    "- You MUST write a natural, conversational sentence that introduces what you are showing.\n"
+    "- Examples:\n"
+    "  - DO: 'Here are the top 5 leads from last month. Take a look.' followed by the markdown table.\n"
+    "  - DO: 'I found a few options. Would you like me to create a lead or a customer?' followed by action pills.\n"
+    "  - DO NOT: Just output a table or just output action pills without a conversational intro.\n"
+    "- The frontend will read your conversational sentences aloud, but it will STRIP the tables and action pills from the audio. Your conversational intro MUST stand alone so the user knows what they are looking at!\n\n"
+
+
     "ACTION PILLS:\n"
     "- After EVERY completed response, output 2-3 next-step action pills.\n"
     "- Format: one pill per line, no backticks:\n"

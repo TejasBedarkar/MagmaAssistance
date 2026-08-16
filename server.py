@@ -428,6 +428,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount the WebRTC voice router
+from Voice.voice_routes import voice_router
+app.include_router(voice_router)
+
 
 
 # ---------------------------------------------------------------------
@@ -1789,6 +1793,29 @@ async def synthesize_speech(req: TTSRequest):
 
     return {"audio": base64.b64encode(wav_bytes).decode("ascii")}
 
+
+@app.post("/api/tts/stream")
+async def synthesize_speech_stream(req: TTSRequest):
+    """Streams TTS audio chunks directly from OpenAI as they are generated.
+    Starts sending audio within ~200ms instead of waiting for the full file.
+    The browser plays chunks progressively via MediaSource API.
+    Returns: chunked audio/mpeg stream."""
+    from fastapi.responses import StreamingResponse
+    import asyncio
+
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    def generate_chunks():
+        try:
+            for chunk in assistant.tts.synthesize_stream(text, response_format="mp3"):
+                yield chunk
+        except Exception as exc:
+            logger.exception("Streaming TTS failed")
+
+    return StreamingResponse(generate_chunks(), media_type="audio/mpeg")
+
 class ChatRequest(BaseModel):
     message: str
 
@@ -1978,6 +2005,13 @@ def export_audit_json(session_id: str = None):
 
 from Voice.ws_voice import register_voice_ws
 register_voice_ws(app, stream_agent_turn, assistant.tts, logger, load_stream_history, save_stream_history)
+
+# Expose shared state on app.state so voice_routes.py can access it
+# without circular imports. Attached after everything is defined.
+app.state.session_identities = session_identities
+app.state.all_tools_list = ALL_TOOLS
+app.state.execute_tool_fn = _execute_tool
+app.state.load_stream_history_fn = load_stream_history
 
 
 @app.get("/api/health")
