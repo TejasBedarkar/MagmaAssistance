@@ -11,7 +11,7 @@ import json
 import logging
 import re
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 import urllib.robotparser as robotparser
 
 import requests
@@ -59,6 +59,24 @@ def _clean_text(soup: BeautifulSoup) -> str:
 
 def _page_title(soup: BeautifulSoup, fallback: str) -> str:
     return soup.title.get_text(strip=True) if soup.title else fallback
+
+
+def _normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+
+    filtered = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.startswith("utm_") or key in {"fbclid", "gclid", "msclkid", "mc_cid", "mc_eid"}:
+            continue
+        filtered.append((key, value))
+
+    normalized = parsed._replace(fragment="")
+    normalized = normalized._replace(query=urlencode(filtered, doseq=True))
+    if normalized.path == "":
+        normalized = normalized._replace(path="/")
+    return normalized.geturl().rstrip("?")
 
 
 def _allowed_by_robots(url: str) -> bool:
@@ -130,28 +148,30 @@ def web_crawl(start_url: str, max_pages: int = 5, same_domain_only: bool = True)
 
     def run():
         start_domain = urlparse(start_url).netloc
+        start_url_norm = _normalize_url(start_url)
         visited: set[str] = set()
-        queue = [start_url]
+        queue = [start_url_norm]
         pages_out = []
         while queue and len(visited) < n:
             url = queue.pop(0)
-            if url in visited:
+            url_norm = _normalize_url(url)
+            if url_norm in visited:
                 continue
-            visited.add(url)
-            if not _allowed_by_robots(url):
-                pages_out.append(f"--- {url} ---\n[Skipped: disallowed by robots.txt]")
+            visited.add(url_norm)
+            if not _allowed_by_robots(url_norm):
+                pages_out.append(f"--- {url_norm} ---\n[Skipped: disallowed by robots.txt]")
                 continue
             try:
-                resp = requests.get(url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
+                resp = requests.get(url_norm, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
                 resp.raise_for_status()
             except requests.exceptions.RequestException as exc:
-                pages_out.append(f"--- {url} ---\n[Could not fetch: {exc}]")
+                pages_out.append(f"--- {url_norm} ---\n[Could not fetch: {exc}]")
                 continue
             if "html" not in resp.headers.get("Content-Type", ""):
                 continue
             soup = BeautifulSoup(resp.text, "lxml")
             for a in soup.find_all("a", href=True):
-                link = urljoin(url, a["href"]).split("#")[0]
+                link = _normalize_url(urljoin(url_norm, a["href"]))
                 if not link.startswith("http"):
                     continue
                 if same_domain_only and urlparse(link).netloc != start_domain:
@@ -162,7 +182,7 @@ def web_crawl(start_url: str, max_pages: int = 5, same_domain_only: bool = True)
             snippet = text[:_CRAWL_PAGE_CHARS]
             if len(text) > _CRAWL_PAGE_CHARS:
                 snippet += "\n... [truncated]"
-            pages_out.append(f"--- {_page_title(soup, url)} ({url}) ---\n{snippet}")
+            pages_out.append(f"--- {_page_title(soup, url_norm)} ({url_norm}) ---\n{snippet}")
         if not pages_out:
             return f"Could not gather any content starting from '{start_url}'."
         return f"Crawled {len(visited)} page(s):\n\n" + "\n\n".join(pages_out)
@@ -247,4 +267,8 @@ def web_company_lookup(
     return result.to_dict()
 
 
-WEB_TOOLS = [web_search, web_fetch_page, web_crawl, web_company_lookup]
+# The application intentionally keeps a single official-site resolution flow:
+# discover/choose a company website, then crawl only that selected website.
+# Generic page-level crawling is retained as a private utility, but it is not
+# part of the active company-enrichment toolset.
+WEB_TOOLS = [web_search, web_fetch_page, web_company_lookup]

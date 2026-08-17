@@ -1,13 +1,18 @@
 from unittest.mock import patch
 
-from web.web_tool import WEB_TOOLS, web_company_lookup, web_fetch_page, web_search
+from web.web_tool import (
+    WEB_TOOLS,
+    _normalize_url,
+    web_company_lookup,
+    web_fetch_page,
+    web_search,
+)
 
 
 def test_all_web_tools_are_registered():
     assert [tool.name for tool in WEB_TOOLS] == [
         "web_search",
         "web_fetch_page",
-        "web_crawl",
         "web_company_lookup",
     ]
 
@@ -25,6 +30,12 @@ def test_web_search_uses_ddgs():
         result = web_search.invoke({"query": "example query", "max_results": 3})
     assert "Example" in result
     assert "https://example.com" in result
+
+
+def test_normalize_url_removes_fragments_and_tracking_params():
+    assert _normalize_url("https://example.com/about?utm_source=ads#top") == "https://example.com/about"
+    assert _normalize_url("https://example.com/about/") == "https://example.com/about/"
+    assert _normalize_url("https://example.com") == "https://example.com/"
 
 
 def test_company_lookup_returns_json_and_delegates_to_resolver():

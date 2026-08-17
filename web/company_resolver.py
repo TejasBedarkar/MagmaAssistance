@@ -10,13 +10,15 @@ import re
 from dataclasses import dataclass, asdict
 from difflib import SequenceMatcher
 from typing import Optional, Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 
 logger = logging.getLogger("company-resolver")
+
+_PENDING_CLARIFICATION: dict[str, CompanyResult] = {}
 
 
 # ============================================================================
@@ -181,6 +183,36 @@ def normalize(value: str) -> str:
         " ",
         value,
     ).strip()
+
+
+def _normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+
+    filtered_query = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.startswith("utm_") or key in {"fbclid", "gclid", "msclkid", "mc_cid", "mc_eid"}:
+            continue
+        filtered_query.append((key, value))
+
+    normalized = parsed._replace(fragment="", query=urlencode(filtered_query, doseq=True))
+    if normalized.path == "":
+        normalized = normalized._replace(path="/")
+    return normalized.geturl().rstrip("?")
+
+
+def _coerce_url_scheme(url: str) -> str:
+    if not url:
+        return url
+    value = url.strip()
+    if value.startswith(("http://", "https://")):
+        return value
+    if value.startswith("//"):
+        return "https:" + value
+    if "/" in value and not value.startswith("http"):
+        return "https://" + value.lstrip("/")
+    return "https://" + value.lstrip("/")
 
 
 def company_tokens(value: str) -> set[str]:
@@ -1000,9 +1032,11 @@ async def crawl_website(
                 if not href:
                     continue
 
-                absolute = urljoin(
-                    website,
-                    href,
+                absolute = _normalize_url(
+                    urljoin(
+                        website,
+                        href,
+                    )
                 )
 
                 if root_domain(
@@ -1038,14 +1072,14 @@ async def crawl_website(
 
         # Deduplicate.
         unique_links = []
+        seen_links: set[str] = set()
 
         for link in links:
-
-            if link not in unique_links:
-
-                unique_links.append(
-                    link
-                )
+            canonical = _normalize_url(link)
+            if canonical in seen_links:
+                continue
+            seen_links.add(canonical)
+            unique_links.append(canonical)
 
         # Only 2 additional pages.
         unique_links = unique_links[
@@ -1819,15 +1853,18 @@ def resolve_company(
             error="Company name is required.",
         )
 
+    normalized_key = company_name.casefold()
+
     # --------------------------------------------------------------
     # If the user selected a website, SKIP DISCOVERY and crawl only it.
     # --------------------------------------------------------------
 
     if selected_website:
-
+        _PENDING_CLARIFICATION.pop(normalized_key, None)
+        website = _coerce_url_scheme(selected_website)
         return verify_selected_company(
             company_name,
-            selected_website,
+            website,
         )
 
     # --------------------------------------------------------------
@@ -1835,7 +1872,7 @@ def resolve_company(
     # --------------------------------------------------------------
 
     if search_hint:
-
+        _PENDING_CLARIFICATION.pop(normalized_key, None)
         candidates = targeted_search(
             company_name,
             search_hint,
@@ -1853,7 +1890,7 @@ def resolve_company(
                 ),
             )
 
-        return CompanyResult(
+        result = CompanyResult(
             status="clarification_required",
             query=company_name,
             question=(
@@ -1865,6 +1902,8 @@ def resolve_company(
                 for candidate in candidates[:MAX_DISCOVERY_RESULTS]
             ],
         )
+        _PENDING_CLARIFICATION[normalized_key] = result
+        return result
 
     # --------------------------------------------------------------
     # The user selected an MCA legal entity. Discover websites for that
@@ -1872,18 +1911,27 @@ def resolve_company(
     # --------------------------------------------------------------
 
     if selected_company_cin:
+        _PENDING_CLARIFICATION.pop(normalized_key, None)
         legal_matches = discover_indian_companies(company_name)
         legal_match = next(
             (item for item in legal_matches if item["cin"].casefold() == selected_company_cin.strip().casefold()),
             None,
         )
         if legal_match:
-            return discovery_stage(legal_match["name"])
+            result = discovery_stage(legal_match["name"])
+            _PENDING_CLARIFICATION[legal_match["name"].casefold()] = result
+            return result
         # The API may be temporarily unavailable or its historical data may no
         # longer contain the record. Retain the supplied name and continue with
         # website discovery instead of blocking the user.
         logger.warning("Selected MCA CIN was not available for verification: %s", selected_company_cin)
-        return discovery_stage(company_name)
+        result = discovery_stage(company_name)
+        _PENDING_CLARIFICATION[normalized_key] = result
+        return result
+
+    pending = _PENDING_CLARIFICATION.get(normalized_key)
+    if pending is not None and pending.status == "clarification_required":
+        return pending
 
     # --------------------------------------------------------------
     # FIRST TURN: official India company identity first, when configured.
@@ -1893,8 +1941,9 @@ def resolve_company(
 
     identity_result = company_identity_stage(company_name)
     if identity_result:
+        _PENDING_CLARIFICATION[normalized_key] = identity_result
         return identity_result
 
-    return discovery_stage(
-        company_name
-    )
+    result = discovery_stage(company_name)
+    _PENDING_CLARIFICATION[normalized_key] = result
+    return result
