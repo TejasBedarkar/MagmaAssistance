@@ -101,28 +101,14 @@ class OpenAIChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         api_messages = [convert_message_to_dict(msg) for msg in messages]
-        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
         env_openai_key = os.environ.get("OPENAI_API_KEY")
-        key = openrouter_key or self.api_key or env_openai_key
-
-        is_openrouter = bool(openrouter_key) or (key and str(key).startswith("sk-or-v1-")) or "openrouter.ai" in str(self.base_url)
-
-        if is_openrouter:
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "http://localhost:8050",
-                "X-Title": "MagmaAssistance",
-            }
-            target_url = "https://openrouter.ai/api/v1/chat/completions"
-            model_name = self.model_name if "/" in self.model_name else f"openai/{self.model_name}"
-        else:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
-            target_url = self.base_url
-            model_name = self.model_name
+        key = self.api_key or env_openai_key
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+        target_url = self.base_url
+        model_name = self.model_name
 
         data = {
             "model": model_name,
@@ -309,11 +295,8 @@ else:
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "gpt-4o-mini-transcribe")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 TTS_VOICE = os.environ.get("TTS_VOICE", "alloy")
-# Neither OpenAI nor (especially) OpenRouter can be trusted to pick a
-# sensible default completion length on their own -- OpenRouter in
-# particular will silently cap some routed providers far below the
-# model's real context window when `max_tokens` is omitted. Without an
-# explicit value here, long replies get cut off mid-sentence with
+# The model may still hit the token limit on long replies. Without an
+# explicit value here, long replies can get cut off mid-sentence with
 # finish_reason="length" and no error, and the old code below wasn't
 # checking finish_reason at all, so the truncated text just went out
 # as if it were complete. Set high on purpose; MAX_COMPLETION_ROUNDS
@@ -326,11 +309,11 @@ LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "4096"))
 MAX_COMPLETION_ROUNDS = int(os.environ.get("LLM_MAX_COMPLETION_ROUNDS", "4"))
 # Neither the sync (requests) nor the async (httpx) call to the LLM API
 # had a timeout at all -- the streaming path was explicitly
-# timeout=None. If the provider stalls mid-connection (dropped
-# packets, an OpenRouter route hanging, etc.) the request just sits
-# open forever: no exception, no response, nothing -- which is exactly
-# what produces an endless "Thinking..." spinner on the frontend with
-# zero output and no visible error. This caps how long we'll wait.
+# timeout=None. If the provider stalls mid-connection, the request just
+# sits open forever: no exception, no response, nothing -- which is
+# exactly what produces an endless "Thinking..." spinner on the
+# frontend with zero output and no visible error. This caps how long
+# we'll wait.
 LLM_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("LLM_REQUEST_TIMEOUT_SECONDS", "90"))
 
 logger.info("Loading VoiceAssistant agent (STT=%s, LLM=%s)...", WHISPER_MODEL, LLM_MODEL)
@@ -888,18 +871,11 @@ async def _execute_tool(
 
 async def _stream_chat_completion(messages, tools=None):
     api_messages = [convert_message_to_dict(m) for m in messages]
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
     env_openai_key = os.environ.get("OPENAI_API_KEY")
-    key = openrouter_key or env_openai_key
-    is_openrouter = bool(openrouter_key)
-    if is_openrouter:
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "HTTP-Referer": "http://localhost:8050", "X-Title": "MagmaAssistance"}
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        model_name = LLM_MODEL if "/" in LLM_MODEL else f"openai/{LLM_MODEL}"
-    else:
-        headers = {"Authorization": f"Bearer {env_openai_key}", "Content-Type": "application/json"}
-        url = "https://api.openai.com/v1/chat/completions"
-        model_name = LLM_MODEL
+    key = env_openai_key
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    url = "https://api.openai.com/v1/chat/completions"
+    model_name = LLM_MODEL
     data = {"model": model_name, "messages": api_messages, "temperature": assistant.llm.temperature, "stream": True, "max_tokens": LLM_MAX_TOKENS}
     if tools:
         data["tools"] = tools

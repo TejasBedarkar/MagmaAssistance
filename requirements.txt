@@ -15,7 +15,7 @@ fastmcp
 langchain-mcp-adapters
 
 # Agent pipeline (from Main.py)
-# NOTE: LLM/LLM.py talks to OpenRouter directly via `requests`, not
+# NOTE: LLM/LLM.py talks directly to OpenAI via `requests`, not
 # ChatOllama, so langchain-ollama is not actually imported anywhere --
 # only langchain-core (used for prompts/messages/output parsers) is needed.
 langchain
@@ -53,8 +53,14 @@ openai
 playsound==1.2.2
 
 # API-key-free public web search, fetching, and crawling (web/web_tool.py)
+# Google is primary for company website discovery; DDGS is the fallback.
+googlesearch-python
 ddgs
 beautifulsoup4
 lxml
+# Headless-browser crawler used by web_crawl (web/crawl4ai_tool.py) --
+# after installing, run `crawl4ai-setup` once to download its Playwright
+# Chromium build (see README/steps below).
+crawl4ai
 psycopg2
 boto3
