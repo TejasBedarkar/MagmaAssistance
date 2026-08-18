@@ -21,6 +21,7 @@ import logging
 import os
 from typing import Any, Callable, Dict, Optional
 
+from livekit import api
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -283,3 +284,35 @@ def _convert_history_to_realtime_items(history: list) -> list:
                 },
             })
     return items
+
+@voice_router.post("/livekit-token")
+async def get_livekit_token(req: VoiceSessionStartRequest):
+    """Generates a LiveKit Access Token for the React frontend."""
+    import os
+    import json
+    from livekit import api
+    from fastapi import HTTPException
+    
+    api_key = os.environ.get("LIVEKIT_API_KEY")
+    api_secret = os.environ.get("LIVEKIT_API_SECRET")
+    
+    if not api_key or not api_secret:
+        raise HTTPException(status_code=500, detail="LIVEKIT_API_KEY or LIVEKIT_API_SECRET not set")
+        
+    room_name = f"voice_room_{req.session_id}"
+    identity = req.user_id or "anonymous_user"
+    
+    token = api.AccessToken(api_key, api_secret)
+    token.with_identity(identity)
+    token.with_name(identity)
+    token.with_grants(api.VideoGrants(
+        room_join=True,
+        room=room_name,
+    ))
+    
+    # Pass session_id in metadata so the Python worker can extract it!
+    metadata = {"session_id": req.session_id}
+    token.with_metadata(json.dumps(metadata))
+    
+    jwt = token.to_jwt()
+    return {"token": jwt, "room": room_name, "serverUrl": os.environ.get("LIVEKIT_URL", "wss://magna-erp-ai.livekit.cloud")}

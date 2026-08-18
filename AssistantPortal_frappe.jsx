@@ -5,6 +5,7 @@ import BentoWelcome from './BentoWelcome';
 import ChatArea, { ToolActivityPanel, ChartBlock, FormattedMarkdownText, EmbeddedBase64Image, getCleanTextAndChart, API_BASE_URL } from './ChatArea';
 import { useVoiceSession } from './useVoiceSession';
 import OrbController from './orb/OrbController.js';
+import AudioCapture from './AudioCapture.js';
 import './orb.css';
 
 // API_BASE_URL now lives in ChatArea.jsx (top of the file) — edit it
@@ -494,6 +495,8 @@ export default function AssistantPortal({ isOpen, onClose }) {
     const voiceConversationEndRef = useRef(null);
     const orbRef = useRef(null);
     const speechRecognitionRef = useRef(null);
+    const audioCaptureRef = useRef(null);
+    const runningToolsCountRef = useRef(0);
 
     const activeChat = chatHistory.find(c => c.id === currentChatId);
     const activeMessages = activeChat ? activeChat.messages : messages;
@@ -516,32 +519,61 @@ export default function AssistantPortal({ isOpen, onClose }) {
         resizeMessageInput(messageInputRef.current);
     }, [input, currentChatId]);
 
-    // WebRTC Direct-to-OpenAI voice session hook
-    // Handles: token lifecycle, SDP exchange, tool interception → backend execution
-    const { status: webRtcStatus, transcript: webRtcTranscript, start: startVoice, stop: stopVoice } = useVoiceSession({
-        sessionId: currentChatId || 'default',
-        userId: null,
-        apiBase: API_BASE_URL,
-        onMessage: (text) => {
-            // When AI finishes a voice response, show it in chat
-            if (text && currentChatId) {
-                appendMessage(currentChatId, { sender: 'bot', text, tools: [] });
-            }
-        },
-        onError: (msg, err) => {
-            console.error('[Voice]', msg, err);
-            alert(`Voice error: ${msg}`);
-            setIsListening(false);
-        },
-    });
+    const dictationRef = useRef(null);
+    const originalInputRef = useRef('');
 
     const handleVoiceInput = () => {
-        if (webRtcStatus === 'active' || webRtcStatus === 'connecting' || webRtcStatus === 'tool_calling') {
-            stopVoice();
+        if (isListening) {
+            if (dictationRef.current) {
+                try { dictationRef.current.stop(); } catch(e){}
+                dictationRef.current = null;
+            }
             setIsListening(false);
-        } else {
+            return;
+        }
+
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            alert("Dictation is not supported in this browser. Please use Chrome or Edge.");
+            return;
+        }
+
+        const recognition = new SpeechRecognition();
+        recognition.lang = 'en-IN';
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        
+        originalInputRef.current = input;
+
+        recognition.onstart = () => {
             setIsListening(true);
-            startVoice();
+        };
+
+        recognition.onresult = (event) => {
+            let transcript = '';
+            for (let i = 0; i < event.results.length; ++i) {
+                transcript += event.results[i][0].transcript;
+            }
+            setInput((originalInputRef.current ? originalInputRef.current + ' ' : '') + transcript);
+        };
+
+        recognition.onerror = (event) => {
+            if (event.error !== 'no-speech' && event.error !== 'aborted') {
+                console.error("Dictation error:", event.error);
+            }
+            setIsListening(false);
+        };
+
+        recognition.onend = () => {
+            setIsListening(false);
+            dictationRef.current = null;
+        };
+
+        dictationRef.current = recognition;
+        try {
+            recognition.start();
+        } catch(e) {
+            console.error("Dictation start error:", e);
         }
     };
 
@@ -898,7 +930,14 @@ export default function AssistantPortal({ isOpen, onClose }) {
         setVoiceStatus('speaking');
         source.onended = () => {
             if (voiceModeOpenRef.current && context.currentTime >= playbackCursorRef.current - 0.03) {
-                setVoiceStatus('listening');
+                window.lastSpeakingEndTime = Date.now();
+                setVoiceStatus('waiting');
+                setTimeout(() => {
+                    if (voiceModeOpenRef.current && voiceStatusRef.current === 'waiting' && runningToolsCountRef.current === 0) {
+                        setVoiceStatus('listening');
+                        if (audioCaptureRef.current) audioCaptureRef.current.start();
+                    }
+                }, 2500);
             }
         };
     };
@@ -985,6 +1024,7 @@ export default function AssistantPortal({ isOpen, onClose }) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({ ...msg, text: streamingReplyRef.current }));
             }
         } else if (type === 'tool_call') {
+            runningToolsCountRef.current++;
             const toolObj = { name: event.name || event.tool_name, args: event.args || {}, status: 'running', result: null };
             setVoiceTools((prev) => [...prev, toolObj]);
             setVoiceStatus('thinking');
@@ -996,6 +1036,7 @@ export default function AssistantPortal({ isOpen, onClose }) {
                 }));
             }
         } else if (type === 'tool_result') {
+            runningToolsCountRef.current = Math.max(0, runningToolsCountRef.current - 1);
             setVoiceTools((prev) => {
                 const next = [...prev];
                 for (let i = next.length - 1; i >= 0; i--) {
@@ -1032,9 +1073,35 @@ export default function AssistantPortal({ isOpen, onClose }) {
             const tables = extractMarkdownTables(cleanText);
             if (chartData || tables.length) setPinnedChart({ chartData, tables });
             streamingReplyRef.current = '';
-            setVoiceStatus('listening');
             
-            if (voiceChatIdRef.current) {
+            const context = playbackCtxRef.current;
+            if (runningToolsCountRef.current > 0) {
+                // Do not revert to listening yet; the AI is executing a tool.
+            } else if (!context || context.state === 'closed' || context.currentTime >= playbackCursorRef.current - 0.05) {
+                setVoiceStatus('waiting');
+                setTimeout(() => {
+                    if (voiceModeOpenRef.current && voiceStatusRef.current === 'waiting' && runningToolsCountRef.current === 0) {
+                        setVoiceStatus('listening');
+                        if (audioCaptureRef.current) audioCaptureRef.current.start();
+                    }
+                }, 2500);
+            } else {
+                // Guarantee the UI reverts to listening when audio completes
+                const remainingDelay = (playbackCursorRef.current - context.currentTime) * 1000 + 100;
+                setTimeout(() => {
+                    if (voiceModeOpenRef.current && voiceStatusRef.current !== 'listening' && runningToolsCountRef.current === 0) {
+                        setVoiceStatus('waiting');
+                        setTimeout(() => {
+                            if (voiceModeOpenRef.current && voiceStatusRef.current === 'waiting' && runningToolsCountRef.current === 0) {
+                                setVoiceStatus('listening');
+                                if (audioCaptureRef.current) audioCaptureRef.current.start();
+                            }
+                        }, 2500);
+                    }
+                }, remainingDelay);
+            }
+            
+            if (voiceChatIdRef.current && runningToolsCountRef.current === 0) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({ ...msg, streaming: false }));
             }
         } else if (type === 'error') {
@@ -1060,54 +1127,38 @@ export default function AssistantPortal({ isOpen, onClose }) {
         voiceSessionIdRef.current = sessionId;
         createVoiceChat();
         
-        // Native Browser STT
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (SpeechRecognition && !speechRecognitionRef.current) {
-            const recognition = new SpeechRecognition();
-            recognition.lang = SPEECH_RECOGNITION_LANGUAGE;
-            recognition.continuous = true;
-            recognition.interimResults = true;
-            
-            recognition.onresult = (event) => {
-                if (!voiceSocketRef.current || voiceSocketRef.current.readyState !== WebSocket.OPEN) return;
-                
-                let interim = '';
-                let final = '';
-                
-                for (let i = event.resultIndex; i < event.results.length; ++i) {
-                    if (event.results[i].isFinal) {
-                        final += event.results[i][0].transcript;
+        // True Voice-to-Voice VAD (Livechat architecture)
+        if (!audioCaptureRef.current) {
+            audioCaptureRef.current = new AudioCapture(
+                // onSpeechStart (Barge-in / Interruption)
+                () => {
+                    if (voiceStatusRef.current !== 'listening') return;
+                    if (voiceSocketRef.current && voiceSocketRef.current.readyState === WebSocket.OPEN) {
+                        voiceSocketRef.current.send(JSON.stringify({ type: 'interrupt' }));
+                    }
+                    interruptSpeech();
+                },
+                // onSpeechEnd (Send Audio to Backend)
+                (base64Audio) => {
+                    if (voiceStatusRef.current !== 'listening') return;
+                    if (voiceSocketRef.current && voiceSocketRef.current.readyState === WebSocket.OPEN) {
+                        voiceSocketRef.current.send(JSON.stringify({
+                            type: 'audio',
+                            data: base64Audio
+                        }));
+                    }
+                    // Prevent immediate relistening overlap
+                    window.lastSpeakingEndTime = Date.now();
+                },
+                // onAudioLevel (Visualizer)
+                (level) => {
+                    if (voiceStatusRef.current === 'listening') {
+                        setMicLevel(level);
                     } else {
-                        interim += event.results[i][0].transcript;
+                        setMicLevel(0);
                     }
                 }
-                
-                if (interim) {
-                    handleVoiceEvent({ type: 'partial_transcript', text: interim });
-                }
-                if (final) {
-                    const cleanText = getRecognizedText([{ transcript: final, confidence: 1 }]);
-                    handleVoiceEvent({ type: 'final_transcript', text: cleanText });
-                    if (voiceStatusRef.current === 'speaking') {
-                        interruptSpeech();
-                    }
-                    voiceSocketRef.current.send(JSON.stringify({ type: "user_speech", text: cleanText }));
-                }
-            };
-            
-            recognition.onerror = (e) => {
-                if (e.error !== 'no-speech') {
-                    setVoiceError('Speech recognition error: ' + e.error);
-                }
-            };
-            
-            recognition.onend = () => {
-                if (voiceModeOpenRef.current && speechRecognitionRef.current) {
-                    try { speechRecognitionRef.current.start(); } catch(e){}
-                }
-            };
-            
-            speechRecognitionRef.current = recognition;
+            );
         }
         
         const voiceParams = new URLSearchParams({ session_id: sessionId });
@@ -1120,9 +1171,7 @@ export default function AssistantPortal({ isOpen, onClose }) {
             setVoiceConnected(true);
             setVoiceStatus('listening');
             addVoiceEvent('connected', sessionId);
-            if (speechRecognitionRef.current) {
-                try { speechRecognitionRef.current.start(); } catch(e){}
-            }
+            if (audioCaptureRef.current) audioCaptureRef.current.start();
         };
         
         socket.onmessage = (message) => {
@@ -1151,9 +1200,9 @@ export default function AssistantPortal({ isOpen, onClose }) {
     };
 
     const disconnectVoice = () => {
-        if (speechRecognitionRef.current) {
-            try { speechRecognitionRef.current.stop(); } catch(e){}
-            speechRecognitionRef.current = null;
+        if (audioCaptureRef.current) {
+            audioCaptureRef.current.stop();
+            audioCaptureRef.current = null;
         }
         const socket = voiceSocketRef.current;
         voiceSocketRef.current = null;
@@ -1263,6 +1312,7 @@ const openVoiceMode = () => {
         listening: 'Listening…',
         thinking: 'Thinking…',
         speaking: 'Speaking…',
+        waiting: 'Waiting...',
         error: 'Voice connection error',
     }[voiceStatus];
 
@@ -1774,9 +1824,6 @@ const openVoiceMode = () => {
                                     padding: '64px 24px 104px', overflow: 'hidden'
                                 }}
                             >
-                                <div className="magna-hero-dotgrid" style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 0 }} />
-                                <VoiceParticles status={voiceStatus} micLevel={micLevel} />
-
                                 <motion.button
                                     className="magna-close-btn"
                                     whileHover={{ scale: 1.05 }}
@@ -1803,9 +1850,8 @@ const openVoiceMode = () => {
                                                 position: 'absolute', top: '64px', right: '22px', zIndex: 2,
                                                 width: '250px', maxHeight: '46vh', overflowY: 'auto',
                                                 padding: '10px 11px', borderRadius: '14px',
-                                                border: '1px solid color-mix(in srgb, var(--border-color, rgba(148, 163, 184, 0.4)) 50%, transparent)',
-                                                background: 'color-mix(in srgb, var(--card-bg, #ffffff) 65%, transparent)',
-                                                backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)',
+                                                border: '1px solid color-mix(in srgb, var(--primary-color, #6366f1) 30%, var(--border-color, rgba(148, 163, 184, 0.35)))',
+                                                backgroundColor: 'color-mix(in srgb, var(--control-bg, var(--card-bg, #f8fafc)) 100%, transparent)',
                                                 boxShadow: '0 16px 36px -12px rgba(0, 0, 0, 0.35)'
                                             }}
                                         >
@@ -1882,7 +1928,76 @@ const openVoiceMode = () => {
                                     <div ref={voiceConversationEndRef} />
                                 </div>
 
-                                {/* Popped-up chart/table — appears on the left */}
+                                <div style={{
+                                    display: 'inline-flex', alignItems: 'center', gap: '7px',
+                                    margin: '8px 0 10px', padding: '5px 13px', borderRadius: '999px',
+                                    border: '1px solid var(--border-color, rgba(148, 163, 184, 0.25))',
+                                    backgroundColor: 'color-mix(in srgb, var(--primary-color, #6366f1) 7%, transparent)',
+                                    position: 'relative', zIndex: 1
+                                }}>
+                                    <span className="magna-live-dot" style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: 'var(--primary-color, #6366f1)' }} />
+                                    <span style={{
+                                        fontSize: '10px', fontWeight: '700', letterSpacing: '0.1em', textTransform: 'uppercase',
+                                        color: 'var(--primary-color, #6366f1)', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace'
+                                    }}>
+                                        Live Voice Mode
+                                    </span>
+                                </div>
+
+                                {/* Orb */}
+                                <div className="magna-voice-orb-wrap" style={{
+                                    position: 'relative', width: '140px', height: '140px',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                    marginBottom: '8px', zIndex: 1, flexShrink: 0,
+                                    transform: 'scale(1.3)'
+                                }}>
+                                    <div id="orb-container" onClick={handleOrbTap} style={{ cursor: 'pointer', zIndex: 5 }}>
+                                        <canvas id="orb-canvas"></canvas>
+                                    </div>
+                                </div>
+
+                                <div style={{ fontSize: '13.5px', fontWeight: '700', color: 'var(--text-color, #0f172a)', marginBottom: '10px', position: 'relative', zIndex: 1, display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                    {voiceStatusLabel}
+                                    <AnimatePresence>
+                                        {voiceStatus === 'speaking' && (
+                                            <motion.button
+                                                key="interrupt-pill"
+                                                initial={{ opacity: 0, scale: 0.9 }}
+                                                animate={{ opacity: 1, scale: 1 }}
+                                                exit={{ opacity: 0, scale: 0.9 }}
+                                                whileHover={{ scale: 1.05 }}
+                                                whileTap={{ scale: 0.95 }}
+                                                onClick={() => { interruptSpeech(); addVoiceEvent('interrupted', 'manual'); }}
+                                                title="Stop the assistant and start talking"
+                                                style={{
+                                                    display: 'flex', alignItems: 'center', gap: '5px',
+                                                    border: '1px solid color-mix(in srgb, var(--primary-color, #6366f1) 30%, transparent)',
+                                                    borderRadius: '999px', cursor: 'pointer', padding: '3px 11px 3px 9px',
+                                                    fontSize: '10px', fontWeight: '700', letterSpacing: '0.03em',
+                                                    color: 'var(--primary-color, #6366f1)',
+                                                    backgroundColor: 'color-mix(in srgb, var(--primary-color, #6366f1) 10%, transparent)'
+                                                }}
+                                            >
+                                                <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2" /></svg>
+                                                Interrupt
+                                            </motion.button>
+                                        )}
+                                    </AnimatePresence>
+                                </div>
+
+                                {voiceStatus === 'error' && (
+                                    <div style={{
+                                        minHeight: '20px', maxWidth: '440px', textAlign: 'center', padding: '0 28px',
+                                        fontSize: '12.5px', color: '#ef4444', lineHeight: 1.5,
+                                        position: 'relative', zIndex: 1
+                                    }}>
+                                        {voiceError}
+                                    </div>
+                                )}
+
+                                {/* Popped-up chart/table — appears on the left when a reply carries
+                                    one, and stays on screen (independent of listening/thinking/speaking
+                                    status) until a new chart/graph is created or the user taps close. */}
                                 <AnimatePresence>
                                     {pinnedChart && (
                                         <motion.div
@@ -1894,9 +2009,8 @@ const openVoiceMode = () => {
                                                 zIndex: 2, width: 'min(360px, calc(100% - 44px))',
                                                 overflowY: 'auto', textAlign: 'left',
                                                 padding: '18px 20px', borderRadius: '18px',
-                                                border: '1px solid color-mix(in srgb, var(--border-color, rgba(148, 163, 184, 0.4)) 50%, transparent)',
-                                                background: 'color-mix(in srgb, var(--card-bg, #ffffff) 65%, transparent)',
-                                                backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)',
+                                                border: '1px solid color-mix(in srgb, var(--primary-color, #6366f1) 30%, var(--border-color, rgba(148, 163, 184, 0.35)))',
+                                                backgroundColor: 'color-mix(in srgb, var(--control-bg, var(--card-bg, #f8fafc)) 100%, transparent)',
                                                 boxShadow: '0 26px 60px -16px rgba(0, 0, 0, 0.4)'
                                             }}
                                         >
@@ -1928,133 +2042,51 @@ const openVoiceMode = () => {
                                     )}
                                 </AnimatePresence>
 
-                                <div style={{
-                                    display: 'flex', flexDirection: 'column', alignItems: 'center',
-                                    background: 'color-mix(in srgb, var(--card-bg, #ffffff) 65%, transparent)',
-                                    backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)',
-                                    border: '1px solid color-mix(in srgb, var(--border-color, rgba(148, 163, 184, 0.4)) 50%, transparent)',
-                                    borderRadius: '40px', padding: '24px 32px 32px',
-                                    boxShadow: '0 24px 48px -12px rgba(0,0,0,0.1)',
-                                    zIndex: 10, marginTop: 'auto', marginBottom: 'auto'
+                                <div className="magna-voice-controls" style={{
+                                    position: 'relative', display: 'flex', alignItems: 'center',
+                                    justifyContent: 'center', gap: '12px', zIndex: 3,
+                                    marginTop: '12px', flexShrink: 0
                                 }}>
-                                    <div style={{
-                                        display: 'inline-flex', alignItems: 'center', gap: '7px',
-                                        margin: '0 0 16px', padding: '5px 13px', borderRadius: '999px',
-                                        border: '1px solid var(--border-color, rgba(148, 163, 184, 0.25))',
-                                        backgroundColor: 'color-mix(in srgb, var(--primary-color, #6366f1) 7%, transparent)',
-                                        position: 'relative', zIndex: 1
-                                    }}>
-                                        <span className="magna-live-dot" style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: 'var(--primary-color, #6366f1)' }} />
-                                        <span style={{
-                                            fontSize: '10px', fontWeight: '700', letterSpacing: '0.1em', textTransform: 'uppercase',
-                                            color: 'var(--primary-color, #6366f1)', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace'
-                                        }}>
-                                            Live Voice Mode
-                                        </span>
-                                    </div>
-
-                                    {/* Orb */}
-                                    <div className="magna-voice-orb-wrap" style={{
-                                        position: 'relative', width: '140px', height: '140px',
-                                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                        marginBottom: '16px', zIndex: 1, flexShrink: 0,
-                                        transform: 'scale(1.3)'
-                                    }}>
-                                        <div id="orb-container" onClick={handleOrbTap} style={{ cursor: 'pointer', zIndex: 5 }}>
-                                            <canvas id="orb-canvas"></canvas>
-                                        </div>
-                                    </div>
-
-                                    <div style={{ fontSize: '14px', fontWeight: '700', color: 'var(--text-color, #0f172a)', marginBottom: '24px', position: 'relative', zIndex: 1, display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                        {voiceStatusLabel}
-                                        <AnimatePresence>
-                                            {voiceStatus === 'speaking' && (
-                                                <motion.button
-                                                    key="interrupt-pill"
-                                                    initial={{ opacity: 0, scale: 0.9 }}
-                                                    animate={{ opacity: 1, scale: 1 }}
-                                                    exit={{ opacity: 0, scale: 0.9 }}
-                                                    whileHover={{ scale: 1.05 }}
-                                                    whileTap={{ scale: 0.95 }}
-                                                    onClick={() => { interruptSpeech(); addVoiceEvent('interrupted', 'manual'); }}
-                                                    title="Stop the assistant and start talking"
-                                                    style={{
-                                                        display: 'flex', alignItems: 'center', gap: '5px',
-                                                        border: '1px solid color-mix(in srgb, var(--primary-color, #6366f1) 30%, transparent)',
-                                                        borderRadius: '999px', cursor: 'pointer', padding: '3px 11px 3px 9px',
-                                                        fontSize: '10px', fontWeight: '700', letterSpacing: '0.03em',
-                                                        color: 'var(--primary-color, #6366f1)',
-                                                        backgroundColor: 'color-mix(in srgb, var(--primary-color, #6366f1) 10%, transparent)'
-                                                    }}
-                                                >
-                                                    <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2" /></svg>
-                                                    Interrupt
-                                                </motion.button>
-                                            )}
-                                        </AnimatePresence>
-                                    </div>
-
-                                    {voiceStatus === 'error' && (
-                                        <div style={{
-                                            minHeight: '20px', maxWidth: '440px', textAlign: 'center', padding: '0 28px',
-                                            fontSize: '13px', color: '#ef4444', lineHeight: 1.5,
-                                            position: 'relative', zIndex: 1, marginBottom: '16px'
-                                        }}>
-                                            {voiceError}
-                                        </div>
-                                    )}
-
-                                    <div className="magna-voice-controls" style={{
-                                        position: 'relative', display: 'flex', alignItems: 'center',
-                                        justifyContent: 'center', gap: '16px', zIndex: 3, flexShrink: 0
-                                    }}>
-                                        <motion.button
-                                            whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
-                                            onClick={requestMicrophone}
-                                            disabled={micPermission === 'granted'}
-                                            style={{
-                                                border: '1px solid color-mix(in srgb, var(--border-color, #cbd5e1) 50%, transparent)',
-                                                borderRadius: '999px', padding: '12px 20px', fontSize: '13px', fontWeight: '650',
-                                                color: 'var(--text-color, #0f172a)',
-                                                backgroundColor: 'color-mix(in srgb, var(--card-bg, #ffffff) 50%, transparent)',
-                                                backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-                                                cursor: micPermission === 'granted' ? 'default' : 'pointer',
-                                                opacity: micPermission === 'granted' ? 0.7 : 1
-                                            }}
-                                        >
-                                            Mic: {micPermission === 'granted' ? 'Allowed' : micPermission === 'denied' ? 'Retry permission' : 'Allow'}
-                                        </motion.button>
-                                        <motion.button
-                                            whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
-                                            onClick={voiceConnected ? disconnectVoice : connectVoice}
-                                            style={{
-                                                border: '1px solid color-mix(in srgb, ' + (voiceConnected ? '#f59e0b' : 'var(--primary-color, #6366f1)') + ' 20%, transparent)',
-                                                borderRadius: '999px', cursor: 'pointer', padding: '12px 24px',
-                                                fontSize: '13px', fontWeight: '700',
-                                                color: voiceConnected ? '#f59e0b' : 'var(--primary-color, #6366f1)',
-                                                backgroundColor: 'color-mix(in srgb, ' + (voiceConnected ? '#f59e0b' : 'var(--primary-color, #6366f1)') + ' 10%, transparent)',
-                                                backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-                                            }}
-                                        >
-                                            {voiceConnected ? 'Disconnect' : 'Connect'}
-                                        </motion.button>
-                                        <motion.button
-                                            className="magna-end-call-btn"
-                                            whileHover={{ scale: 1.05 }}
-                                            whileTap={{ scale: 0.95 }}
-                                            onClick={closeVoiceMode}
-                                            style={{
-                                                display: 'flex', alignItems: 'center', gap: '8px',
-                                                border: '1px solid color-mix(in srgb, #ef4444 20%, transparent)',
-                                                borderRadius: '999px', cursor: 'pointer',
-                                                padding: '12px 24px', fontSize: '13px', fontWeight: '650',
-                                                color: '#ef4444', backgroundColor: 'color-mix(in srgb, #ef4444 10%, transparent)',
-                                                backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-                                            }}
-                                        >
-                                            <PhoneEndIcon /> Close
-                                        </motion.button>
-                                    </div>
+                                    <motion.button
+                                        whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
+                                        onClick={requestMicrophone}
+                                        disabled={micPermission === 'granted'}
+                                        style={{
+                                            border: '1px solid var(--border-color, #cbd5e1)', borderRadius: '999px',
+                                            cursor: micPermission === 'granted' ? 'default' : 'pointer', padding: '10px 17px',
+                                            fontSize: '12px', fontWeight: '650', color: 'var(--text-color, #0f172a)',
+                                            backgroundColor: 'var(--control-bg, var(--card-bg, #fff))',
+                                            opacity: micPermission === 'granted' ? 0.7 : 1
+                                        }}
+                                    >
+                                        Mic: {micPermission === 'granted' ? 'Allowed' : micPermission === 'denied' ? 'Retry permission' : 'Allow'}
+                                    </motion.button>
+                                    <motion.button
+                                        whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
+                                        onClick={voiceConnected ? disconnectVoice : connectVoice}
+                                        style={{
+                                            border: 'none', borderRadius: '999px', cursor: 'pointer', padding: '10px 20px',
+                                            fontSize: '12px', fontWeight: '700', color: '#fff',
+                                            backgroundColor: voiceConnected ? '#f59e0b' : 'var(--primary-color, #6366f1)'
+                                        }}
+                                    >
+                                        {voiceConnected ? 'Disconnect' : 'Connect'}
+                                    </motion.button>
+                                    <motion.button
+                                        className="magna-end-call-btn"
+                                        whileHover={{ scale: 1.05 }}
+                                        whileTap={{ scale: 0.95 }}
+                                        onClick={closeVoiceMode}
+                                        style={{
+                                            display: 'flex', alignItems: 'center', gap: '8px',
+                                            border: 'none', borderRadius: '999px', cursor: 'pointer',
+                                            padding: '11px 22px', fontSize: '12.5px', fontWeight: '650',
+                                            backgroundColor: '#ef4444', color: '#ffffff',
+                                            boxShadow: '0 10px 24px -8px rgba(239, 68, 68, 0.5)'
+                                        }}
+                                    >
+                                        <PhoneEndIcon /> Close
+                                    </motion.button>
                                 </div>
                             </motion.div>
                         )}

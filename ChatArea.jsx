@@ -51,7 +51,8 @@ function stripMarkdownForSpeech(text) {
         .replace(/`([^`]+)`/g, '$1')                      // inline code
         .replace(/!\[[^\]]*\]\([^)]*\)/g, '')             // images
         .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')          // links -> link text
-        .replace(/^\s*\|.*\|\s*$/gm, '')                  // table rows
+        .replace(/\[Action[^\]]*\]/g, '')                  // action pills like [Action: Run Report]
+        .replace(/^\s*[|+].*\n?/gm, '')                     // ALL table rows and borders (pipes and pluses)
         .replace(/^\s*#{1,6}\s*/gm, '')                   // headings
         .replace(/^\s*[-*]\s+/gm, '')                     // bullet markers
         .replace(/\*\*(.*?)\*\*/g, '$1')                  // bold
@@ -62,14 +63,65 @@ function stripMarkdownForSpeech(text) {
         .trim();
 }
 
-// Calls the backend TTS endpoint and returns a playable data: URL. Reuses
-// the same OpenAI voice (TTS_VOICE, e.g. "alloy") that Live Voice Mode
-// speaks with, so both surfaces sound identical.
+// Streams TTS audio from /api/tts/stream using MediaSource API.
+// Playback starts in ~200ms (first chunk) vs waiting for the full file.
+// Falls back to the old base64 endpoint if MediaSource is unavailable.
+async function streamSpeechAudio(text, onReady, onEnded, onError, cancelRef) {
+    if (!window.MediaSource || !MediaSource.isTypeSupported('audio/mpeg')) {
+        // Fallback: fetch full audio as base64
+        const r = await fetch(`${API_BASE_URL}/api/tts`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
+        });
+        if (!r.ok) throw new Error(`TTS failed: ${r.status}`);
+        const d = await r.json();
+        const audio = new Audio(`data:audio/mpeg;base64,${d.audio}`);
+        audio.onended = onEnded;
+        audio.onerror = onError;
+        onReady(audio);
+        return audio;
+    }
+
+    const ms = new MediaSource();
+    const audio = new Audio();
+    audio.src = URL.createObjectURL(ms);
+    audio.onended = onEnded;
+    audio.onerror = onError;
+
+    ms.addEventListener('sourceopen', async () => {
+        let sb;
+        try { sb = ms.addSourceBuffer('audio/mpeg'); } catch { ms.endOfStream(); return; }
+
+        const response = await fetch(`${API_BASE_URL}/api/tts/stream`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+        });
+        if (!response.ok) { ms.endOfStream(); onError(new Error(`TTS stream failed: ${response.status}`)); return; }
+
+        const reader = response.body.getReader();
+        let firstChunk = true;
+
+        const pump = async () => {
+            while (true) {
+                if (cancelRef && cancelRef.cancelled) { reader.cancel(); ms.endOfStream(); return; }
+                const { done, value } = await reader.read();
+                if (done) { if (!sb.updating) ms.endOfStream(); return; }
+                await new Promise(res => { if (sb.updating) sb.addEventListener('updateend', res, {once:true}); else res(); });
+                sb.appendBuffer(value);
+                if (firstChunk) { firstChunk = false; onReady(audio); audio.play().catch(()=>{}); }
+                await new Promise(res => sb.addEventListener('updateend', res, {once:true}));
+            }
+        };
+        pump().catch(() => { try { ms.endOfStream(); } catch {} });
+    });
+
+    return audio;
+}
+
+// Kept for backward compat — used in the non-streaming fallback path
 async function fetchSpeechAudio(text) {
     const response = await fetch(`${API_BASE_URL}/api/tts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
     });
     if (!response.ok) throw new Error(`TTS request failed with status ${response.status}`);
     const data = await response.json();
@@ -993,34 +1045,35 @@ export default function ChatArea({ messages = [], isThinking, onSuggestionClick 
         stopSpeaking();
         const requestId = speechRequestIdRef.current;
         setLoadingSpeechIndex(index);
+        const cancelRef = { cancelled: false };
 
         try {
-            const audioSrc = await fetchSpeechAudio(plainText);
-            if (requestId !== speechRequestIdRef.current) return; // superseded/stopped while loading
-
-            const audio = new Audio(audioSrc);
-            currentAudioRef.current = audio;
-            audio.onended = () => {
-                if (currentAudioRef.current === audio) currentAudioRef.current = null;
-                setSpeakingIndex((current) => (current === index ? null : current));
-            };
-            audio.onerror = () => {
-                if (currentAudioRef.current === audio) currentAudioRef.current = null;
-                setSpeakingIndex((current) => (current === index ? null : current));
-                console.error('Text-to-speech playback failed for the received audio.');
-                alert('Could not play the reply audio (the audio data from the server looked invalid). Check the browser console/network tab for details.');
-            };
-            setLoadingSpeechIndex(null);
-            setSpeakingIndex(index);
-            audio.play().catch((playErr) => {
-                setSpeakingIndex((current) => (current === index ? null : current));
-                console.error('Audio playback was blocked or failed:', playErr);
-                alert(`Could not play the reply audio: ${playErr.message || playErr}`);
-            });
+            await streamSpeechAudio(
+                plainText,
+                (audio) => {
+                    // onReady: called as soon as first chunk arrives (~200ms)
+                    if (requestId !== speechRequestIdRef.current) { audio.pause(); cancelRef.cancelled = true; return; }
+                    currentAudioRef.current = audio;
+                    setLoadingSpeechIndex(null);
+                    setSpeakingIndex(index);
+                },
+                () => {
+                    // onEnded
+                    if (currentAudioRef.current) currentAudioRef.current = null;
+                    setSpeakingIndex((current) => (current === index ? null : current));
+                },
+                (err) => {
+                    // onError
+                    console.error('TTS playback error:', err);
+                    setLoadingSpeechIndex(null);
+                    setSpeakingIndex((current) => (current === index ? null : current));
+                },
+                cancelRef,
+            );
         } catch (err) {
             console.error('Text-to-speech failed:', err);
             if (requestId === speechRequestIdRef.current) setLoadingSpeechIndex(null);
-            alert(`Could not read this reply aloud: ${err.message}. Check that the backend server is running the latest server.py (with the /api/tts route) and is reachable at ${API_BASE_URL}.`);
+            alert(`Could not read this reply aloud: ${err.message}`);
         }
     };
 

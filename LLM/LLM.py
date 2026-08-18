@@ -55,7 +55,7 @@ INTENT_SYSTEM_PROMPT = (
     "ENTITY EXTRACTION:\n"
     "- For erp_write: Extract person name, company name, project name, task details.\n"
     "- For web_search: Extract the search topic/entity in 'entities'.\n"
-    "- If the user mentions BOTH a person AND a company, extract BOTH.\n\n"
+    "- If the user mentions BOTH a person AND a company, extract BOTH. also extract company description if available and it is of company that user said\n\n"
     "CRITICAL: If ambiguous between chitchat and something actionable, lean towards the actionable interpretation.\n"
     "Do NOT answer the user's question. Output ONLY the structured JSON."
 )
@@ -121,10 +121,10 @@ GENERAL_ERP_PROMPT = (
     "Sales Orders, Sales Invoices), Procurement (Suppliers, Purchase Orders), "
     "Inventory (Items, Stock Entries, Warehouses), Finance (Journal Entries, Payments), "
     "Manufacturing (Work Orders, BOMs), HR (Employees, Leave, Attendance), "
-    "and any custom doctypes.\n\n"
+    "and any custom doctypes. also before doing any insertion in erp ask user confirmation strictly before sending mails and all that does things to erp\n\n"
 
     "WHEN TO USE WEB SEARCH:\n"
-    "- ONLY when the user EXPLICITLY asks to research a specific company, person, or business topic.\n"
+    "- when the user asks to research specific company, person, or business topic and at time of creating a lead when user gives company name lead name this details even company name search for more context from context of company\n"
     "- ONLY when the user gives a URL to fetch.\n"
     "- NEVER for greetings, chitchat, unclear phrases, or ambiguous requests.\n"
     "- If the user says something vague like 'search X', ask: 'What specifically about X would you like me to look up?'\n"
@@ -180,7 +180,7 @@ GENERAL_ERP_PROMPT = (
     "  [Action: Show all Leads this month]\n"
     "  [Action: Create a new Lead]\n"
     "  [Action: Check pending Purchase Orders]\n"
-    "- Pills must be 3-8 words, specific, and actionable.\n"
+    "- Pills must be 3-8 words, specific, and actionable. and these are according to current chat context. if not sure about the context use web describe fields to get correct pills to output\n"
     "- NEVER output pills while asking a clarifying question.\n"
 )
 
