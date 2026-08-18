@@ -479,6 +479,8 @@ export default function AssistantPortal({ isOpen, onClose }) {
     const voiceSessionIdRef = useRef(null);
     const voiceStatusRef = useRef('idle');
     const bargeInStreakRef = useRef(0);
+    const bargeInRafRef = useRef(null);
+    const bargeInFloorRef = useRef(0.015);
     const streamingReplyRef = useRef('');
     const voiceChatIdRef = useRef(null);
     const micStreamRef = useRef(null);
@@ -788,9 +790,10 @@ export default function AssistantPortal({ isOpen, onClose }) {
 
     // Drain the TTS sentence queue — called after each utterance ends.
     const drainTtsQueue = () => {
-        if (ttsInterruptedRef.current) { ttsQueueRef.current = []; ttsSpeakingRef.current = false; return; }
+        if (ttsInterruptedRef.current) { ttsQueueRef.current = []; ttsSpeakingRef.current = false; stopBargeInDetector(); return; }
         if (ttsQueueRef.current.length === 0) {
             ttsSpeakingRef.current = false;
+            stopBargeInDetector();
             // All speech done — return orb to listening state
             if (voiceModeOpenRef.current) setVoiceStatus('listening');
             return;
@@ -804,25 +807,22 @@ export default function AssistantPortal({ isOpen, onClose }) {
         if (voice) utterance.voice = voice;
         utterance.onstart = () => {
             setVoiceStatus('speaking');
-            console.log('[MAGMA VOICE] speechSynthesis speaking:', text.slice(0, 60));
+            startBargeInDetector(); // watch for barge-in while speaking
+            console.log('[MAGMA VOICE] TTS speaking:', text.slice(0, 80));
         };
-        utterance.onend = () => {
-            console.log('[MAGMA VOICE] speechSynthesis chunk done');
-            drainTtsQueue();
-        };
+        utterance.onend = () => { drainTtsQueue(); };
         utterance.onerror = (e) => {
-            console.error('[MAGMA VOICE] speechSynthesis error:', e.error);
+            console.error('[MAGMA VOICE] TTS error:', e.error);
             drainTtsQueue();
         };
         ttsSpeakingRef.current = true;
         window.speechSynthesis.speak(utterance);
     };
 
-    // Enqueue a sentence for speaking. Deduplicates consecutive identical sentences.
+    // Queue a sentence for low-latency streaming speech.
     const speakSentence = (text) => {
         const clean = (text || '').trim();
         if (!clean) return;
-        console.log('[MAGMA VOICE] speakSentence queued:', clean.slice(0, 80));
         ttsInterruptedRef.current = false;
         ttsQueueRef.current.push(clean);
         if (!ttsSpeakingRef.current) drainTtsQueue();
@@ -852,7 +852,8 @@ export default function AssistantPortal({ isOpen, onClose }) {
     // portal, switching chats, unmounting). Closing the AudioContext outright
     // (rather than just clearing a queue) guarantees every already-scheduled
     const interruptSpeech = () => {
-        console.log('[MAGMA VOICE] interruptSpeech: cancel speechSynthesis and clear queue');
+        console.log('[MAGMA VOICE] interruptSpeech');
+        stopBargeInDetector();
         ttsInterruptedRef.current = true;
         ttsSpeakingRef.current = false;
         ttsQueueRef.current = [];
@@ -864,35 +865,61 @@ export default function AssistantPortal({ isOpen, onClose }) {
     };
 
     const stopMicAnalyser = () => {
-        if (micRafRef.current) cancelAnimationFrame(micRafRef.current);
-        micRafRef.current = null;
-        if (micStreamRef.current) {
-            micStreamRef.current.getTracks().forEach((t) => t.stop());
-            micStreamRef.current = null;
-        }
-        if (captureNodeRef.current) {
-            captureNodeRef.current.disconnect();
-            captureNodeRef.current.onaudioprocess = null;
-            captureNodeRef.current = null;
-        }
-        if (captureSourceRef.current) {
-            captureSourceRef.current.disconnect();
-            captureSourceRef.current = null;
-        }
-        if (audioCtxRef.current) {
-            audioCtxRef.current.close().catch(() => { });
-            audioCtxRef.current = null;
-        }
-        analyserRef.current = null;
+        stopBargeInDetector();
+        if (micRafRef.current) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; }
+        if (micStreamRef.current) { micStreamRef.current.getTracks().forEach(t => t.stop()); micStreamRef.current = null; }
+        if (captureSourceRef.current) { captureSourceRef.current.disconnect(); captureSourceRef.current = null; }
+        if (analyserRef.current) { analyserRef.current.disconnect?.(); analyserRef.current = null; }
+        if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
         micNoiseGateRef.current = { noiseFloor: 0.02, open: false, hangover: 0, calibrationFrames: 20, speechCandidateFrames: 0 };
         setMicLevel(0);
     };
 
-    
+    // ----------------------------------------------------------------
+    // Mic setup: noise cancellation + analyser for orb level + barge-in
+    // ----------------------------------------------------------------
+    // ----------------------------------------------------------------
+
     const requestMicrophone = async () => {
         try {
-            await navigator.mediaDevices.getUserMedia({ audio: true });
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    // Hardware noise cancellation — eliminates fan/room noise
+                    noiseSuppression:  true,
+                    echoCancellation:  true,   // removes TTS echo picked up by mic
+                    autoGainControl:   true,   // normalizes quiet/loud voices
+                    channelCount:      1,
+                    sampleRate:        16000,  // SpeechRecognition works great at 16kHz
+                    latency:           0,      // lowest possible buffer
+                },
+            });
+            micStreamRef.current = stream;
             setMicPermission('granted');
+
+            // --- Web Audio analyser: feeds mic level → orb animation ---
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            audioCtxRef.current = new AudioCtx();
+            captureSourceRef.current = audioCtxRef.current.createMediaStreamSource(stream);
+            analyserRef.current = audioCtxRef.current.createAnalyser();
+            analyserRef.current.fftSize = 256;
+            analyserRef.current.smoothingTimeConstant = 0.7;
+            captureSourceRef.current.connect(analyserRef.current);
+            // NOTE: do NOT connect analyser to destination — we don't want
+            // the mic echoing through speakers.
+
+            const levelBuf = new Float32Array(analyserRef.current.fftSize);
+            const tickLevel = () => {
+                if (!analyserRef.current) return;
+                analyserRef.current.getFloatTimeDomainData(levelBuf);
+                let sum = 0;
+                for (let i = 0; i < levelBuf.length; i++) sum += levelBuf[i] * levelBuf[i];
+                const rms = Math.sqrt(sum / levelBuf.length);
+                setMicLevel(Math.min(1, rms * 8)); // 0-1 for orb
+                micRafRef.current = requestAnimationFrame(tickLevel);
+            };
+            micRafRef.current = requestAnimationFrame(tickLevel);
+
+            console.log('[MAGMA VOICE] Mic opened with noise cancellation');
             return true;
         } catch (error) {
             setMicPermission('denied');
@@ -900,6 +927,60 @@ export default function AssistantPortal({ isOpen, onClose }) {
             return false;
         }
     };
+
+    // ----------------------------------------------------------------
+    // Barge-in detector: runs during TTS playback, watches mic RMS.
+    // When the user speaks above the adaptive noise floor, we immediately
+    // cancel TTS, send 'interrupt' to the server, and let the user talk.
+    // ----------------------------------------------------------------
+    const startBargeInDetector = () => {
+        if (!analyserRef.current) return;
+        if (bargeInRafRef.current) return; // already running
+
+        const buf = new Float32Array(analyserRef.current.fftSize);
+        const BARGE_THRESHOLD_MULT = 5.0;  // N × noise floor = speech
+        const CONFIRM_FRAMES = 3;          // require 3 consecutive loud frames
+        let loud = 0;
+
+        const tick = () => {
+            // Stop if TTS is no longer speaking or session ended
+            if (!ttsSpeakingRef.current || !voiceModeOpenRef.current) {
+                bargeInRafRef.current = null;
+                return;
+            }
+            analyserRef.current?.getFloatTimeDomainData(buf);
+            let sum = 0;
+            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+            const rms = Math.sqrt(sum / buf.length);
+
+            // Adaptive floor: update during quiet moments
+            if (rms < bargeInFloorRef.current) {
+                bargeInFloorRef.current = bargeInFloorRef.current * 0.95 + rms * 0.05;
+                bargeInFloorRef.current = Math.max(bargeInFloorRef.current, 0.003);
+            }
+
+            const threshold = bargeInFloorRef.current * BARGE_THRESHOLD_MULT;
+            if (rms > threshold) {
+                loud++;
+                if (loud >= CONFIRM_FRAMES) {
+                    console.log('[MAGMA VOICE] Barge-in detected! RMS:', rms.toFixed(4), 'floor:', bargeInFloorRef.current.toFixed(4));
+                    bargeInRafRef.current = null;
+                    interruptSpeech();
+                    voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
+                    return;
+                }
+            } else {
+                loud = 0;
+            }
+            bargeInRafRef.current = requestAnimationFrame(tick);
+        };
+        bargeInRafRef.current = requestAnimationFrame(tick);
+    };
+
+    const stopBargeInDetector = () => {
+        if (bargeInRafRef.current) { cancelAnimationFrame(bargeInRafRef.current); bargeInRafRef.current = null; }
+    };
+
 
     const handleVoiceEvent = (event) => {
         const type = event.type;
@@ -1005,7 +1086,10 @@ export default function AssistantPortal({ isOpen, onClose }) {
 
         // Preload voices (async on some browsers)
         if (window.speechSynthesis && window.speechSynthesis.getVoices().length === 0) {
-            window.speechSynthesis.onvoiceschanged = () => {};
+            await new Promise(resolve => {
+                window.speechSynthesis.onvoiceschanged = resolve;
+                setTimeout(resolve, 1000); // fallback if event never fires
+            });
         }
 
         if (!micStreamRef.current && !(await requestMicrophone())) return;
@@ -1117,11 +1201,12 @@ export default function AssistantPortal({ isOpen, onClose }) {
     };
 
     const disconnectVoice = () => {
+        stopMicAnalyser();
         if (speechRecognitionRef.current) {
             try { speechRecognitionRef.current.stop(); } catch(e){}
             speechRecognitionRef.current = null;
         }
-        // Cancel any pending speech
+        stopBargeInDetector();
         ttsInterruptedRef.current = true;
         ttsQueueRef.current = [];
         ttsSpeakingRef.current = false;
