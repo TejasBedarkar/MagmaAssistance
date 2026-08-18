@@ -965,28 +965,19 @@ export default function AssistantPortal({ isOpen, onClose }) {
     };
 
     const connectVoice = async () => {
-        if (voiceSocketRef.current?.readyState === WebSocket.OPEN || voiceSocketRef.current?.readyState === WebSocket.CONNECTING) return;
-        setVoiceError('');
-        setVoiceStatus('connecting');
+        if (voiceModeOpenRef.current && voiceConnected) return;
 
-        // Preload voices (async on some browsers)
-        if (window.speechSynthesis && window.speechSynthesis.getVoices().length === 0) {
-            await new Promise(resolve => {
-                window.speechSynthesis.onvoiceschanged = resolve;
-                setTimeout(resolve, 1000); // fallback if event never fires
-            });
-        }
-
-        // We no longer await requestMicrophone() here. STT prompts automatically.
-        setMicPermission('granted');
-
-        const sessionId = voiceSessionIdRef.current || (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
-        voiceSessionIdRef.current = sessionId;
-        createVoiceChat();
-
-        // Web Speech API — STT
+        // ----------------------------------------------------------------
+        // 1. Start SpeechRecognition IMMEDIATELY synchronously.
+        // If we await anything before this, the browser will lose the "user gesture"
+        // and silently block the microphone permission prompt for STT!
+        // ----------------------------------------------------------------
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (SpeechRecognition && !speechRecognitionRef.current) {
+        if (SpeechRecognition) {
+            if (speechRecognitionRef.current) {
+                try { speechRecognitionRef.current.stop(); } catch(e){}
+            }
+            
             const recognition = new SpeechRecognition();
             recognition.lang = SPEECH_RECOGNITION_LANGUAGE;
             recognition.continuous = true;
@@ -994,8 +985,6 @@ export default function AssistantPortal({ isOpen, onClose }) {
             recognition.maxAlternatives = 3;
 
             recognition.onresult = (event) => {
-                if (!voiceSocketRef.current || voiceSocketRef.current.readyState !== WebSocket.OPEN) return;
-
                 let interim = '';
                 let final = '';
 
@@ -1009,17 +998,27 @@ export default function AssistantPortal({ isOpen, onClose }) {
 
                 if (interim) {
                     handleVoiceEvent({ type: 'partial_transcript', text: interim });
+                    // Barge-in: STT heard you speak while TTS is playing!
+                    if (ttsSpeakingRef.current) {
+                        console.log('[MAGMA VOICE] Barge-in via STT interim!');
+                        interruptSpeech();
+                        voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
+                    }
                 }
                 if (final) {
                     const cleanText = getRecognizedText([{ transcript: final, confidence: 1 }]);
                     if (!cleanText) return;
+                    
+                    if (!voiceSocketRef.current || voiceSocketRef.current.readyState !== WebSocket.OPEN) {
+                        console.warn('[MAGMA VOICE] Dropping transcript because WebSocket is not open yet.');
+                        return;
+                    }
                     console.log('[MAGMA VOICE] STT final transcript:', cleanText);
                     handleVoiceEvent({ type: 'final_transcript', text: cleanText });
                     voiceSocketRef.current.send(JSON.stringify({ type: 'user_speech', text: cleanText }));
                 }
             };
 
-            // Set mic level strictly based on STT state
             recognition.onaudiostart = () => setMicLevel(0.4);
             recognition.onsoundstart = () => setMicLevel(0.7);
             recognition.onspeechstart = () => setMicLevel(1.0);
@@ -1035,14 +1034,35 @@ export default function AssistantPortal({ isOpen, onClose }) {
             };
 
             recognition.onend = () => {
-                // Restart automatically so we keep listening continuously
                 if (voiceModeOpenRef.current && speechRecognitionRef.current) {
-                    try { speechRecognitionRef.current.start(); } catch(e) { console.warn('[MAGMA VOICE] recognition restart failed:', e); }
+                    try { speechRecognitionRef.current.start(); } catch(e) { console.warn('[MAGMA VOICE] restart failed:', e); }
                 }
             };
 
             speechRecognitionRef.current = recognition;
+            try {
+                recognition.start();
+                setMicPermission('granted');
+            } catch(e) {
+                console.warn('[MAGMA VOICE] Synchronous STT start failed:', e);
+            }
+        } else {
+            setVoiceError('Dictation is not supported in this browser.');
         }
+
+        // ----------------------------------------------------------------
+        // 2. Preload voices (async)
+        // ----------------------------------------------------------------
+        if (window.speechSynthesis && window.speechSynthesis.getVoices().length === 0) {
+            await new Promise(resolve => {
+                window.speechSynthesis.onvoiceschanged = resolve;
+                setTimeout(resolve, 1000); 
+            });
+        }
+
+        const sessionId = voiceSessionIdRef.current || (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        voiceSessionIdRef.current = sessionId;
+        createVoiceChat();
 
         const voiceParams = new URLSearchParams({ session_id: sessionId });
         const hostUrl = API_BASE_URL.replace('http://', 'ws://').replace('https://', 'wss://') || `ws://${window.location.host || 'localhost:8050'}`;
