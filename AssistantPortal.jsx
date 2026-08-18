@@ -943,7 +943,11 @@ export default function AssistantPortal({ isOpen, onClose }) {
         } else if (type === 'interrupted') {
             interruptSpeech();
             if (voiceChatIdRef.current) {
-                updateLastBotMessage(voiceChatIdRef.current, (msg) => ({ ...msg, streaming: false }));
+                updateLastBotMessage(voiceChatIdRef.current, (msg) => ({
+                    ...msg,
+                    streaming: false,
+                    text: msg.text ? msg.text : '[Turn cancelled]'
+                }));
             }
 
         } else if (type === 'done') {
@@ -959,7 +963,7 @@ export default function AssistantPortal({ isOpen, onClose }) {
             }
 
         } else if (type === 'error') {
-            setVoiceError(text || 'The voice server reported an error.');
+            setVoiceError(text || data.message || 'The voice server reported an error.');
             setVoiceStatus('error');
         }
     };
@@ -997,24 +1001,49 @@ export default function AssistantPortal({ isOpen, onClose }) {
                 }
 
                 if (interim) {
-                    handleVoiceEvent({ type: 'partial_transcript', text: interim });
-                    // Barge-in: STT heard you speak while TTS is playing!
-                    if (ttsSpeakingRef.current) {
-                        console.log('[MAGMA VOICE] Barge-in via STT interim!');
-                        interruptSpeech();
-                        voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
+                    const cleanInterim = interim.trim();
+                    if (cleanInterim) {
+                        handleVoiceEvent({ type: 'partial_transcript', text: interim });
+                        // Barge-in Heuristic: Ignore tiny breathing artifacts < 3 characters
+                        if (ttsSpeakingRef.current && cleanInterim.length > 2) {
+                            console.log('[MAGMA VOICE] Barge-in via STT interim!', cleanInterim);
+                            interruptSpeech();
+                            voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
+                        }
                     }
                 }
                 if (final) {
                     const cleanText = getRecognizedText([{ transcript: final, confidence: 1 }]);
-                    if (!cleanText) return;
+                    
+                    // Final STT Heuristic: Ignore pure punctuation/noise artifacts (breathing/fans)
+                    const isNoiseArtifact = !cleanText || cleanText.trim().length <= 1 || /^[^a-zA-Z0-9]+$/.test(cleanText.trim());
+                    if (isNoiseArtifact) {
+                        console.log('[MAGMA VOICE] Ignored noise/breathing artifact:', final);
+                        return;
+                    }
                     
                     if (!voiceSocketRef.current || voiceSocketRef.current.readyState !== WebSocket.OPEN) {
                         console.warn('[MAGMA VOICE] Dropping transcript because WebSocket is not open yet.');
                         return;
                     }
                     console.log('[MAGMA VOICE] STT final transcript:', cleanText);
+
+                    // 1. Cancel the OLD bot message locally if we are barging in
+                    if (voiceStatusRef.current === 'speaking' || voiceStatusRef.current === 'thinking') {
+                        interruptSpeech();
+                        if (voiceChatIdRef.current) {
+                            updateLastBotMessage(voiceChatIdRef.current, (msg) => ({
+                                ...msg,
+                                streaming: false,
+                                text: msg.text ? msg.text : '[Turn cancelled]'
+                            }));
+                        }
+                    }
+
+                    // 2. handleVoiceEvent adds the NEW user text + NEW bot placeholder to the UI
                     handleVoiceEvent({ type: 'final_transcript', text: cleanText });
+                    
+                    // 3. Send the transcript to the server (which cleanly cancels the server's old task automatically)
                     voiceSocketRef.current.send(JSON.stringify({ type: 'user_speech', text: cleanText }));
                 }
             };
@@ -1119,6 +1148,16 @@ export default function AssistantPortal({ isOpen, onClose }) {
         ttsQueueRef.current = [];
         ttsSpeakingRef.current = false;
         window.speechSynthesis?.cancel();
+        
+        // Clean up any hanging thinking state before disconnecting
+        if (voiceChatIdRef.current) {
+            updateLastBotMessage(voiceChatIdRef.current, (msg) => ({
+                ...msg,
+                streaming: false,
+                text: msg.text ? msg.text : '[Turn cancelled]'
+            }));
+        }
+        
         const socket = voiceSocketRef.current;
         voiceSocketRef.current = null;
         if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, 'User disconnected');
@@ -1148,8 +1187,6 @@ const openVoiceMode = () => {
         setVoiceTools([]);
         setPinnedChart(null);
         disconnectVoice();
-        if (playbackCtxRef.current) playbackCtxRef.current.close().catch(() => { });
-        playbackCtxRef.current = null;
         voiceChatIdRef.current = null;
     };
 
@@ -1971,22 +2008,7 @@ const openVoiceMode = () => {
                                         position: 'relative', display: 'flex', alignItems: 'center',
                                         justifyContent: 'center', gap: '16px', zIndex: 3, flexShrink: 0
                                     }}>
-                                        <motion.button
-                                            whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
-                                            onClick={requestMicrophone}
-                                            disabled={micPermission === 'granted'}
-                                            style={{
-                                                border: '1px solid color-mix(in srgb, var(--border-color, #cbd5e1) 50%, transparent)',
-                                                borderRadius: '999px', padding: '12px 20px', fontSize: '13px', fontWeight: '650',
-                                                color: 'var(--text-color, #0f172a)',
-                                                backgroundColor: 'color-mix(in srgb, var(--card-bg, #ffffff) 50%, transparent)',
-                                                backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-                                                cursor: micPermission === 'granted' ? 'default' : 'pointer',
-                                                opacity: micPermission === 'granted' ? 0.7 : 1
-                                            }}
-                                        >
-                                            Mic: {micPermission === 'granted' ? 'Allowed' : micPermission === 'denied' ? 'Retry permission' : 'Allow'}
-                                        </motion.button>
+
                                         <motion.button
                                             whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
                                             onClick={voiceConnected ? disconnectVoice : connectVoice}

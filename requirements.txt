@@ -59,3 +59,4 @@ beautifulsoup4
 lxml
 psycopg2-binary
 boto3
+openai-agents[voice]
