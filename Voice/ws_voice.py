@@ -1,16 +1,28 @@
+"""
+Voice/ws_voice.py — WebSocket voice endpoint
+
+Architecture (Web Speech API mode):
+  Browser SpeechRecognition  →  WS {type:"user_speech", text:"..."}
+  ↓ stream_agent_turn()  →  WS {type:"token"/"tool_call"/"done"...}
+  Browser speechSynthesis reads tokens as they arrive
+
+No audio bytes flow in either direction.
+All ERP + Web tools and stream_history.sqlite are shared with the text chat.
+"""
+
 import asyncio
 import json
 import re
 import time
 from fastapi import WebSocket, WebSocketDisconnect
 
-_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?\u0964])\s+")
 
 def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, save_stream_history):
+
     @app.websocket("/ws/voice")
     async def ws_voice(ws: WebSocket, session_id: str = "voice-default", user_id: str = None):
         await ws.accept()
-        logger.info("[WS/voice] Connection ACCEPTED  session=%s user=%s", session_id, user_id)
+        logger.info("[WS/voice] OPEN  session=%s user=%s", session_id, user_id)
 
         class ConnectionClosed(Exception):
             """Raised when a background task tries to use a closed websocket."""
@@ -18,20 +30,29 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
         connected = True
         state = {"turn_task": None, "speaking": False}
 
-        async def send(message):
+        # ------------------------------------------------------------------ #
+        # Send helpers                                                         #
+        # ------------------------------------------------------------------ #
+
+        async def send_json(payload: dict):
             nonlocal connected
             if not connected:
                 raise ConnectionClosed
             try:
-                await ws.send(message)
+                await ws.send({"type": "websocket.send", "text": json.dumps(payload)})
             except (WebSocketDisconnect, RuntimeError, OSError) as exc:
                 connected = False
                 raise ConnectionClosed from exc
 
-        async def send_json(payload):
-            await send({"type": "websocket.send", "text": json.dumps(payload)})
+        # ------------------------------------------------------------------ #
+        # Shared conversation history (same sqlite as /api/chat/stream)       #
+        # ------------------------------------------------------------------ #
 
         history = await load_stream_history(session_id)
+
+        # ------------------------------------------------------------------ #
+        # Turn management                                                      #
+        # ------------------------------------------------------------------ #
 
         async def cancel_turn():
             task = state["turn_task"]
@@ -42,215 +63,157 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
                 except asyncio.CancelledError:
                     pass
                 except Exception:
-                    logger.exception("Voice turn task raised on cancel")
+                    logger.exception("[WS/voice] Turn task raised on cancel")
             state["turn_task"] = None
             state["speaking"] = False
 
-        async def speak_chunk(text_chunk: str):
-            if not text_chunk.strip():
-                return
-            try:
-                from Voice import openai_tts
-                t0 = time.monotonic()
-                audio_bytes = await openai_tts.synthesize(text_chunk)
-                elapsed = (time.monotonic() - t0) * 1000
-                logger.debug(
-                    "[WS/voice] TTS  %.0fms  %d bytes  text=%r",
-                    elapsed, len(audio_bytes), text_chunk[:60]
-                )
-                await send({"type": "websocket.send", "bytes": audio_bytes})
-            except Exception as e:
-                logger.error("[WS/voice] TTS ERROR: %s", e)
+        # ------------------------------------------------------------------ #
+        # Text cleaning for TTS (removes markdown, tables, action tags)       #
+        # The cleaned text is sent as voice_text events so the browser        #
+        # speechSynthesis speaks clean prose instead of raw markdown.         #
+        # ------------------------------------------------------------------ #
 
-        class TTSFilter:
-            def __init__(self):
-                self.buffer = ""
-                self.accumulated_sentences = []
-                
-            def _clean(self, text):
-                text = re.sub(r'\[Action:.*?\]', '', text)
-                text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-                
-                lines = text.split('\n')
-                cleaned_lines = []
-                for line in lines:
-                    stripped = line.strip()
-                    if stripped.startswith('|') and stripped.endswith('|'):
-                        continue
-                    cleaned_lines.append(line)
-                
-                text = '\n'.join(cleaned_lines)
-                text = text.replace('*', '').replace('#', '')
-                return text.strip()
+        _ACTION_TAG_RE = re.compile(r'\[Action:[^\]]*\]')
+        _CODE_BLOCK_RE = re.compile(r'```[\s\S]*?```')
+        _TABLE_LINE_RE = re.compile(r'^\s*\|.*\|\s*$')
 
-            def process_token(self, text):
-                results = []
-                self.buffer += text
-                
-                if '[' in self.buffer and ']' not in self.buffer[self.buffer.rfind('['):]:
-                    return results
-                    
-                if '```' in self.buffer and self.buffer.count('```') % 2 != 0:
-                    return results
+        def clean_for_speech(text: str) -> str:
+            """Strip markdown formatting that sounds awful when spoken."""
+            text = _ACTION_TAG_RE.sub('', text)
+            text = _CODE_BLOCK_RE.sub('', text)
+            lines = [l for l in text.split('\n') if not _TABLE_LINE_RE.match(l)]
+            text = '\n'.join(lines)
+            text = text.replace('**', '').replace('*', '').replace('#', '')
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text
 
-                parts = re.split(r'(?<=[.!?\u0964])\s+', self.buffer)
-                
-                if len(parts) > 1:
-                    for i in range(len(parts) - 1):
-                        cleaned = self._clean(parts[i])
-                        if cleaned:
-                            while len(cleaned) > 450:
-                                split_idx = cleaned.rfind(' ', 0, 450)
-                                if split_idx == -1: split_idx = 450
-                                self.accumulated_sentences.append(cleaned[:split_idx])
-                                cleaned = cleaned[split_idx:].strip()
-                            if cleaned:
-                                self.accumulated_sentences.append(cleaned)
-                            
-                    self.buffer = parts[-1]
-                    
-                    combined = " ".join(self.accumulated_sentences)
-                    if len(self.accumulated_sentences) >= 2 or len(combined) > 250:
-                        if len(combined) > 450:
-                            for s in self.accumulated_sentences:
-                                results.append(s)
-                        else:
-                            results.append(combined)
-                        self.accumulated_sentences = []
-                        
-                return results
-
-            def flush(self):
-                results = []
-                cleaned = self._clean(self.buffer)
-                if cleaned:
-                    while len(cleaned) > 450:
-                        split_idx = cleaned.rfind(' ', 0, 450)
-                        if split_idx == -1: split_idx = 450
-                        self.accumulated_sentences.append(cleaned[:split_idx])
-                        cleaned = cleaned[split_idx:].strip()
-                    if cleaned:
-                        self.accumulated_sentences.append(cleaned)
-                    
-                if self.accumulated_sentences:
-                    combined = " ".join(self.accumulated_sentences)
-                    if len(combined) > 450:
-                        for s in self.accumulated_sentences:
-                            results.append(s)
-                    else:
-                        results.append(combined)
-                    
-                self.buffer = ""
-                self.accumulated_sentences = []
-                return results
+        # ------------------------------------------------------------------ #
+        # Core turn: call agent, stream events back to browser                #
+        # ------------------------------------------------------------------ #
 
         async def run_turn(text: str):
+            t0 = time.monotonic()
             logger.info("[WS/voice] turn START  session=%s  text=%r", session_id, text[:120])
-            t_turn = time.monotonic()
             state["speaking"] = True
-            
-            tts_queue = asyncio.Queue()
-            
-            async def tts_worker():
-                while True:
-                    chunk = await tts_queue.get()
-                    if chunk is None:
-                        break
-                    await speak_chunk(chunk)
-                    tts_queue.task_done()
-                    
-            worker_task = asyncio.create_task(tts_worker())
-            tts_filter = TTSFilter()
-            
+            token_buf = ""   # accumulates cleaned text for speech
+
             try:
-                async for event in stream_agent_turn(text, session_id=session_id, user_id=user_id, history=history):
+                async for event in stream_agent_turn(
+                    text, session_id=session_id, user_id=user_id, history=history
+                ):
                     etype = event["type"]
+
                     if etype == "token":
-                        await send_json({"type": "token", "text": event["text"]})
-                        for chunk in tts_filter.process_token(event["text"]):
-                            await tts_queue.put(chunk)
+                        raw = event["text"]
+                        await send_json({"type": "token", "text": raw})
+                        token_buf += raw
+
+                        # Emit a voice_sentence whenever a sentence boundary
+                        # is detected so speechSynthesis can start speaking
+                        # before the full reply is done — low latency.
+                        parts = re.split(r'(?<=[.!?\u0964])\s+', token_buf)
+                        if len(parts) > 1:
+                            for sentence in parts[:-1]:
+                                cleaned = clean_for_speech(sentence)
+                                if cleaned:
+                                    await send_json({"type": "voice_sentence", "text": cleaned})
+                            token_buf = parts[-1]
+
                     elif etype == "tool_call":
-                        logger.info("[WS/voice] tool_call  name=%s  args=%s", event["name"], str(event.get("args", {}))[:200])
-                        await send_json({"type": "tool_call", "name": event["name"], "args": event["args"]})
+                        logger.info(
+                            "[WS/voice] tool_call  name=%s  args=%s",
+                            event["name"], str(event.get("args", {}))[:200]
+                        )
+                        await send_json({
+                            "type": "tool_call",
+                            "name": event["name"],
+                            "args": event.get("args", {})
+                        })
+
                     elif etype == "tool_result":
-                        logger.info("[WS/voice] tool_result  name=%s  result=%s", event["name"], str(event.get("result", ""))[:200])
-                        await send_json({"type": "tool_result", "name": event["name"], "result": str(event["result"])})
+                        logger.info(
+                            "[WS/voice] tool_result  name=%s  result=%s",
+                            event["name"], str(event.get("result", ""))[:200]
+                        )
+                        await send_json({
+                            "type": "tool_result",
+                            "name": event["name"],
+                            "result": str(event.get("result", ""))
+                        })
+
                     elif etype == "done":
-                        final_chunks = tts_filter.flush()
-                        for chunk in final_chunks:
-                            await tts_queue.put(chunk)
-                        await tts_queue.put(None)
-                        await worker_task
-                        elapsed = (time.monotonic() - t_turn) * 1000
+                        # Flush any remaining text in the buffer
+                        final = clean_for_speech(token_buf)
+                        if final:
+                            await send_json({"type": "voice_sentence", "text": final})
+                        token_buf = ""
+                        elapsed = (time.monotonic() - t0) * 1000
                         logger.info("[WS/voice] turn DONE  %.0fms  session=%s", elapsed, session_id)
                         await send_json({"type": "done"})
-                
+
                 await save_stream_history(session_id, history)
+
             except asyncio.CancelledError:
-                if not worker_task.done():
-                    worker_task.cancel()
+                logger.info("[WS/voice] turn CANCELLED  session=%s", session_id)
                 raise
             except ConnectionClosed:
                 pass
-            except Exception as e:
-                logger.exception("Voice turn failed")
+            except Exception as exc:
+                logger.exception("[WS/voice] Turn failed: %s", exc)
                 try:
-                    await send_json({"type": "error", "message": str(e)})
+                    await send_json({"type": "error", "message": str(exc)})
                 except ConnectionClosed:
                     pass
             finally:
                 state["speaking"] = False
 
+        # ------------------------------------------------------------------ #
+        # Main receive loop                                                   #
+        # ------------------------------------------------------------------ #
+
         try:
             while True:
                 message = await ws.receive()
+
                 if message.get("type") == "websocket.disconnect":
+                    logger.info("[WS/voice] DISCONNECT  session=%s", session_id)
                     connected = False
                     break
-                
+
                 text_msg = message.get("text")
                 if not text_msg:
                     continue
+
                 try:
                     control = json.loads(text_msg)
                 except Exception:
+                    logger.warning("[WS/voice] Bad JSON from client: %r", text_msg[:120])
                     continue
-                
+
                 msg_type = control.get("type")
-                
-                if msg_type == "interrupt":
-                    if state["speaking"] or state["turn_task"]:
-                        await cancel_turn()
-                        await send_json({"type": "interrupted"})
-                elif msg_type == "audio":
+                logger.debug("[WS/voice] recv  type=%s  session=%s", msg_type, session_id)
+
+                if msg_type == "user_speech":
+                    # Web Speech API STT → transcript text arrives here
+                    text = (control.get("text") or "").strip()
+                    if not text:
+                        continue
+                    logger.info("[WS/voice] user_speech  %r  session=%s", text[:120], session_id)
                     await cancel_turn()
-                    audio_b64 = control.get("data", "")
-                    if audio_b64:
-                        import base64
-                        from Voice import openai_stt
-                        try:
-                            audio_bytes = base64.b64decode(audio_b64)
-                            logger.info("[WS/voice] STT request  %d bytes audio  session=%s", len(audio_bytes), session_id)
-                            t0 = time.monotonic()
-                            stt_result = await openai_stt.transcribe(audio_bytes)
-                            elapsed = (time.monotonic() - t0) * 1000
-                            transcript = stt_result["transcript"].strip()
-                            logger.info("[WS/voice] STT result  %.0fms  %r", elapsed, transcript[:120])
-                            if transcript:
-                                await send_json({"type": "final_transcript", "text": transcript})
-                                state["turn_task"] = asyncio.create_task(run_turn(transcript))
-                            else:
-                                logger.warning("[WS/voice] STT returned empty transcript")
-                        except Exception as e:
-                            logger.error("[WS/voice] STT ERROR: %s", e)
-                            await send_json({"type": "error", "message": f"STT failed: {e}"})
-                elif msg_type == "user_speech":
+                    state["turn_task"] = asyncio.create_task(run_turn(text))
+
+                elif msg_type == "interrupt":
+                    logger.info("[WS/voice] interrupt requested  session=%s", session_id)
                     await cancel_turn()
-                    state["turn_task"] = asyncio.create_task(run_turn(control.get("text", "")))
+                    await send_json({"type": "interrupted"})
+
                 elif msg_type == "end":
+                    logger.info("[WS/voice] end received  session=%s", session_id)
                     break
+
         except (WebSocketDisconnect, ConnectionClosed):
             connected = False
         finally:
             connected = False
             await cancel_turn()
+            logger.info("[WS/voice] CLOSED  session=%s", session_id)

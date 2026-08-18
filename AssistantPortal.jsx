@@ -479,21 +479,23 @@ export default function AssistantPortal({ isOpen, onClose }) {
     const voiceSessionIdRef = useRef(null);
     const voiceStatusRef = useRef('idle');
     const bargeInStreakRef = useRef(0);
-    const captureNodeRef = useRef(null);
-    const captureSourceRef = useRef(null);
-    const pcmPendingRef = useRef([]);
-    const playbackCtxRef = useRef(null);
-    const playbackCursorRef = useRef(0);
     const streamingReplyRef = useRef('');
     const voiceChatIdRef = useRef(null);
-    const audioCtxRef = useRef(null);
-    const analyserRef = useRef(null);
     const micStreamRef = useRef(null);
     const micRafRef = useRef(null);
     const micNoiseGateRef = useRef({ noiseFloor: 0.02, open: false, hangover: 0, calibrationFrames: 20, speechCandidateFrames: 0 });
     const voiceConversationEndRef = useRef(null);
     const orbRef = useRef(null);
     const speechRecognitionRef = useRef(null);
+    // Web Speech TTS: queue of utterances waiting to be spoken
+    const ttsQueueRef = useRef([]);
+    const ttsSpeakingRef = useRef(false);
+    const ttsInterruptedRef = useRef(false);
+    const audioCtxRef = useRef(null);
+    const analyserRef = useRef(null);
+    const captureNodeRef = useRef(null);
+    const captureSourceRef = useRef(null);
+    const pcmPendingRef = useRef([]);
 
     const activeChat = chatHistory.find(c => c.id === currentChatId);
     const activeMessages = activeChat ? activeChat.messages : messages;
@@ -770,9 +772,63 @@ export default function AssistantPortal({ isOpen, onClose }) {
         }
     };
 
-    // ---- Realtime WebSocket voice helpers (PCM16 mono, 24 kHz) ----
-    const VOICE_SAMPLE_RATE = 24000;
-    const VOICE_CHUNK_SAMPLES = 960; // exactly 40 ms at 24 kHz
+    // ---- Web Speech TTS helpers ----
+
+    // Pick the best available en-IN or en-GB voice from speechSynthesis.
+    // Falls back to any English voice, then the browser default.
+    const pickTtsVoice = () => {
+        const voices = window.speechSynthesis?.getVoices() || [];
+        return (
+            voices.find(v => v.lang === 'en-IN') ||
+            voices.find(v => v.lang === 'en-GB') ||
+            voices.find(v => v.lang.startsWith('en')) ||
+            null
+        );
+    };
+
+    // Drain the TTS sentence queue — called after each utterance ends.
+    const drainTtsQueue = () => {
+        if (ttsInterruptedRef.current) { ttsQueueRef.current = []; ttsSpeakingRef.current = false; return; }
+        if (ttsQueueRef.current.length === 0) {
+            ttsSpeakingRef.current = false;
+            // All speech done — return orb to listening state
+            if (voiceModeOpenRef.current) setVoiceStatus('listening');
+            return;
+        }
+        const text = ttsQueueRef.current.shift();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = 'en-IN';
+        utterance.rate = 1.05;
+        utterance.pitch = 1.0;
+        const voice = pickTtsVoice();
+        if (voice) utterance.voice = voice;
+        utterance.onstart = () => {
+            setVoiceStatus('speaking');
+            console.log('[MAGMA VOICE] speechSynthesis speaking:', text.slice(0, 60));
+        };
+        utterance.onend = () => {
+            console.log('[MAGMA VOICE] speechSynthesis chunk done');
+            drainTtsQueue();
+        };
+        utterance.onerror = (e) => {
+            console.error('[MAGMA VOICE] speechSynthesis error:', e.error);
+            drainTtsQueue();
+        };
+        ttsSpeakingRef.current = true;
+        window.speechSynthesis.speak(utterance);
+    };
+
+    // Enqueue a sentence for speaking. Deduplicates consecutive identical sentences.
+    const speakSentence = (text) => {
+        const clean = (text || '').trim();
+        if (!clean) return;
+        console.log('[MAGMA VOICE] speakSentence queued:', clean.slice(0, 80));
+        ttsInterruptedRef.current = false;
+        ttsQueueRef.current.push(clean);
+        if (!ttsSpeakingRef.current) drainTtsQueue();
+    };
+
+    // ---- Mic level analyser (kept for the orb animation) ----
 
     const addVoiceEvent = (type, detail = '') => {
         setVoiceEvents((events) => [...events.slice(-5), { type, detail: String(detail || '') }]);
@@ -789,137 +845,18 @@ export default function AssistantPortal({ isOpen, onClose }) {
         return id;
     };
 
-    const resampleTo24k = (samples, sourceRate) => {
-        if (sourceRate === VOICE_SAMPLE_RATE) return samples;
-        const ratio = sourceRate / VOICE_SAMPLE_RATE;
-        const output = new Float32Array(Math.floor(samples.length / ratio));
-        for (let i = 0; i < output.length; i++) {
-            const position = i * ratio;
-            const left = Math.floor(position);
-            const mix = position - left;
-            output[i] = samples[left] * (1 - mix) + (samples[Math.min(left + 1, samples.length - 1)] || 0) * mix;
-        }
-        return output;
-    };
-
-    const sendPcm = (samples) => {
-        const socket = voiceSocketRef.current;
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        const pending = pcmPendingRef.current;
-        for (let i = 0; i < samples.length; i++) pending.push(samples[i]);
-        while (pending.length >= VOICE_CHUNK_SAMPLES) {
-            const buffer = new ArrayBuffer(VOICE_CHUNK_SAMPLES * 2);
-            const view = new DataView(buffer);
-            for (let i = 0; i < VOICE_CHUNK_SAMPLES; i++) {
-                const sample = Math.max(-1, Math.min(1, pending.shift()));
-                view.setInt16(i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
-            }
-            socket.send(buffer);
-        }
-    };
-
-    // Browser noiseSuppression is only a best-effort constraint and is ignored
-    // by some devices. Keep sending silence (so server-side VAD timing remains
-    // correct), but prevent steady fan/room noise from becoming speech audio.
-    //
-    // Values matched to Livechat AudioCapture.js (industry-level VAD):
-    //   noiseFloor = 0.02   (conservative starting estimate, never below 0.003)
-    //   NOISE_MULTIPLIER = 5.0  (aggressive noise rejection)
-    //   SPEECH_CONFIRM_FRAMES = 3  (hysteresis: requires N consecutive above-threshold frames)
-    //   hangover = ~17 frames (~700ms) for natural sentence pauses
-    const suppressBackgroundNoise = (samples) => {
-        const state = micNoiseGateRef.current;
-        const NOISE_MULTIPLIER = 5.0;
-        const SPEECH_CONFIRM_FRAMES = 3;
-
-        let energy = 0;
-        for (let i = 0; i < samples.length; i++) energy += samples[i] * samples[i];
-        const rms = Math.sqrt(energy / Math.max(1, samples.length));
-
-        // Initial calibration: capture ambient room level before speech starts
-        if (state.calibrationFrames > 0) {
-            state.noiseFloor = (state.noiseFloor * 0.85) + (Math.min(rms, 0.04) * 0.15);
-            state.noiseFloor = Math.max(state.noiseFloor, 0.003); // Never below 0.003
-            state.calibrationFrames -= 1;
-            return new Float32Array(samples.length);
-        }
-
-        const threshold = state.noiseFloor * NOISE_MULTIPLIER;
-
-        if (!state.open) {
-            // Live recalibrate floor only during confirmed silence
-            if (rms < threshold) {
-                const newFloor = Math.max(state.noiseFloor * 0.9 + rms * 0.1, 0.003);
-                if (Math.abs(newFloor - state.noiseFloor) > 0.0005) {
-                    state.noiseFloor = newFloor;
-                }
-            }
-            // Hysteresis: require SPEECH_CONFIRM_FRAMES consecutive above-threshold frames
-            if (rms >= threshold) {
-                state.speechCandidateFrames = (state.speechCandidateFrames || 0) + 1;
-                if (state.speechCandidateFrames >= SPEECH_CONFIRM_FRAMES) {
-                    state.open = true;
-                    state.speechCandidateFrames = 0;
-                    state.hangover = 17; // ~700ms — natural sentence pause
-                }
-            } else {
-                state.speechCandidateFrames = 0;
-            }
-        } else if (rms >= threshold) {
-            state.hangover = 17; // Reset on continued speech
-        } else if (state.hangover > 0) {
-            state.hangover -= 1;
-        } else {
-            state.open = false;
-        }
-
-        return state.open ? samples : new Float32Array(samples.length);
-    };
-
-    const playPcm = async (payload) => {
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
-            playbackCtxRef.current = new AudioCtx({ sampleRate: VOICE_SAMPLE_RATE });
-            playbackCursorRef.current = 0;
-            console.log('[MAGMA VOICE] AudioContext created, sampleRate:', VOICE_SAMPLE_RATE);
-        }
-        const context = playbackCtxRef.current;
-        await context.resume();
-        const bytes = payload instanceof Blob ? await payload.arrayBuffer() : payload;
-        const pcm = new Int16Array(bytes);
-        console.log(`[MAGMA VOICE] playPcm: received ${bytes.byteLength} bytes → ${pcm.length} PCM samples, ctx.state=${context.state}`);
-        const audioBuffer = context.createBuffer(1, pcm.length, VOICE_SAMPLE_RATE);
-        const channel = audioBuffer.getChannelData(0);
-        for (let i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
-        const source = context.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(context.destination);
-        const startAt = Math.max(context.currentTime + 0.015, playbackCursorRef.current);
-        source.start(startAt);
-        playbackCursorRef.current = startAt + audioBuffer.duration;
-        console.log(`[MAGMA VOICE] playPcm: scheduled ${audioBuffer.duration.toFixed(3)}s of audio at t=${startAt.toFixed(3)}s`);
-        setVoiceStatus('speaking');
-        source.onended = () => {
-            console.log('[MAGMA VOICE] playPcm: chunk ended, cursor:', playbackCursorRef.current?.toFixed(3));
-            if (voiceModeOpenRef.current && context.currentTime >= playbackCursorRef.current - 0.03) {
-                setVoiceStatus('listening');
-            }
-        };
-    };
 
     // Stops whatever the assistant is currently saying — used on manual tap,
     // a server-sent 'interrupted' event, client-side barge-in detection, and
     // every "this session is going away" exit path below (closing the
     // portal, switching chats, unmounting). Closing the AudioContext outright
     // (rather than just clearing a queue) guarantees every already-scheduled
-    // chunk is silenced immediately, not just future ones.
     const interruptSpeech = () => {
-        console.log('[MAGMA VOICE] interruptSpeech: closing AudioContext and clearing reply buffer');
-        if (playbackCtxRef.current) {
-            playbackCtxRef.current.close().catch(() => { });
-        }
-        playbackCtxRef.current = null;
-        playbackCursorRef.current = 0;
+        console.log('[MAGMA VOICE] interruptSpeech: cancel speechSynthesis and clear queue');
+        ttsInterruptedRef.current = true;
+        ttsSpeakingRef.current = false;
+        ttsQueueRef.current = [];
+        window.speechSynthesis?.cancel();
         streamingReplyRef.current = '';
         if (voiceModeOpenRef.current && voiceSocketRef.current?.readyState === WebSocket.OPEN) {
             setVoiceStatus('listening');
@@ -967,17 +904,17 @@ export default function AssistantPortal({ isOpen, onClose }) {
     const handleVoiceEvent = (event) => {
         const type = event.type;
         const text = event.text ?? event.transcript ?? event.token ?? event.delta ?? event.message ?? event.response ?? '';
-        // Full event log — filter by '[MAGMA VOICE]' in DevTools console
         if (type === 'token') {
-            // Tokens are high-frequency: log brief summary only
             console.debug(`[MAGMA VOICE] event:token (+${text.length} chars)`);
         } else {
             console.log(`[MAGMA VOICE] event:${type}`, event);
         }
         addVoiceEvent(type, text || event.name || event.tool_name || '');
+
         if (type === 'partial_transcript') {
             setLiveTranscript(text);
             setVoiceStatus('listening');
+
         } else if (type === 'final_transcript') {
             setLiveTranscript(text);
             if (text) {
@@ -988,25 +925,30 @@ export default function AssistantPortal({ isOpen, onClose }) {
             setVoiceTools([]);
             setVoiceStatus('thinking');
             streamingReplyRef.current = '';
+
         } else if (type === 'token') {
             streamingReplyRef.current += text;
             setLastReplyText(streamingReplyRef.current);
             setVoiceStatus('speaking');
-            
             if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({ ...msg, text: streamingReplyRef.current }));
             }
+
+        } else if (type === 'voice_sentence') {
+            // Server sent a clean, speech-ready sentence — speak it now
+            speakSentence(text);
+
         } else if (type === 'tool_call') {
             const toolObj = { name: event.name || event.tool_name, args: event.args || {}, status: 'running', result: null };
             setVoiceTools((prev) => [...prev, toolObj]);
             setVoiceStatus('thinking');
-            
             if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({
                     ...msg,
                     tools: [...(msg.tools || []), toolObj]
                 }));
             }
+
         } else if (type === 'tool_result') {
             setVoiceTools((prev) => {
                 const next = [...prev];
@@ -1019,7 +961,6 @@ export default function AssistantPortal({ isOpen, onClose }) {
                 return next;
             });
             setVoiceStatus('thinking');
-            
             if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => {
                     const tools = [...(msg.tools || [])];
@@ -1032,11 +973,13 @@ export default function AssistantPortal({ isOpen, onClose }) {
                     return { ...msg, tools };
                 });
             }
+
         } else if (type === 'interrupted') {
             interruptSpeech();
             if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({ ...msg, streaming: false }));
             }
+
         } else if (type === 'done') {
             const reply = streamingReplyRef.current;
             setLastReplyText(reply);
@@ -1044,11 +987,11 @@ export default function AssistantPortal({ isOpen, onClose }) {
             const tables = extractMarkdownTables(cleanText);
             if (chartData || tables.length) setPinnedChart({ chartData, tables });
             streamingReplyRef.current = '';
-            setVoiceStatus('listening');
-            
+            // Status will be set to 'listening' when the TTS queue drains
             if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({ ...msg, streaming: false }));
             }
+
         } else if (type === 'error') {
             setVoiceError(text || 'The voice server reported an error.');
             setVoiceStatus('error');
@@ -1059,33 +1002,33 @@ export default function AssistantPortal({ isOpen, onClose }) {
         if (voiceSocketRef.current?.readyState === WebSocket.OPEN || voiceSocketRef.current?.readyState === WebSocket.CONNECTING) return;
         setVoiceError('');
         setVoiceStatus('connecting');
-        
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
-            playbackCtxRef.current = new AudioCtx({ sampleRate: VOICE_SAMPLE_RATE });
-            playbackCursorRef.current = 0;
+
+        // Preload voices (async on some browsers)
+        if (window.speechSynthesis && window.speechSynthesis.getVoices().length === 0) {
+            window.speechSynthesis.onvoiceschanged = () => {};
         }
-        playbackCtxRef.current.resume().catch(() => {});
+
         if (!micStreamRef.current && !(await requestMicrophone())) return;
-        
+
         const sessionId = voiceSessionIdRef.current || (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
         voiceSessionIdRef.current = sessionId;
         createVoiceChat();
-        
-        // Native Browser STT
+
+        // Web Speech API — STT
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (SpeechRecognition && !speechRecognitionRef.current) {
             const recognition = new SpeechRecognition();
             recognition.lang = SPEECH_RECOGNITION_LANGUAGE;
             recognition.continuous = true;
             recognition.interimResults = true;
-            
+            recognition.maxAlternatives = 3;
+
             recognition.onresult = (event) => {
                 if (!voiceSocketRef.current || voiceSocketRef.current.readyState !== WebSocket.OPEN) return;
-                
+
                 let interim = '';
                 let final = '';
-                
+
                 for (let i = event.resultIndex; i < event.results.length; ++i) {
                     if (event.results[i].isFinal) {
                         final += event.results[i][0].transcript;
@@ -1093,39 +1036,44 @@ export default function AssistantPortal({ isOpen, onClose }) {
                         interim += event.results[i][0].transcript;
                     }
                 }
-                
+
                 if (interim) {
                     handleVoiceEvent({ type: 'partial_transcript', text: interim });
                 }
                 if (final) {
                     const cleanText = getRecognizedText([{ transcript: final, confidence: 1 }]);
-                    handleVoiceEvent({ type: 'final_transcript', text: cleanText });
+                    if (!cleanText) return;
+                    console.log('[MAGMA VOICE] STT final transcript:', cleanText);
+                    // Barge-in: interrupt TTS if the assistant is speaking
                     if (voiceStatusRef.current === 'speaking') {
                         interruptSpeech();
+                        voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
                     }
-                    voiceSocketRef.current.send(JSON.stringify({ type: "user_speech", text: cleanText }));
+                    handleVoiceEvent({ type: 'final_transcript', text: cleanText });
+                    voiceSocketRef.current.send(JSON.stringify({ type: 'user_speech', text: cleanText }));
                 }
             };
-            
+
             recognition.onerror = (e) => {
-                if (e.error !== 'no-speech') {
+                console.warn('[MAGMA VOICE] SpeechRecognition error:', e.error);
+                if (e.error !== 'no-speech' && e.error !== 'aborted') {
                     setVoiceError('Speech recognition error: ' + e.error);
                 }
             };
-            
+
             recognition.onend = () => {
+                // Restart automatically so we keep listening continuously
                 if (voiceModeOpenRef.current && speechRecognitionRef.current) {
-                    try { speechRecognitionRef.current.start(); } catch(e){}
+                    try { speechRecognitionRef.current.start(); } catch(e) { console.warn('[MAGMA VOICE] recognition restart failed:', e); }
                 }
             };
-            
+
             speechRecognitionRef.current = recognition;
         }
-        
+
         const voiceParams = new URLSearchParams({ session_id: sessionId });
         const hostUrl = API_BASE_URL.replace('http://', 'ws://').replace('https://', 'wss://') || `ws://${window.location.host || 'localhost:8050'}`;
         const socket = new WebSocket(`${hostUrl}/ws/voice?${voiceParams.toString()}`);
-        socket.binaryType = 'arraybuffer';
         voiceSocketRef.current = socket;
         
         socket.onopen = () => {
@@ -1134,36 +1082,31 @@ export default function AssistantPortal({ isOpen, onClose }) {
             setVoiceStatus('listening');
             addVoiceEvent('connected', sessionId);
             if (speechRecognitionRef.current) {
-                try { speechRecognitionRef.current.start(); } catch(e){ console.warn('[MAGMA VOICE] SpeechRecognition.start() failed:', e); }
+                try { speechRecognitionRef.current.start(); } catch(e) { console.warn('[MAGMA VOICE] SpeechRecognition.start() failed:', e); }
             }
         };
-        
+
         socket.onmessage = (message) => {
+            // No binary frames expected — server sends only JSON text events now
             if (typeof message.data !== 'string') {
-                const byteLen = message.data instanceof ArrayBuffer ? message.data.byteLength : '?';
-                console.log(`[MAGMA VOICE] Binary message received: ${byteLen} bytes (PCM audio chunk)`);
-                playPcm(message.data).catch((error) => {
-                    console.error('[MAGMA VOICE] playPcm ERROR:', error);
-                    setVoiceError(`Audio playback failed: ${error.message}`);
-                    setVoiceStatus('error');
-                });
+                console.warn('[MAGMA VOICE] Unexpected binary frame ignored, size:', message.data?.byteLength);
                 return;
             }
             try {
                 const parsed = JSON.parse(message.data);
                 handleVoiceEvent(parsed);
             } catch (error) {
-                console.error('[MAGMA VOICE] JSON parse ERROR on message:', message.data, error);
+                console.error('[MAGMA VOICE] JSON parse ERROR:', message.data, error);
                 addVoiceEvent('error', 'Invalid JSON event');
             }
         };
-        
+
         socket.onerror = (err) => {
             console.error('[MAGMA VOICE] WebSocket ERROR:', err);
             setVoiceError('Could not connect to the voice service.');
             setVoiceStatus('error');
         };
-        
+
         socket.onclose = (evt) => {
             console.log(`[MAGMA VOICE] WebSocket CLOSED: code=${evt.code} reason="${evt.reason}" wasClean=${evt.wasClean}`);
             setVoiceConnected(false);
@@ -1178,12 +1121,16 @@ export default function AssistantPortal({ isOpen, onClose }) {
             try { speechRecognitionRef.current.stop(); } catch(e){}
             speechRecognitionRef.current = null;
         }
+        // Cancel any pending speech
+        ttsInterruptedRef.current = true;
+        ttsQueueRef.current = [];
+        ttsSpeakingRef.current = false;
+        window.speechSynthesis?.cancel();
         const socket = voiceSocketRef.current;
         voiceSocketRef.current = null;
         if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, 'User disconnected');
         setVoiceConnected(false);
         setVoiceStatus('idle');
-        pcmPendingRef.current = [];
     };
 const openVoiceMode = () => {
         if (voiceModeOpenRef.current) return;
