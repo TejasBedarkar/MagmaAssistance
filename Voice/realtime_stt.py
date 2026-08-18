@@ -33,7 +33,7 @@ VAD_CALIBRATION_MS = float(os.environ.get("STT_VAD_CALIBRATION_MS", "500"))
 VAD_NOISE_MULTIPLIER = float(os.environ.get("STT_VAD_NOISE_MULTIPLIER", "3.0"))
 VAD_NOISE_MARGIN = float(os.environ.get("STT_VAD_NOISE_MARGIN", "250"))
 VAD_MAX_NOISE_FLOOR = float(os.environ.get("STT_VAD_MAX_NOISE_FLOOR", "1200"))
-VAD_DEBUG = os.environ.get("STT_VAD_DEBUG", "1") == "0"
+VAD_DEBUG = True
 
 
 def _rms(pcm_bytes: bytes) -> float:
@@ -140,10 +140,7 @@ class RealtimeTranscriber:
         if self._noise_floor is None:
             self._noise_floor = energy
         elif not self._speaking and self._speech_ms == 0:
-            self._noise_floor = min(
-                self._noise_floor * 0.95 + energy * 0.05,
-                VAD_MAX_NOISE_FLOOR,
-            )
+            self._noise_floor = self._noise_floor * 0.95 + energy * 0.05
         adaptive_threshold = max(
             VAD_ENERGY_THRESHOLD,
             self._noise_floor * VAD_NOISE_MULTIPLIER + VAD_NOISE_MARGIN,
