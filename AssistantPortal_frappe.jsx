@@ -5,7 +5,6 @@ import BentoWelcome from './BentoWelcome';
 import ChatArea, { ToolActivityPanel, ChartBlock, FormattedMarkdownText, EmbeddedBase64Image, getCleanTextAndChart, API_BASE_URL } from './ChatArea';
 import { useVoiceSession } from './useVoiceSession';
 import OrbController from './orb/OrbController.js';
-import AudioCapture from './AudioCapture.js';
 import './orb.css';
 
 // API_BASE_URL now lives in ChatArea.jsx (top of the file) — edit it
@@ -479,24 +478,15 @@ export default function AssistantPortal({ isOpen, onClose }) {
     const voiceSocketRef = useRef(null);
     const voiceSessionIdRef = useRef(null);
     const voiceStatusRef = useRef('idle');
-    const bargeInStreakRef = useRef(0);
-    const captureNodeRef = useRef(null);
-    const captureSourceRef = useRef(null);
-    const pcmPendingRef = useRef([]);
-    const playbackCtxRef = useRef(null);
-    const playbackCursorRef = useRef(0);
     const streamingReplyRef = useRef('');
     const voiceChatIdRef = useRef(null);
-    const audioCtxRef = useRef(null);
-    const analyserRef = useRef(null);
-    const micStreamRef = useRef(null);
-    const micRafRef = useRef(null);
-    const micNoiseGateRef = useRef({ noiseFloor: 0.02, open: false, hangover: 0, calibrationFrames: 20, speechCandidateFrames: 0 });
     const voiceConversationEndRef = useRef(null);
     const orbRef = useRef(null);
     const speechRecognitionRef = useRef(null);
-    const audioCaptureRef = useRef(null);
-    const runningToolsCountRef = useRef(0);
+    // Web Speech TTS: queue of utterances waiting to be spoken
+    const ttsQueueRef = useRef([]);
+    const ttsSpeakingRef = useRef(false);
+    const ttsInterruptedRef = useRef(false);
 
     const activeChat = chatHistory.find(c => c.id === currentChatId);
     const activeMessages = activeChat ? activeChat.messages : messages;
@@ -519,61 +509,32 @@ export default function AssistantPortal({ isOpen, onClose }) {
         resizeMessageInput(messageInputRef.current);
     }, [input, currentChatId]);
 
-    const dictationRef = useRef(null);
-    const originalInputRef = useRef('');
+    // WebRTC Direct-to-OpenAI voice session hook
+    // Handles: token lifecycle, SDP exchange, tool interception → backend execution
+    const { status: webRtcStatus, transcript: webRtcTranscript, start: startVoice, stop: stopVoice } = useVoiceSession({
+        sessionId: currentChatId || 'default',
+        userId: null,
+        apiBase: API_BASE_URL,
+        onMessage: (text) => {
+            // When AI finishes a voice response, show it in chat
+            if (text && currentChatId) {
+                appendMessage(currentChatId, { sender: 'bot', text, tools: [] });
+            }
+        },
+        onError: (msg, err) => {
+            console.error('[Voice]', msg, err);
+            alert(`Voice error: ${msg}`);
+            setIsListening(false);
+        },
+    });
 
     const handleVoiceInput = () => {
-        if (isListening) {
-            if (dictationRef.current) {
-                try { dictationRef.current.stop(); } catch(e){}
-                dictationRef.current = null;
-            }
+        if (webRtcStatus === 'active' || webRtcStatus === 'connecting' || webRtcStatus === 'tool_calling') {
+            stopVoice();
             setIsListening(false);
-            return;
-        }
-
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SpeechRecognition) {
-            alert("Dictation is not supported in this browser. Please use Chrome or Edge.");
-            return;
-        }
-
-        const recognition = new SpeechRecognition();
-        recognition.lang = 'en-IN';
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        
-        originalInputRef.current = input;
-
-        recognition.onstart = () => {
+        } else {
             setIsListening(true);
-        };
-
-        recognition.onresult = (event) => {
-            let transcript = '';
-            for (let i = 0; i < event.results.length; ++i) {
-                transcript += event.results[i][0].transcript;
-            }
-            setInput((originalInputRef.current ? originalInputRef.current + ' ' : '') + transcript);
-        };
-
-        recognition.onerror = (event) => {
-            if (event.error !== 'no-speech' && event.error !== 'aborted') {
-                console.error("Dictation error:", event.error);
-            }
-            setIsListening(false);
-        };
-
-        recognition.onend = () => {
-            setIsListening(false);
-            dictationRef.current = null;
-        };
-
-        dictationRef.current = recognition;
-        try {
-            recognition.start();
-        } catch(e) {
-            console.error("Dictation start error:", e);
+            startVoice();
         }
     };
 
@@ -802,9 +763,59 @@ export default function AssistantPortal({ isOpen, onClose }) {
         }
     };
 
-    // ---- Realtime WebSocket voice helpers (PCM16 mono, 24 kHz) ----
-    const VOICE_SAMPLE_RATE = 24000;
-    const VOICE_CHUNK_SAMPLES = 960; // exactly 40 ms at 24 kHz
+    // ---- Web Speech TTS helpers ----
+
+    // Pick the best available en-IN or en-GB voice from speechSynthesis.
+    // Falls back to any English voice, then the browser default.
+    const pickTtsVoice = () => {
+        const voices = window.speechSynthesis?.getVoices() || [];
+        return (
+            voices.find(v => v.lang === 'en-IN') ||
+            voices.find(v => v.lang === 'en-GB') ||
+            voices.find(v => v.lang.startsWith('en')) ||
+            null
+        );
+    };
+
+    // Drain the TTS sentence queue — called after each utterance ends.
+    const drainTtsQueue = () => {
+        if (ttsInterruptedRef.current) { ttsQueueRef.current = []; ttsSpeakingRef.current = false; return; }
+        if (ttsQueueRef.current.length === 0) {
+            ttsSpeakingRef.current = false;
+            // All speech done — return orb to listening state
+            if (voiceModeOpenRef.current) setVoiceStatus('listening');
+            return;
+        }
+        const text = ttsQueueRef.current.shift();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = 'en-IN';
+        utterance.rate = 1.05;
+        utterance.pitch = 1.0;
+        const voice = pickTtsVoice();
+        if (voice) utterance.voice = voice;
+        utterance.onstart = () => {
+            setVoiceStatus('speaking');
+            console.log('[MAGMA VOICE] TTS speaking:', text.slice(0, 80));
+        };
+        utterance.onend = () => { drainTtsQueue(); };
+        utterance.onerror = (e) => {
+            console.error('[MAGMA VOICE] TTS error:', e.error);
+            drainTtsQueue();
+        };
+        ttsSpeakingRef.current = true;
+        window.speechSynthesis.speak(utterance);
+    };
+
+    // Queue a sentence for low-latency streaming speech.
+    const speakSentence = (text) => {
+        const clean = (text || '').trim();
+        if (!clean) return;
+        ttsInterruptedRef.current = false;
+        ttsQueueRef.current.push(clean);
+        if (!ttsSpeakingRef.current) drainTtsQueue();
+    };
+
+    // ---- Mic level analyser (kept for the orb animation) ----
 
     const addVoiceEvent = (type, detail = '') => {
         setVoiceEvents((events) => [...events.slice(-5), { type, detail: String(detail || '') }]);
@@ -821,139 +832,18 @@ export default function AssistantPortal({ isOpen, onClose }) {
         return id;
     };
 
-    const resampleTo24k = (samples, sourceRate) => {
-        if (sourceRate === VOICE_SAMPLE_RATE) return samples;
-        const ratio = sourceRate / VOICE_SAMPLE_RATE;
-        const output = new Float32Array(Math.floor(samples.length / ratio));
-        for (let i = 0; i < output.length; i++) {
-            const position = i * ratio;
-            const left = Math.floor(position);
-            const mix = position - left;
-            output[i] = samples[left] * (1 - mix) + (samples[Math.min(left + 1, samples.length - 1)] || 0) * mix;
-        }
-        return output;
-    };
-
-    const sendPcm = (samples) => {
-        const socket = voiceSocketRef.current;
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        const pending = pcmPendingRef.current;
-        for (let i = 0; i < samples.length; i++) pending.push(samples[i]);
-        while (pending.length >= VOICE_CHUNK_SAMPLES) {
-            const buffer = new ArrayBuffer(VOICE_CHUNK_SAMPLES * 2);
-            const view = new DataView(buffer);
-            for (let i = 0; i < VOICE_CHUNK_SAMPLES; i++) {
-                const sample = Math.max(-1, Math.min(1, pending.shift()));
-                view.setInt16(i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
-            }
-            socket.send(buffer);
-        }
-    };
-
-    // Browser noiseSuppression is only a best-effort constraint and is ignored
-    // by some devices. Keep sending silence (so server-side VAD timing remains
-    // correct), but prevent steady fan/room noise from becoming speech audio.
-    //
-    // Values matched to Livechat AudioCapture.js (industry-level VAD):
-    //   noiseFloor = 0.02   (conservative starting estimate, never below 0.003)
-    //   NOISE_MULTIPLIER = 5.0  (aggressive noise rejection)
-    //   SPEECH_CONFIRM_FRAMES = 3  (hysteresis: requires N consecutive above-threshold frames)
-    //   hangover = ~17 frames (~700ms) for natural sentence pauses
-    const suppressBackgroundNoise = (samples) => {
-        const state = micNoiseGateRef.current;
-        const NOISE_MULTIPLIER = 5.0;
-        const SPEECH_CONFIRM_FRAMES = 3;
-
-        let energy = 0;
-        for (let i = 0; i < samples.length; i++) energy += samples[i] * samples[i];
-        const rms = Math.sqrt(energy / Math.max(1, samples.length));
-
-        // Initial calibration: capture ambient room level before speech starts
-        if (state.calibrationFrames > 0) {
-            state.noiseFloor = (state.noiseFloor * 0.85) + (Math.min(rms, 0.04) * 0.15);
-            state.noiseFloor = Math.max(state.noiseFloor, 0.003); // Never below 0.003
-            state.calibrationFrames -= 1;
-            return new Float32Array(samples.length);
-        }
-
-        const threshold = state.noiseFloor * NOISE_MULTIPLIER;
-
-        if (!state.open) {
-            // Live recalibrate floor only during confirmed silence
-            if (rms < threshold) {
-                const newFloor = Math.max(state.noiseFloor * 0.9 + rms * 0.1, 0.003);
-                if (Math.abs(newFloor - state.noiseFloor) > 0.0005) {
-                    state.noiseFloor = newFloor;
-                }
-            }
-            // Hysteresis: require SPEECH_CONFIRM_FRAMES consecutive above-threshold frames
-            if (rms >= threshold) {
-                state.speechCandidateFrames = (state.speechCandidateFrames || 0) + 1;
-                if (state.speechCandidateFrames >= SPEECH_CONFIRM_FRAMES) {
-                    state.open = true;
-                    state.speechCandidateFrames = 0;
-                    state.hangover = 17; // ~700ms — natural sentence pause
-                }
-            } else {
-                state.speechCandidateFrames = 0;
-            }
-        } else if (rms >= threshold) {
-            state.hangover = 17; // Reset on continued speech
-        } else if (state.hangover > 0) {
-            state.hangover -= 1;
-        } else {
-            state.open = false;
-        }
-
-        return state.open ? samples : new Float32Array(samples.length);
-    };
-
-    const playPcm = async (payload) => {
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
-            playbackCtxRef.current = new AudioCtx({ sampleRate: VOICE_SAMPLE_RATE });
-            playbackCursorRef.current = 0;
-        }
-        const context = playbackCtxRef.current;
-        await context.resume();
-        const bytes = payload instanceof Blob ? await payload.arrayBuffer() : payload;
-        const pcm = new Int16Array(bytes);
-        const audioBuffer = context.createBuffer(1, pcm.length, VOICE_SAMPLE_RATE);
-        const channel = audioBuffer.getChannelData(0);
-        for (let i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
-        const source = context.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(context.destination);
-        const startAt = Math.max(context.currentTime + 0.015, playbackCursorRef.current);
-        source.start(startAt);
-        playbackCursorRef.current = startAt + audioBuffer.duration;
-        setVoiceStatus('speaking');
-        source.onended = () => {
-            if (voiceModeOpenRef.current && context.currentTime >= playbackCursorRef.current - 0.03) {
-                window.lastSpeakingEndTime = Date.now();
-                setVoiceStatus('waiting');
-                setTimeout(() => {
-                    if (voiceModeOpenRef.current && voiceStatusRef.current === 'waiting' && runningToolsCountRef.current === 0) {
-                        setVoiceStatus('listening');
-                        if (audioCaptureRef.current) audioCaptureRef.current.start();
-                    }
-                }, 2500);
-            }
-        };
-    };
 
     // Stops whatever the assistant is currently saying — used on manual tap,
     // a server-sent 'interrupted' event, client-side barge-in detection, and
     // every "this session is going away" exit path below (closing the
     // portal, switching chats, unmounting). Closing the AudioContext outright
     // (rather than just clearing a queue) guarantees every already-scheduled
-    // chunk is silenced immediately, not just future ones.
     const interruptSpeech = () => {
-        if (playbackCtxRef.current) {
-            playbackCtxRef.current.close().catch(() => { });
-        }
-        playbackCtxRef.current = null;
-        playbackCursorRef.current = 0;
+        console.log('[MAGMA VOICE] interruptSpeech');
+        ttsInterruptedRef.current = true;
+        ttsSpeakingRef.current = false;
+        ttsQueueRef.current = [];
+        window.speechSynthesis?.cancel();
         streamingReplyRef.current = '';
         if (voiceModeOpenRef.current && voiceSocketRef.current?.readyState === WebSocket.OPEN) {
             setVoiceStatus('listening');
@@ -961,50 +851,36 @@ export default function AssistantPortal({ isOpen, onClose }) {
     };
 
     const stopMicAnalyser = () => {
-        if (micRafRef.current) cancelAnimationFrame(micRafRef.current);
-        micRafRef.current = null;
-        if (micStreamRef.current) {
-            micStreamRef.current.getTracks().forEach((t) => t.stop());
-            micStreamRef.current = null;
-        }
-        if (captureNodeRef.current) {
-            captureNodeRef.current.disconnect();
-            captureNodeRef.current.onaudioprocess = null;
-            captureNodeRef.current = null;
-        }
-        if (captureSourceRef.current) {
-            captureSourceRef.current.disconnect();
-            captureSourceRef.current = null;
-        }
-        if (audioCtxRef.current) {
-            audioCtxRef.current.close().catch(() => { });
-            audioCtxRef.current = null;
-        }
-        analyserRef.current = null;
-        micNoiseGateRef.current = { noiseFloor: 0.02, open: false, hangover: 0, calibrationFrames: 20, speechCandidateFrames: 0 };
         setMicLevel(0);
     };
 
-    
-    const requestMicrophone = async () => {
-        try {
-            await navigator.mediaDevices.getUserMedia({ audio: true });
-            setMicPermission('granted');
-            return true;
-        } catch (error) {
-            setMicPermission('denied');
-            setVoiceError(error?.message || 'Microphone permission was denied.');
-            return false;
-        }
-    };
+    // ----------------------------------------------------------------
+    // Pure Web Speech API Voice Implementation
+    // No getUserMedia is used, as it conflicts with SpeechRecognition on some OS.
+    // Barge-in is triggered instantly by STT interim results.
+    // ----------------------------------------------------------------
 
     const handleVoiceEvent = (event) => {
         const type = event.type;
         const text = event.text ?? event.transcript ?? event.token ?? event.delta ?? event.message ?? event.response ?? '';
+        if (type === 'token') {
+            console.debug(`[MAGMA VOICE] event:token (+${text.length} chars)`);
+        } else {
+            console.log(`[MAGMA VOICE] event:${type}`, event);
+        }
         addVoiceEvent(type, text || event.name || event.tool_name || '');
+
         if (type === 'partial_transcript') {
             setLiveTranscript(text);
             setVoiceStatus('listening');
+            
+            // Barge-in: STT heard you speak while TTS is playing!
+            if (ttsSpeakingRef.current) {
+                console.log('[MAGMA VOICE] Barge-in via STT interim!');
+                interruptSpeech();
+                voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
+            }
+
         } else if (type === 'final_transcript') {
             setLiveTranscript(text);
             if (text) {
@@ -1015,28 +891,31 @@ export default function AssistantPortal({ isOpen, onClose }) {
             setVoiceTools([]);
             setVoiceStatus('thinking');
             streamingReplyRef.current = '';
+
         } else if (type === 'token') {
             streamingReplyRef.current += text;
             setLastReplyText(streamingReplyRef.current);
             setVoiceStatus('speaking');
-            
             if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({ ...msg, text: streamingReplyRef.current }));
             }
+
+        } else if (type === 'voice_sentence') {
+            // Server sent a clean, speech-ready sentence — speak it now
+            speakSentence(text);
+
         } else if (type === 'tool_call') {
-            runningToolsCountRef.current++;
             const toolObj = { name: event.name || event.tool_name, args: event.args || {}, status: 'running', result: null };
             setVoiceTools((prev) => [...prev, toolObj]);
             setVoiceStatus('thinking');
-            
             if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({
                     ...msg,
                     tools: [...(msg.tools || []), toolObj]
                 }));
             }
+
         } else if (type === 'tool_result') {
-            runningToolsCountRef.current = Math.max(0, runningToolsCountRef.current - 1);
             setVoiceTools((prev) => {
                 const next = [...prev];
                 for (let i = next.length - 1; i >= 0; i--) {
@@ -1048,7 +927,6 @@ export default function AssistantPortal({ isOpen, onClose }) {
                 return next;
             });
             setVoiceStatus('thinking');
-            
             if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => {
                     const tools = [...(msg.tools || [])];
@@ -1061,11 +939,13 @@ export default function AssistantPortal({ isOpen, onClose }) {
                     return { ...msg, tools };
                 });
             }
+
         } else if (type === 'interrupted') {
             interruptSpeech();
             if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({ ...msg, streaming: false }));
             }
+
         } else if (type === 'done') {
             const reply = streamingReplyRef.current;
             setLastReplyText(reply);
@@ -1073,37 +953,11 @@ export default function AssistantPortal({ isOpen, onClose }) {
             const tables = extractMarkdownTables(cleanText);
             if (chartData || tables.length) setPinnedChart({ chartData, tables });
             streamingReplyRef.current = '';
-            
-            const context = playbackCtxRef.current;
-            if (runningToolsCountRef.current > 0) {
-                // Do not revert to listening yet; the AI is executing a tool.
-            } else if (!context || context.state === 'closed' || context.currentTime >= playbackCursorRef.current - 0.05) {
-                setVoiceStatus('waiting');
-                setTimeout(() => {
-                    if (voiceModeOpenRef.current && voiceStatusRef.current === 'waiting' && runningToolsCountRef.current === 0) {
-                        setVoiceStatus('listening');
-                        if (audioCaptureRef.current) audioCaptureRef.current.start();
-                    }
-                }, 2500);
-            } else {
-                // Guarantee the UI reverts to listening when audio completes
-                const remainingDelay = (playbackCursorRef.current - context.currentTime) * 1000 + 100;
-                setTimeout(() => {
-                    if (voiceModeOpenRef.current && voiceStatusRef.current !== 'listening' && runningToolsCountRef.current === 0) {
-                        setVoiceStatus('waiting');
-                        setTimeout(() => {
-                            if (voiceModeOpenRef.current && voiceStatusRef.current === 'waiting' && runningToolsCountRef.current === 0) {
-                                setVoiceStatus('listening');
-                                if (audioCaptureRef.current) audioCaptureRef.current.start();
-                            }
-                        }, 2500);
-                    }
-                }, remainingDelay);
-            }
-            
-            if (voiceChatIdRef.current && runningToolsCountRef.current === 0) {
+            // Status will be set to 'listening' when the TTS queue drains
+            if (voiceChatIdRef.current) {
                 updateLastBotMessage(voiceChatIdRef.current, (msg) => ({ ...msg, streaming: false }));
             }
+
         } else if (type === 'error') {
             setVoiceError(text || 'The voice server reported an error.');
             setVoiceStatus('error');
@@ -1114,84 +968,120 @@ export default function AssistantPortal({ isOpen, onClose }) {
         if (voiceSocketRef.current?.readyState === WebSocket.OPEN || voiceSocketRef.current?.readyState === WebSocket.CONNECTING) return;
         setVoiceError('');
         setVoiceStatus('connecting');
-        
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
-            playbackCtxRef.current = new AudioCtx({ sampleRate: VOICE_SAMPLE_RATE });
-            playbackCursorRef.current = 0;
+
+        // Preload voices (async on some browsers)
+        if (window.speechSynthesis && window.speechSynthesis.getVoices().length === 0) {
+            await new Promise(resolve => {
+                window.speechSynthesis.onvoiceschanged = resolve;
+                setTimeout(resolve, 1000); // fallback if event never fires
+            });
         }
-        playbackCtxRef.current.resume().catch(() => {});
-        if (!micStreamRef.current && !(await requestMicrophone())) return;
-        
+
+        // We no longer await requestMicrophone() here. STT prompts automatically.
+        setMicPermission('granted');
+
         const sessionId = voiceSessionIdRef.current || (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
         voiceSessionIdRef.current = sessionId;
         createVoiceChat();
-        
-        // True Voice-to-Voice VAD (Livechat architecture)
-        if (!audioCaptureRef.current) {
-            audioCaptureRef.current = new AudioCapture(
-                // onSpeechStart (Barge-in / Interruption)
-                () => {
-                    if (voiceStatusRef.current !== 'listening') return;
-                    if (voiceSocketRef.current && voiceSocketRef.current.readyState === WebSocket.OPEN) {
-                        voiceSocketRef.current.send(JSON.stringify({ type: 'interrupt' }));
-                    }
-                    interruptSpeech();
-                },
-                // onSpeechEnd (Send Audio to Backend)
-                (base64Audio) => {
-                    if (voiceStatusRef.current !== 'listening') return;
-                    if (voiceSocketRef.current && voiceSocketRef.current.readyState === WebSocket.OPEN) {
-                        voiceSocketRef.current.send(JSON.stringify({
-                            type: 'audio',
-                            data: base64Audio
-                        }));
-                    }
-                    // Prevent immediate relistening overlap
-                    window.lastSpeakingEndTime = Date.now();
-                },
-                // onAudioLevel (Visualizer)
-                (level) => {
-                    if (voiceStatusRef.current === 'listening') {
-                        setMicLevel(level);
+
+        // Web Speech API — STT
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition && !speechRecognitionRef.current) {
+            const recognition = new SpeechRecognition();
+            recognition.lang = SPEECH_RECOGNITION_LANGUAGE;
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.maxAlternatives = 3;
+
+            recognition.onresult = (event) => {
+                if (!voiceSocketRef.current || voiceSocketRef.current.readyState !== WebSocket.OPEN) return;
+
+                let interim = '';
+                let final = '';
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        final += event.results[i][0].transcript;
                     } else {
-                        setMicLevel(0);
+                        interim += event.results[i][0].transcript;
                     }
                 }
-            );
+
+                if (interim) {
+                    handleVoiceEvent({ type: 'partial_transcript', text: interim });
+                }
+                if (final) {
+                    const cleanText = getRecognizedText([{ transcript: final, confidence: 1 }]);
+                    if (!cleanText) return;
+                    console.log('[MAGMA VOICE] STT final transcript:', cleanText);
+                    handleVoiceEvent({ type: 'final_transcript', text: cleanText });
+                    voiceSocketRef.current.send(JSON.stringify({ type: 'user_speech', text: cleanText }));
+                }
+            };
+
+            // Set mic level strictly based on STT state
+            recognition.onaudiostart = () => setMicLevel(0.4);
+            recognition.onsoundstart = () => setMicLevel(0.7);
+            recognition.onspeechstart = () => setMicLevel(1.0);
+            recognition.onspeechend = () => setMicLevel(0.4);
+            recognition.onsoundend = () => setMicLevel(0.1);
+            recognition.onaudioend = () => setMicLevel(0);
+
+            recognition.onerror = (e) => {
+                console.warn('[MAGMA VOICE] SpeechRecognition error:', e.error);
+                if (e.error !== 'no-speech' && e.error !== 'aborted') {
+                    setVoiceError('Speech recognition error: ' + e.error);
+                }
+            };
+
+            recognition.onend = () => {
+                // Restart automatically so we keep listening continuously
+                if (voiceModeOpenRef.current && speechRecognitionRef.current) {
+                    try { speechRecognitionRef.current.start(); } catch(e) { console.warn('[MAGMA VOICE] recognition restart failed:', e); }
+                }
+            };
+
+            speechRecognitionRef.current = recognition;
         }
-        
+
         const voiceParams = new URLSearchParams({ session_id: sessionId });
         const hostUrl = API_BASE_URL.replace('http://', 'ws://').replace('https://', 'wss://') || `ws://${window.location.host || 'localhost:8050'}`;
         const socket = new WebSocket(`${hostUrl}/ws/voice?${voiceParams.toString()}`);
-        socket.binaryType = 'arraybuffer';
         voiceSocketRef.current = socket;
         
         socket.onopen = () => {
+            console.log('[MAGMA VOICE] WebSocket OPEN:', socket.url);
             setVoiceConnected(true);
             setVoiceStatus('listening');
             addVoiceEvent('connected', sessionId);
-            if (audioCaptureRef.current) audioCaptureRef.current.start();
+            if (speechRecognitionRef.current) {
+                try { speechRecognitionRef.current.start(); } catch(e) { console.warn('[MAGMA VOICE] SpeechRecognition.start() failed:', e); }
+            }
         };
-        
+
         socket.onmessage = (message) => {
+            // No binary frames expected — server sends only JSON text events now
             if (typeof message.data !== 'string') {
-                playPcm(message.data).catch((error) => {
-                    setVoiceError(`Audio playback failed: ${error.message}`);
-                    setVoiceStatus('error');
-                });
+                console.warn('[MAGMA VOICE] Unexpected binary frame ignored, size:', message.data?.byteLength);
                 return;
             }
-            try { handleVoiceEvent(JSON.parse(message.data)); }
-            catch (error) { addVoiceEvent('error', 'Invalid JSON event'); }
+            try {
+                const parsed = JSON.parse(message.data);
+                handleVoiceEvent(parsed);
+            } catch (error) {
+                console.error('[MAGMA VOICE] JSON parse ERROR:', message.data, error);
+                addVoiceEvent('error', 'Invalid JSON event');
+            }
         };
-        
-        socket.onerror = () => {
+
+        socket.onerror = (err) => {
+            console.error('[MAGMA VOICE] WebSocket ERROR:', err);
             setVoiceError('Could not connect to the voice service.');
             setVoiceStatus('error');
         };
-        
-        socket.onclose = () => {
+
+        socket.onclose = (evt) => {
+            console.log(`[MAGMA VOICE] WebSocket CLOSED: code=${evt.code} reason="${evt.reason}" wasClean=${evt.wasClean}`);
             setVoiceConnected(false);
             if (voiceSocketRef.current === socket) voiceSocketRef.current = null;
             if (voiceModeOpenRef.current) setVoiceStatus('idle');
@@ -1200,16 +1090,20 @@ export default function AssistantPortal({ isOpen, onClose }) {
     };
 
     const disconnectVoice = () => {
-        if (audioCaptureRef.current) {
-            audioCaptureRef.current.stop();
-            audioCaptureRef.current = null;
+        stopMicAnalyser();
+        if (speechRecognitionRef.current) {
+            try { speechRecognitionRef.current.stop(); } catch(e){}
+            speechRecognitionRef.current = null;
         }
+        ttsInterruptedRef.current = true;
+        ttsQueueRef.current = [];
+        ttsSpeakingRef.current = false;
+        window.speechSynthesis?.cancel();
         const socket = voiceSocketRef.current;
         voiceSocketRef.current = null;
         if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, 'User disconnected');
         setVoiceConnected(false);
         setVoiceStatus('idle');
-        pcmPendingRef.current = [];
     };
 const openVoiceMode = () => {
         if (voiceModeOpenRef.current) return;
@@ -1312,7 +1206,6 @@ const openVoiceMode = () => {
         listening: 'Listening…',
         thinking: 'Thinking…',
         speaking: 'Speaking…',
-        waiting: 'Waiting...',
         error: 'Voice connection error',
     }[voiceStatus];
 
@@ -1824,6 +1717,9 @@ const openVoiceMode = () => {
                                     padding: '64px 24px 104px', overflow: 'hidden'
                                 }}
                             >
+                                <div className="magna-hero-dotgrid" style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 0 }} />
+                                <VoiceParticles status={voiceStatus} micLevel={micLevel} />
+
                                 <motion.button
                                     className="magna-close-btn"
                                     whileHover={{ scale: 1.05 }}
@@ -1850,8 +1746,9 @@ const openVoiceMode = () => {
                                                 position: 'absolute', top: '64px', right: '22px', zIndex: 2,
                                                 width: '250px', maxHeight: '46vh', overflowY: 'auto',
                                                 padding: '10px 11px', borderRadius: '14px',
-                                                border: '1px solid color-mix(in srgb, var(--primary-color, #6366f1) 30%, var(--border-color, rgba(148, 163, 184, 0.35)))',
-                                                backgroundColor: 'color-mix(in srgb, var(--control-bg, var(--card-bg, #f8fafc)) 100%, transparent)',
+                                                border: '1px solid color-mix(in srgb, var(--border-color, rgba(148, 163, 184, 0.4)) 50%, transparent)',
+                                                background: 'color-mix(in srgb, var(--card-bg, #ffffff) 65%, transparent)',
+                                                backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)',
                                                 boxShadow: '0 16px 36px -12px rgba(0, 0, 0, 0.35)'
                                             }}
                                         >
@@ -1928,76 +1825,7 @@ const openVoiceMode = () => {
                                     <div ref={voiceConversationEndRef} />
                                 </div>
 
-                                <div style={{
-                                    display: 'inline-flex', alignItems: 'center', gap: '7px',
-                                    margin: '8px 0 10px', padding: '5px 13px', borderRadius: '999px',
-                                    border: '1px solid var(--border-color, rgba(148, 163, 184, 0.25))',
-                                    backgroundColor: 'color-mix(in srgb, var(--primary-color, #6366f1) 7%, transparent)',
-                                    position: 'relative', zIndex: 1
-                                }}>
-                                    <span className="magna-live-dot" style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: 'var(--primary-color, #6366f1)' }} />
-                                    <span style={{
-                                        fontSize: '10px', fontWeight: '700', letterSpacing: '0.1em', textTransform: 'uppercase',
-                                        color: 'var(--primary-color, #6366f1)', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace'
-                                    }}>
-                                        Live Voice Mode
-                                    </span>
-                                </div>
-
-                                {/* Orb */}
-                                <div className="magna-voice-orb-wrap" style={{
-                                    position: 'relative', width: '140px', height: '140px',
-                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                    marginBottom: '8px', zIndex: 1, flexShrink: 0,
-                                    transform: 'scale(1.3)'
-                                }}>
-                                    <div id="orb-container" onClick={handleOrbTap} style={{ cursor: 'pointer', zIndex: 5 }}>
-                                        <canvas id="orb-canvas"></canvas>
-                                    </div>
-                                </div>
-
-                                <div style={{ fontSize: '13.5px', fontWeight: '700', color: 'var(--text-color, #0f172a)', marginBottom: '10px', position: 'relative', zIndex: 1, display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                    {voiceStatusLabel}
-                                    <AnimatePresence>
-                                        {voiceStatus === 'speaking' && (
-                                            <motion.button
-                                                key="interrupt-pill"
-                                                initial={{ opacity: 0, scale: 0.9 }}
-                                                animate={{ opacity: 1, scale: 1 }}
-                                                exit={{ opacity: 0, scale: 0.9 }}
-                                                whileHover={{ scale: 1.05 }}
-                                                whileTap={{ scale: 0.95 }}
-                                                onClick={() => { interruptSpeech(); addVoiceEvent('interrupted', 'manual'); }}
-                                                title="Stop the assistant and start talking"
-                                                style={{
-                                                    display: 'flex', alignItems: 'center', gap: '5px',
-                                                    border: '1px solid color-mix(in srgb, var(--primary-color, #6366f1) 30%, transparent)',
-                                                    borderRadius: '999px', cursor: 'pointer', padding: '3px 11px 3px 9px',
-                                                    fontSize: '10px', fontWeight: '700', letterSpacing: '0.03em',
-                                                    color: 'var(--primary-color, #6366f1)',
-                                                    backgroundColor: 'color-mix(in srgb, var(--primary-color, #6366f1) 10%, transparent)'
-                                                }}
-                                            >
-                                                <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2" /></svg>
-                                                Interrupt
-                                            </motion.button>
-                                        )}
-                                    </AnimatePresence>
-                                </div>
-
-                                {voiceStatus === 'error' && (
-                                    <div style={{
-                                        minHeight: '20px', maxWidth: '440px', textAlign: 'center', padding: '0 28px',
-                                        fontSize: '12.5px', color: '#ef4444', lineHeight: 1.5,
-                                        position: 'relative', zIndex: 1
-                                    }}>
-                                        {voiceError}
-                                    </div>
-                                )}
-
-                                {/* Popped-up chart/table — appears on the left when a reply carries
-                                    one, and stays on screen (independent of listening/thinking/speaking
-                                    status) until a new chart/graph is created or the user taps close. */}
+                                {/* Popped-up chart/table — appears on the left */}
                                 <AnimatePresence>
                                     {pinnedChart && (
                                         <motion.div
@@ -2009,8 +1837,9 @@ const openVoiceMode = () => {
                                                 zIndex: 2, width: 'min(360px, calc(100% - 44px))',
                                                 overflowY: 'auto', textAlign: 'left',
                                                 padding: '18px 20px', borderRadius: '18px',
-                                                border: '1px solid color-mix(in srgb, var(--primary-color, #6366f1) 30%, var(--border-color, rgba(148, 163, 184, 0.35)))',
-                                                backgroundColor: 'color-mix(in srgb, var(--control-bg, var(--card-bg, #f8fafc)) 100%, transparent)',
+                                                border: '1px solid color-mix(in srgb, var(--border-color, rgba(148, 163, 184, 0.4)) 50%, transparent)',
+                                                background: 'color-mix(in srgb, var(--card-bg, #ffffff) 65%, transparent)',
+                                                backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)',
                                                 boxShadow: '0 26px 60px -16px rgba(0, 0, 0, 0.4)'
                                             }}
                                         >
@@ -2042,51 +1871,133 @@ const openVoiceMode = () => {
                                     )}
                                 </AnimatePresence>
 
-                                <div className="magna-voice-controls" style={{
-                                    position: 'relative', display: 'flex', alignItems: 'center',
-                                    justifyContent: 'center', gap: '12px', zIndex: 3,
-                                    marginTop: '12px', flexShrink: 0
+                                <div style={{
+                                    display: 'flex', flexDirection: 'column', alignItems: 'center',
+                                    background: 'color-mix(in srgb, var(--card-bg, #ffffff) 65%, transparent)',
+                                    backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)',
+                                    border: '1px solid color-mix(in srgb, var(--border-color, rgba(148, 163, 184, 0.4)) 50%, transparent)',
+                                    borderRadius: '40px', padding: '24px 32px 32px',
+                                    boxShadow: '0 24px 48px -12px rgba(0,0,0,0.1)',
+                                    zIndex: 10, marginTop: 'auto', marginBottom: 'auto'
                                 }}>
-                                    <motion.button
-                                        whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
-                                        onClick={requestMicrophone}
-                                        disabled={micPermission === 'granted'}
-                                        style={{
-                                            border: '1px solid var(--border-color, #cbd5e1)', borderRadius: '999px',
-                                            cursor: micPermission === 'granted' ? 'default' : 'pointer', padding: '10px 17px',
-                                            fontSize: '12px', fontWeight: '650', color: 'var(--text-color, #0f172a)',
-                                            backgroundColor: 'var(--control-bg, var(--card-bg, #fff))',
-                                            opacity: micPermission === 'granted' ? 0.7 : 1
-                                        }}
-                                    >
-                                        Mic: {micPermission === 'granted' ? 'Allowed' : micPermission === 'denied' ? 'Retry permission' : 'Allow'}
-                                    </motion.button>
-                                    <motion.button
-                                        whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
-                                        onClick={voiceConnected ? disconnectVoice : connectVoice}
-                                        style={{
-                                            border: 'none', borderRadius: '999px', cursor: 'pointer', padding: '10px 20px',
-                                            fontSize: '12px', fontWeight: '700', color: '#fff',
-                                            backgroundColor: voiceConnected ? '#f59e0b' : 'var(--primary-color, #6366f1)'
-                                        }}
-                                    >
-                                        {voiceConnected ? 'Disconnect' : 'Connect'}
-                                    </motion.button>
-                                    <motion.button
-                                        className="magna-end-call-btn"
-                                        whileHover={{ scale: 1.05 }}
-                                        whileTap={{ scale: 0.95 }}
-                                        onClick={closeVoiceMode}
-                                        style={{
-                                            display: 'flex', alignItems: 'center', gap: '8px',
-                                            border: 'none', borderRadius: '999px', cursor: 'pointer',
-                                            padding: '11px 22px', fontSize: '12.5px', fontWeight: '650',
-                                            backgroundColor: '#ef4444', color: '#ffffff',
-                                            boxShadow: '0 10px 24px -8px rgba(239, 68, 68, 0.5)'
-                                        }}
-                                    >
-                                        <PhoneEndIcon /> Close
-                                    </motion.button>
+                                    <div style={{
+                                        display: 'inline-flex', alignItems: 'center', gap: '7px',
+                                        margin: '0 0 16px', padding: '5px 13px', borderRadius: '999px',
+                                        border: '1px solid var(--border-color, rgba(148, 163, 184, 0.25))',
+                                        backgroundColor: 'color-mix(in srgb, var(--primary-color, #6366f1) 7%, transparent)',
+                                        position: 'relative', zIndex: 1
+                                    }}>
+                                        <span className="magna-live-dot" style={{ width: '5px', height: '5px', borderRadius: '50%', backgroundColor: 'var(--primary-color, #6366f1)' }} />
+                                        <span style={{
+                                            fontSize: '10px', fontWeight: '700', letterSpacing: '0.1em', textTransform: 'uppercase',
+                                            color: 'var(--primary-color, #6366f1)', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace'
+                                        }}>
+                                            Live Voice Mode
+                                        </span>
+                                    </div>
+
+                                    {/* Orb */}
+                                    <div className="magna-voice-orb-wrap" style={{
+                                        position: 'relative', width: '140px', height: '140px',
+                                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                        marginBottom: '16px', zIndex: 1, flexShrink: 0,
+                                        transform: 'scale(1.3)'
+                                    }}>
+                                        <div id="orb-container" onClick={handleOrbTap} style={{ cursor: 'pointer', zIndex: 5 }}>
+                                            <canvas id="orb-canvas"></canvas>
+                                        </div>
+                                    </div>
+
+                                    <div style={{ fontSize: '14px', fontWeight: '700', color: 'var(--text-color, #0f172a)', marginBottom: '24px', position: 'relative', zIndex: 1, display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                        {voiceStatusLabel}
+                                        <AnimatePresence>
+                                            {voiceStatus === 'speaking' && (
+                                                <motion.button
+                                                    key="interrupt-pill"
+                                                    initial={{ opacity: 0, scale: 0.9 }}
+                                                    animate={{ opacity: 1, scale: 1 }}
+                                                    exit={{ opacity: 0, scale: 0.9 }}
+                                                    whileHover={{ scale: 1.05 }}
+                                                    whileTap={{ scale: 0.95 }}
+                                                    onClick={() => { interruptSpeech(); addVoiceEvent('interrupted', 'manual'); }}
+                                                    title="Stop the assistant and start talking"
+                                                    style={{
+                                                        display: 'flex', alignItems: 'center', gap: '5px',
+                                                        border: '1px solid color-mix(in srgb, var(--primary-color, #6366f1) 30%, transparent)',
+                                                        borderRadius: '999px', cursor: 'pointer', padding: '3px 11px 3px 9px',
+                                                        fontSize: '10px', fontWeight: '700', letterSpacing: '0.03em',
+                                                        color: 'var(--primary-color, #6366f1)',
+                                                        backgroundColor: 'color-mix(in srgb, var(--primary-color, #6366f1) 10%, transparent)'
+                                                    }}
+                                                >
+                                                    <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2" /></svg>
+                                                    Interrupt
+                                                </motion.button>
+                                            )}
+                                        </AnimatePresence>
+                                    </div>
+
+                                    {voiceStatus === 'error' && (
+                                        <div style={{
+                                            minHeight: '20px', maxWidth: '440px', textAlign: 'center', padding: '0 28px',
+                                            fontSize: '13px', color: '#ef4444', lineHeight: 1.5,
+                                            position: 'relative', zIndex: 1, marginBottom: '16px'
+                                        }}>
+                                            {voiceError}
+                                        </div>
+                                    )}
+
+                                    <div className="magna-voice-controls" style={{
+                                        position: 'relative', display: 'flex', alignItems: 'center',
+                                        justifyContent: 'center', gap: '16px', zIndex: 3, flexShrink: 0
+                                    }}>
+                                        <motion.button
+                                            whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
+                                            onClick={requestMicrophone}
+                                            disabled={micPermission === 'granted'}
+                                            style={{
+                                                border: '1px solid color-mix(in srgb, var(--border-color, #cbd5e1) 50%, transparent)',
+                                                borderRadius: '999px', padding: '12px 20px', fontSize: '13px', fontWeight: '650',
+                                                color: 'var(--text-color, #0f172a)',
+                                                backgroundColor: 'color-mix(in srgb, var(--card-bg, #ffffff) 50%, transparent)',
+                                                backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+                                                cursor: micPermission === 'granted' ? 'default' : 'pointer',
+                                                opacity: micPermission === 'granted' ? 0.7 : 1
+                                            }}
+                                        >
+                                            Mic: {micPermission === 'granted' ? 'Allowed' : micPermission === 'denied' ? 'Retry permission' : 'Allow'}
+                                        </motion.button>
+                                        <motion.button
+                                            whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
+                                            onClick={voiceConnected ? disconnectVoice : connectVoice}
+                                            style={{
+                                                border: '1px solid color-mix(in srgb, ' + (voiceConnected ? '#f59e0b' : 'var(--primary-color, #6366f1)') + ' 20%, transparent)',
+                                                borderRadius: '999px', cursor: 'pointer', padding: '12px 24px',
+                                                fontSize: '13px', fontWeight: '700',
+                                                color: voiceConnected ? '#f59e0b' : 'var(--primary-color, #6366f1)',
+                                                backgroundColor: 'color-mix(in srgb, ' + (voiceConnected ? '#f59e0b' : 'var(--primary-color, #6366f1)') + ' 10%, transparent)',
+                                                backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+                                            }}
+                                        >
+                                            {voiceConnected ? 'Disconnect' : 'Connect'}
+                                        </motion.button>
+                                        <motion.button
+                                            className="magna-end-call-btn"
+                                            whileHover={{ scale: 1.05 }}
+                                            whileTap={{ scale: 0.95 }}
+                                            onClick={closeVoiceMode}
+                                            style={{
+                                                display: 'flex', alignItems: 'center', gap: '8px',
+                                                border: '1px solid color-mix(in srgb, #ef4444 20%, transparent)',
+                                                borderRadius: '999px', cursor: 'pointer',
+                                                padding: '12px 24px', fontSize: '13px', fontWeight: '650',
+                                                color: '#ef4444', backgroundColor: 'color-mix(in srgb, #ef4444 10%, transparent)',
+                                                backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+                                            }}
+                                        >
+                                            <PhoneEndIcon /> Close
+                                        </motion.button>
+                                    </div>
                                 </div>
                             </motion.div>
                         )}
