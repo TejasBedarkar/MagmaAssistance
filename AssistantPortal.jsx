@@ -478,14 +478,8 @@ export default function AssistantPortal({ isOpen, onClose }) {
     const voiceSocketRef = useRef(null);
     const voiceSessionIdRef = useRef(null);
     const voiceStatusRef = useRef('idle');
-    const bargeInStreakRef = useRef(0);
-    const bargeInRafRef = useRef(null);
-    const bargeInFloorRef = useRef(0.015);
     const streamingReplyRef = useRef('');
     const voiceChatIdRef = useRef(null);
-    const micStreamRef = useRef(null);
-    const micRafRef = useRef(null);
-    const micNoiseGateRef = useRef({ noiseFloor: 0.02, open: false, hangover: 0, calibrationFrames: 20, speechCandidateFrames: 0 });
     const voiceConversationEndRef = useRef(null);
     const orbRef = useRef(null);
     const speechRecognitionRef = useRef(null);
@@ -493,11 +487,6 @@ export default function AssistantPortal({ isOpen, onClose }) {
     const ttsQueueRef = useRef([]);
     const ttsSpeakingRef = useRef(false);
     const ttsInterruptedRef = useRef(false);
-    const audioCtxRef = useRef(null);
-    const analyserRef = useRef(null);
-    const captureNodeRef = useRef(null);
-    const captureSourceRef = useRef(null);
-    const pcmPendingRef = useRef([]);
 
     const activeChat = chatHistory.find(c => c.id === currentChatId);
     const activeMessages = activeChat ? activeChat.messages : messages;
@@ -790,10 +779,9 @@ export default function AssistantPortal({ isOpen, onClose }) {
 
     // Drain the TTS sentence queue — called after each utterance ends.
     const drainTtsQueue = () => {
-        if (ttsInterruptedRef.current) { ttsQueueRef.current = []; ttsSpeakingRef.current = false; stopBargeInDetector(); return; }
+        if (ttsInterruptedRef.current) { ttsQueueRef.current = []; ttsSpeakingRef.current = false; return; }
         if (ttsQueueRef.current.length === 0) {
             ttsSpeakingRef.current = false;
-            stopBargeInDetector();
             // All speech done — return orb to listening state
             if (voiceModeOpenRef.current) setVoiceStatus('listening');
             return;
@@ -807,7 +795,6 @@ export default function AssistantPortal({ isOpen, onClose }) {
         if (voice) utterance.voice = voice;
         utterance.onstart = () => {
             setVoiceStatus('speaking');
-            startBargeInDetector(); // watch for barge-in while speaking
             console.log('[MAGMA VOICE] TTS speaking:', text.slice(0, 80));
         };
         utterance.onend = () => { drainTtsQueue(); };
@@ -853,7 +840,6 @@ export default function AssistantPortal({ isOpen, onClose }) {
     // (rather than just clearing a queue) guarantees every already-scheduled
     const interruptSpeech = () => {
         console.log('[MAGMA VOICE] interruptSpeech');
-        stopBargeInDetector();
         ttsInterruptedRef.current = true;
         ttsSpeakingRef.current = false;
         ttsQueueRef.current = [];
@@ -865,122 +851,14 @@ export default function AssistantPortal({ isOpen, onClose }) {
     };
 
     const stopMicAnalyser = () => {
-        stopBargeInDetector();
-        if (micRafRef.current) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; }
-        if (micStreamRef.current) { micStreamRef.current.getTracks().forEach(t => t.stop()); micStreamRef.current = null; }
-        if (captureSourceRef.current) { captureSourceRef.current.disconnect(); captureSourceRef.current = null; }
-        if (analyserRef.current) { analyserRef.current.disconnect?.(); analyserRef.current = null; }
-        if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
-        micNoiseGateRef.current = { noiseFloor: 0.02, open: false, hangover: 0, calibrationFrames: 20, speechCandidateFrames: 0 };
         setMicLevel(0);
     };
 
     // ----------------------------------------------------------------
-    // Mic setup: noise cancellation + analyser for orb level + barge-in
+    // Pure Web Speech API Voice Implementation
+    // No getUserMedia is used, as it conflicts with SpeechRecognition on some OS.
+    // Barge-in is triggered instantly by STT interim results.
     // ----------------------------------------------------------------
-    // ----------------------------------------------------------------
-
-    const requestMicrophone = async () => {
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    // Hardware noise cancellation — eliminates fan/room noise
-                    noiseSuppression:  true,
-                    echoCancellation:  true,   // removes TTS echo picked up by mic
-                    autoGainControl:   true,   // normalizes quiet/loud voices
-                    channelCount:      1,
-                    sampleRate:        16000,  // SpeechRecognition works great at 16kHz
-                    latency:           0,      // lowest possible buffer
-                },
-            });
-            micStreamRef.current = stream;
-            setMicPermission('granted');
-
-            // --- Web Audio analyser: feeds mic level → orb animation ---
-            const AudioCtx = window.AudioContext || window.webkitAudioContext;
-            audioCtxRef.current = new AudioCtx();
-            captureSourceRef.current = audioCtxRef.current.createMediaStreamSource(stream);
-            analyserRef.current = audioCtxRef.current.createAnalyser();
-            analyserRef.current.fftSize = 256;
-            analyserRef.current.smoothingTimeConstant = 0.7;
-            captureSourceRef.current.connect(analyserRef.current);
-            // NOTE: do NOT connect analyser to destination — we don't want
-            // the mic echoing through speakers.
-
-            const levelBuf = new Float32Array(analyserRef.current.fftSize);
-            const tickLevel = () => {
-                if (!analyserRef.current) return;
-                analyserRef.current.getFloatTimeDomainData(levelBuf);
-                let sum = 0;
-                for (let i = 0; i < levelBuf.length; i++) sum += levelBuf[i] * levelBuf[i];
-                const rms = Math.sqrt(sum / levelBuf.length);
-                setMicLevel(Math.min(1, rms * 8)); // 0-1 for orb
-                micRafRef.current = requestAnimationFrame(tickLevel);
-            };
-            micRafRef.current = requestAnimationFrame(tickLevel);
-
-            console.log('[MAGMA VOICE] Mic opened with noise cancellation');
-            return true;
-        } catch (error) {
-            setMicPermission('denied');
-            setVoiceError(error?.message || 'Microphone permission was denied.');
-            return false;
-        }
-    };
-
-    // ----------------------------------------------------------------
-    // Barge-in detector: runs during TTS playback, watches mic RMS.
-    // When the user speaks above the adaptive noise floor, we immediately
-    // cancel TTS, send 'interrupt' to the server, and let the user talk.
-    // ----------------------------------------------------------------
-    const startBargeInDetector = () => {
-        if (!analyserRef.current) return;
-        if (bargeInRafRef.current) return; // already running
-
-        const buf = new Float32Array(analyserRef.current.fftSize);
-        const BARGE_THRESHOLD_MULT = 5.0;  // N × noise floor = speech
-        const CONFIRM_FRAMES = 3;          // require 3 consecutive loud frames
-        let loud = 0;
-
-        const tick = () => {
-            // Stop if TTS is no longer speaking or session ended
-            if (!ttsSpeakingRef.current || !voiceModeOpenRef.current) {
-                bargeInRafRef.current = null;
-                return;
-            }
-            analyserRef.current?.getFloatTimeDomainData(buf);
-            let sum = 0;
-            for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-            const rms = Math.sqrt(sum / buf.length);
-
-            // Adaptive floor: update during quiet moments
-            if (rms < bargeInFloorRef.current) {
-                bargeInFloorRef.current = bargeInFloorRef.current * 0.95 + rms * 0.05;
-                bargeInFloorRef.current = Math.max(bargeInFloorRef.current, 0.003);
-            }
-
-            const threshold = bargeInFloorRef.current * BARGE_THRESHOLD_MULT;
-            if (rms > threshold) {
-                loud++;
-                if (loud >= CONFIRM_FRAMES) {
-                    console.log('[MAGMA VOICE] Barge-in detected! RMS:', rms.toFixed(4), 'floor:', bargeInFloorRef.current.toFixed(4));
-                    bargeInRafRef.current = null;
-                    interruptSpeech();
-                    voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
-                    return;
-                }
-            } else {
-                loud = 0;
-            }
-            bargeInRafRef.current = requestAnimationFrame(tick);
-        };
-        bargeInRafRef.current = requestAnimationFrame(tick);
-    };
-
-    const stopBargeInDetector = () => {
-        if (bargeInRafRef.current) { cancelAnimationFrame(bargeInRafRef.current); bargeInRafRef.current = null; }
-    };
-
 
     const handleVoiceEvent = (event) => {
         const type = event.type;
@@ -995,6 +873,13 @@ export default function AssistantPortal({ isOpen, onClose }) {
         if (type === 'partial_transcript') {
             setLiveTranscript(text);
             setVoiceStatus('listening');
+            
+            // Barge-in: STT heard you speak while TTS is playing!
+            if (ttsSpeakingRef.current) {
+                console.log('[MAGMA VOICE] Barge-in via STT interim!');
+                interruptSpeech();
+                voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
+            }
 
         } else if (type === 'final_transcript') {
             setLiveTranscript(text);
@@ -1092,7 +977,8 @@ export default function AssistantPortal({ isOpen, onClose }) {
             });
         }
 
-        if (!micStreamRef.current && !(await requestMicrophone())) return;
+        // We no longer await requestMicrophone() here. STT prompts automatically.
+        setMicPermission('granted');
 
         const sessionId = voiceSessionIdRef.current || (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
         voiceSessionIdRef.current = sessionId;
@@ -1128,15 +1014,18 @@ export default function AssistantPortal({ isOpen, onClose }) {
                     const cleanText = getRecognizedText([{ transcript: final, confidence: 1 }]);
                     if (!cleanText) return;
                     console.log('[MAGMA VOICE] STT final transcript:', cleanText);
-                    // Barge-in: interrupt TTS if the assistant is speaking
-                    if (voiceStatusRef.current === 'speaking') {
-                        interruptSpeech();
-                        voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
-                    }
                     handleVoiceEvent({ type: 'final_transcript', text: cleanText });
                     voiceSocketRef.current.send(JSON.stringify({ type: 'user_speech', text: cleanText }));
                 }
             };
+
+            // Set mic level strictly based on STT state
+            recognition.onaudiostart = () => setMicLevel(0.4);
+            recognition.onsoundstart = () => setMicLevel(0.7);
+            recognition.onspeechstart = () => setMicLevel(1.0);
+            recognition.onspeechend = () => setMicLevel(0.4);
+            recognition.onsoundend = () => setMicLevel(0.1);
+            recognition.onaudioend = () => setMicLevel(0);
 
             recognition.onerror = (e) => {
                 console.warn('[MAGMA VOICE] SpeechRecognition error:', e.error);
@@ -1206,7 +1095,6 @@ export default function AssistantPortal({ isOpen, onClose }) {
             try { speechRecognitionRef.current.stop(); } catch(e){}
             speechRecognitionRef.current = null;
         }
-        stopBargeInDetector();
         ttsInterruptedRef.current = true;
         ttsQueueRef.current = [];
         ttsSpeakingRef.current = false;
