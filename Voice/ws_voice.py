@@ -48,8 +48,8 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
             if not text_chunk.strip():
                 return
             try:
-                from Voice import sarvam_tts
-                audio_bytes = await sarvam_tts.synthesize(text_chunk)
+                from Voice import openai_tts
+                audio_bytes = await openai_tts.synthesize(text_chunk)
                 await send({"type": "websocket.send", "bytes": audio_bytes})
             except Exception as e:
                 logger.error(f"TTS Synthesis error: {e}")
@@ -214,10 +214,10 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
                     audio_b64 = control.get("data", "")
                     if audio_b64:
                         import base64
-                        from Voice import sarvam_stt
+                        from Voice import openai_stt
                         try:
                             audio_bytes = base64.b64decode(audio_b64)
-                            stt_result = await sarvam_stt.transcribe(audio_bytes)
+                            stt_result = await openai_stt.transcribe(audio_bytes)
                             transcript = stt_result["transcript"].strip()
                             if transcript:
                                 await send_json({"type": "final_transcript", "text": transcript})
