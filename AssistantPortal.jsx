@@ -881,11 +881,13 @@ export default function AssistantPortal({ isOpen, onClose }) {
         if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
             playbackCtxRef.current = new AudioCtx({ sampleRate: VOICE_SAMPLE_RATE });
             playbackCursorRef.current = 0;
+            console.log('[MAGMA VOICE] AudioContext created, sampleRate:', VOICE_SAMPLE_RATE);
         }
         const context = playbackCtxRef.current;
         await context.resume();
         const bytes = payload instanceof Blob ? await payload.arrayBuffer() : payload;
         const pcm = new Int16Array(bytes);
+        console.log(`[MAGMA VOICE] playPcm: received ${bytes.byteLength} bytes → ${pcm.length} PCM samples, ctx.state=${context.state}`);
         const audioBuffer = context.createBuffer(1, pcm.length, VOICE_SAMPLE_RATE);
         const channel = audioBuffer.getChannelData(0);
         for (let i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
@@ -895,8 +897,10 @@ export default function AssistantPortal({ isOpen, onClose }) {
         const startAt = Math.max(context.currentTime + 0.015, playbackCursorRef.current);
         source.start(startAt);
         playbackCursorRef.current = startAt + audioBuffer.duration;
+        console.log(`[MAGMA VOICE] playPcm: scheduled ${audioBuffer.duration.toFixed(3)}s of audio at t=${startAt.toFixed(3)}s`);
         setVoiceStatus('speaking');
         source.onended = () => {
+            console.log('[MAGMA VOICE] playPcm: chunk ended, cursor:', playbackCursorRef.current?.toFixed(3));
             if (voiceModeOpenRef.current && context.currentTime >= playbackCursorRef.current - 0.03) {
                 setVoiceStatus('listening');
             }
@@ -910,6 +914,7 @@ export default function AssistantPortal({ isOpen, onClose }) {
     // (rather than just clearing a queue) guarantees every already-scheduled
     // chunk is silenced immediately, not just future ones.
     const interruptSpeech = () => {
+        console.log('[MAGMA VOICE] interruptSpeech: closing AudioContext and clearing reply buffer');
         if (playbackCtxRef.current) {
             playbackCtxRef.current.close().catch(() => { });
         }
@@ -962,6 +967,13 @@ export default function AssistantPortal({ isOpen, onClose }) {
     const handleVoiceEvent = (event) => {
         const type = event.type;
         const text = event.text ?? event.transcript ?? event.token ?? event.delta ?? event.message ?? event.response ?? '';
+        // Full event log — filter by '[MAGMA VOICE]' in DevTools console
+        if (type === 'token') {
+            // Tokens are high-frequency: log brief summary only
+            console.debug(`[MAGMA VOICE] event:token (+${text.length} chars)`);
+        } else {
+            console.log(`[MAGMA VOICE] event:${type}`, event);
+        }
         addVoiceEvent(type, text || event.name || event.tool_name || '');
         if (type === 'partial_transcript') {
             setLiveTranscript(text);
@@ -1117,32 +1129,43 @@ export default function AssistantPortal({ isOpen, onClose }) {
         voiceSocketRef.current = socket;
         
         socket.onopen = () => {
+            console.log('[MAGMA VOICE] WebSocket OPEN:', socket.url);
             setVoiceConnected(true);
             setVoiceStatus('listening');
             addVoiceEvent('connected', sessionId);
             if (speechRecognitionRef.current) {
-                try { speechRecognitionRef.current.start(); } catch(e){}
+                try { speechRecognitionRef.current.start(); } catch(e){ console.warn('[MAGMA VOICE] SpeechRecognition.start() failed:', e); }
             }
         };
         
         socket.onmessage = (message) => {
             if (typeof message.data !== 'string') {
+                const byteLen = message.data instanceof ArrayBuffer ? message.data.byteLength : '?';
+                console.log(`[MAGMA VOICE] Binary message received: ${byteLen} bytes (PCM audio chunk)`);
                 playPcm(message.data).catch((error) => {
+                    console.error('[MAGMA VOICE] playPcm ERROR:', error);
                     setVoiceError(`Audio playback failed: ${error.message}`);
                     setVoiceStatus('error');
                 });
                 return;
             }
-            try { handleVoiceEvent(JSON.parse(message.data)); }
-            catch (error) { addVoiceEvent('error', 'Invalid JSON event'); }
+            try {
+                const parsed = JSON.parse(message.data);
+                handleVoiceEvent(parsed);
+            } catch (error) {
+                console.error('[MAGMA VOICE] JSON parse ERROR on message:', message.data, error);
+                addVoiceEvent('error', 'Invalid JSON event');
+            }
         };
         
-        socket.onerror = () => {
+        socket.onerror = (err) => {
+            console.error('[MAGMA VOICE] WebSocket ERROR:', err);
             setVoiceError('Could not connect to the voice service.');
             setVoiceStatus('error');
         };
         
-        socket.onclose = () => {
+        socket.onclose = (evt) => {
+            console.log(`[MAGMA VOICE] WebSocket CLOSED: code=${evt.code} reason="${evt.reason}" wasClean=${evt.wasClean}`);
             setVoiceConnected(false);
             if (voiceSocketRef.current === socket) voiceSocketRef.current = null;
             if (voiceModeOpenRef.current) setVoiceStatus('idle');

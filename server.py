@@ -260,7 +260,16 @@ ALL_FIELD_PARSERS: dict = {}
 
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+# Global log level: INFO for most modules; DEBUG for voice pipeline modules
+# so STT/TTS timing, byte counts and WebSocket lifecycle are fully visible.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+for _voice_logger in ("ws_voice", "openai-stt", "openai-tts"):
+    logging.getLogger(_voice_logger).setLevel(logging.DEBUG)
+
 logger = logging.getLogger("agent-server")
 
 # ---------------------------------------------------------------------
