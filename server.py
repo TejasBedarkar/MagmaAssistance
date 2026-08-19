@@ -1032,7 +1032,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     tool_result/done event dicts in call order."""
     history = history if history is not None else []
     history.append(HumanMessage(content=text))
-    trimmed = trim_messages(history, max_tokens=MAX_HISTORY_MESSAGES, token_counter=len, strategy="last", include_system=False)
+    trimmed = trim_messages(history, max_tokens=MAX_HISTORY_MESSAGES, token_counter=len, strategy="last", include_system=False, start_on="human")
 
     candidate_tools = []
     if ALL_TOOLS:
@@ -1054,45 +1054,53 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     call_messages = [SystemMessage(content="\n".join(system_parts)), *trimmed]
 
     max_rounds = 4
-    for round_number in range(max_rounds + 1):
+    try:
+        for round_number in range(max_rounds + 1):
+            content = ""
+            tool_calls = []
+            async for event in _stream_full_reply(call_messages, tools=openai_tools):
+                if event["type"] == "token":
+                    yield {"type": "token", "text": event["text"]}
+                else:
+                    content = event["content"]
+                    tool_calls = event["tool_calls"]
+
+            if not tool_calls:
+                ai_msg = AIMessage(content=content)
+                history.append(ai_msg)
+                yield {"type": "done", "text": content}
+                return
+
+            if round_number == max_rounds:
+                break
+
+            ai_msg = AIMessage(content=content, tool_calls=tool_calls)
+            call_messages.append(ai_msg)
+            history.append(ai_msg)
+            for tc in tool_calls:
+                yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
+                result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
+                yield {"type": "tool_result", "name": tc["name"], "result": result}
+                t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
+                call_messages.append(t_msg)
+                history.append(t_msg)
+
         content = ""
-        tool_calls = []
-        async for event in _stream_full_reply(call_messages, tools=openai_tools):
+        async for event in _stream_full_reply(call_messages, tools=None):
             if event["type"] == "token":
                 yield {"type": "token", "text": event["text"]}
             else:
                 content = event["content"]
-                tool_calls = event["tool_calls"]
-
-        if not tool_calls:
-            ai_msg = AIMessage(content=content)
-            history.append(ai_msg)
-            yield {"type": "done", "text": content}
-            return
-
-        if round_number == max_rounds:
-            break
-
-        ai_msg = AIMessage(content=content, tool_calls=tool_calls)
-        call_messages.append(ai_msg)
+        ai_msg = AIMessage(content=content)
         history.append(ai_msg)
-        for tc in tool_calls:
-            yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
-            result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
-            yield {"type": "tool_result", "name": tc["name"], "result": result}
-            t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
-            call_messages.append(t_msg)
-            history.append(t_msg)
-
-    content = ""
-    async for event in _stream_full_reply(call_messages, tools=None):
-        if event["type"] == "token":
-            yield {"type": "token", "text": event["text"]}
-        else:
-            content = event["content"]
-    ai_msg = AIMessage(content=content)
-    history.append(ai_msg)
-    yield {"type": "done", "text": content}
+        yield {"type": "done", "text": content}
+    except asyncio.CancelledError:
+        # Clean up any incomplete tool call sequence from history
+        while history and isinstance(history[-1], ToolMessage):
+            history.pop()
+        if history and isinstance(history[-1], AIMessage) and getattr(history[-1], "tool_calls", None):
+            history.pop()
+        raise
 
 
 _FAKE_NAME_RE = re.compile(r'"name"\s*:\s*"(?P<name>[a-zA-Z_][\w\-.]*)"')
@@ -1548,6 +1556,7 @@ async def general_node(state: ChatState) -> dict:
         token_counter=len,
         strategy="last",
         include_system=False,
+        start_on="human"
     )
     
     if not tool_rag:
