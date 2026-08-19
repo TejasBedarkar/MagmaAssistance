@@ -389,6 +389,12 @@ def erp_data_tool(
                     req_fields = ["name", "item_name", "item_group", "stock_uom"]
                 elif dt_lower == "customer":
                     req_fields = ["name", "customer_name", "customer_group", "territory"]
+                elif dt_lower == "lead":
+                    req_fields = ["name", "lead_name", "company_name", "email_id", "status"]
+                elif dt_lower == "supplier":
+                    req_fields = ["name", "supplier_name", "supplier_group"]
+                elif dt_lower == "employee":
+                    req_fields = ["name", "employee_name", "department", "designation", "status"]
 
             return str(
                 erp_client.get_list(
@@ -571,4 +577,52 @@ def erp_describe_fields(doctype: str) -> str:
     return _safe_call(f"look up required fields for {doctype}", run)
 
 
-ERP_UNIFIED_TOOLS = [erp_data_tool, erp_describe_fields, *PROJECT_ONBOARDING_TOOLS]
+
+@tool
+def erp_send_email(
+    recipients: str,
+    subject: str,
+    content: str,
+    reference_doctype: str = None,
+    reference_name: str = None,
+    cc: str = None,
+) -> str:
+    """Sends an email to a client or contact through ERPNext.
+    
+    `recipients`: Comma-separated list of email addresses.
+    `subject`: The subject line of the email.
+    `content`: The HTML or plain text body of the email.
+    `reference_doctype`: (Optional) The ERPNext document type to attach this email to (e.g. 'Lead', 'Customer', 'Project').
+    `reference_name`: (Optional) The specific Document ID (e.g. 'CRM-LEAD-0001').
+    `cc`: (Optional) Comma-separated list of CC email addresses.
+    
+    Always ensure you have confirmed the exact subject and content with the user before calling this.
+    """
+    def run():
+        payload = {
+            "recipients": recipients,
+            "subject": subject,
+            "content": content,
+            "send_email": 1,
+        }
+        if cc:
+            payload["cc"] = cc
+        if reference_doctype and reference_name:
+            resolved_name = _resolve_link_value(reference_doctype, reference_name)
+            if not resolved_name:
+                return f"Could not find exact match for reference {reference_doctype} '{reference_name}'."
+            payload["doctype"] = reference_doctype
+            payload["name"] = resolved_name
+            
+        try:
+            result = erp_client.call_method_post(
+                "frappe.core.doctype.communication.email.make", payload
+            )
+            return f"Email successfully queued/sent to {recipients}."
+        except Exception as exc:
+            return f"Failed to send email: {str(exc)}"
+
+    return _safe_call(f"send email to {recipients}", run)
+
+
+ERP_UNIFIED_TOOLS = [erp_data_tool, erp_describe_fields, erp_send_email, *PROJECT_ONBOARDING_TOOLS]
