@@ -29,6 +29,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
 
         connected = True
         state = {"turn_task": None, "speaking": False}
+        send_lock = asyncio.Lock()
 
         # ------------------------------------------------------------------ #
         # Send helpers                                                         #
@@ -39,16 +40,11 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
             if not connected:
                 raise ConnectionClosed
             try:
-                await ws.send({"type": "websocket.send", "text": json.dumps(payload)})
+                async with send_lock:
+                    await ws.send({"type": "websocket.send", "text": json.dumps(payload)})
             except (WebSocketDisconnect, RuntimeError, OSError) as exc:
                 connected = False
                 raise ConnectionClosed from exc
-
-        # ------------------------------------------------------------------ #
-        # Shared conversation history (same sqlite as /api/chat/stream)       #
-        # ------------------------------------------------------------------ #
-
-        history = await load_stream_history(session_id)
 
         # ------------------------------------------------------------------ #
         # Turn management                                                      #
@@ -98,6 +94,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
             token_buf = ""   # accumulates cleaned text for speech
 
             try:
+                history = await load_stream_history(session_id)
                 async for event in stream_agent_turn(
                     text, session_id=session_id, user_id=user_id, history=history
                 ):
