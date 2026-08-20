@@ -1,6 +1,7 @@
 """
 Main.py
 
+magnaerp
 Full voice assistant pipeline:
     Microphone audio -> OpenAI STT -> LangChain prompt -> LLM (OpenAI) -> OpenAI TTS -> speakers
 
