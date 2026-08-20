@@ -3,7 +3,7 @@ name: Deploy MagmaAssistance Backend
 on:
   push:
     branches:
-      - beta
+      - Development
 
 jobs:
   deploy:
