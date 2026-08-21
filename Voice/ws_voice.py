@@ -151,8 +151,6 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
                         logger.info("[WS/voice] turn DONE  %.0fms  session=%s", elapsed, session_id)
                         await send_json({"type": "done"})
 
-                await save_stream_history(session_id, history)
-
             except asyncio.CancelledError:
                 logger.info("[WS/voice] turn CANCELLED  session=%s", session_id)
                 raise
@@ -166,6 +164,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
                     pass
             finally:
                 state["speaking"] = False
+                asyncio.create_task(save_stream_history(session_id, list(history)))
 
         # ------------------------------------------------------------------ #
         # Main receive loop                                                   #

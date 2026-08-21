@@ -186,6 +186,7 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
             continue
         field = fields.get(fieldname)
         if not field:
+            cleaned.pop(fieldname, None)
             continue
 
         fieldtype = field.get("fieldtype")
@@ -249,6 +250,13 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
                 cleaned.pop(fieldname, None)
                 warnings.append(
                     f"Omitted {fieldname}='{value}' because it is not an allowed option."
+                )
+                
+        if fieldtype == "Table":
+            if not isinstance(value, list):
+                cleaned.pop(fieldname, None)
+                warnings.append(
+                    f"Omitted {fieldname} because it requires a list of table rows, but a {type(value).__name__} was provided."
                 )
 
     return cleaned, warnings
@@ -553,10 +561,16 @@ def erp_describe_fields(doctype: str) -> str:
         req = get_required_fields(doctype)
         lines = [f"Queryable fields for {doctype} (label: fieldname [type]):"]
         lines.append("- ID / Primary Key: name [Data]")
-        lines.extend(
-            f"- {f['label']}: {f['fieldname']} [{f['fieldtype']}]"
-            for f in available
-        )
+        for f in available:
+            if f['fieldtype'] in {"Table", "Table MultiSelect"} and f.get('options'):
+                lines.append(f"- {f['label']}: {f['fieldname']} [List of {f['options']} dicts]")
+                try:
+                    child_fields = get_available_fields(f['options'])
+                    lines.append(f"  (Child fields: {', '.join([cf['fieldname'] for cf in child_fields])})")
+                except Exception:
+                    pass
+            else:
+                lines.append(f"- {f['label']}: {f['fieldname']} [{f['fieldtype']}]")
         lines.append("")
         if not req:
             lines.append("ERPNext does not mark any user-supplied field as required for creation.")

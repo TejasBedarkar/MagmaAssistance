@@ -107,12 +107,13 @@ def get_available_fields(doctype: str) -> list[dict]:
         fieldtype = field.get("fieldtype")
         if not fieldname or fieldname in seen or fieldtype in _NON_DATA_FIELDTYPES:
             continue
-        if field.get("hidden") or fieldtype in {"Table", "Table MultiSelect"}:
+        if field.get("hidden") and fieldtype not in {"Table", "Table MultiSelect"}:
             continue
         available.append({
             "fieldname": fieldname,
             "label": field.get("label") or fieldname.replace("_", " ").title(),
             "fieldtype": fieldtype or "Data",
+            "options": field.get("options")
         })
         seen.add(fieldname)
     return available
