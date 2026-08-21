@@ -1918,7 +1918,8 @@ async def chat_stream(req: ChatRequest):
             logger.exception("Streaming agent turn failed: %s", text)
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
         finally:
-            await save_stream_history(req.session_id, history)
+            import asyncio
+            asyncio.create_task(save_stream_history(req.session_id, list(history)))
             
         yield "data: [DONE]\n\n"
 

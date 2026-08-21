@@ -33,5 +33,21 @@ KNOWLEDGE_BASE = {
         "- To search for incoming/outgoing emails, use `erp_data_tool` with `operation='list'` and `filters=[['communication_medium', '=', 'Email']]`.\n"
         "- The actual email body is in the `content` field. You may want to fetch fields like `subject`, `content`, `sender`, `recipients`, and `communication_date`.\n"
         "- Do NOT use `erp_data_tool` with `operation='create'` to send an email! ALWAYS use the `erp_send_email` tool instead."
+    ),
+    "BOM": (
+        "- BOMs define materials and operations to manufacture an Item.\n"
+        "- NEVER modify an existing submitted BOM automatically. Submitted BOMs must be cancelled/duplicated for changes.\n"
+        "- When explaining a BOM, clearly state required materials and operations for the requested quantity.\n"
+        "- Actively identify missing operations, workstations, or incorrect quantities."
+    ),
+    "Work Order": (
+        "- A Work Order dictates the quantity of an Item to manufacture and generates material requirements from its BOM.\n"
+        "- Do not create a Work Order if the materials in Inventory are insufficient. Propose a Material Request first."
+    ),
+    "Production Plan": (
+        "- A Production Plan aggregates demand from Sales Orders or Material Requests and is used to generate subsequent Work Orders."
+    ),
+    "Material Request": (
+        "- Use this to propose procurement of materials when Inventory is short of the BOM requirements."
     )
 }
