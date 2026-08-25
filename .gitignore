@@ -52,3 +52,7 @@ cookies.txt
 *.sqlite
 *.sqlite3
 checkpoints.sqlite*
+
+# SQLite WAL files
+*.sqlite-shm
+*.sqlite-wal
