@@ -2032,7 +2032,6 @@ app.state.session_identities = session_identities
 app.state.all_tools_list = ALL_TOOLS
 app.state.execute_tool_fn = _execute_tool
 app.state.load_stream_history_fn = load_stream_history
-app.state.save_stream_history_fn = save_stream_history
 
 
 @app.get("/api/health")

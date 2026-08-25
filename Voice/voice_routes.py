@@ -32,7 +32,6 @@ from Voice.voice_session_manager import (
     create_voice_session,
     get_voice_session,
     revoke_voice_session,
-    append_voice_turn,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,11 +66,6 @@ class VoiceToolRequest(BaseModel):
     tool_name: str
     args: Dict[str, Any] = {}
     call_id: Optional[str] = None   # OpenAI function call ID — echoed back to client
-
-
-class VoiceTurnRequest(BaseModel):
-    role: str
-    text: str
 
 
 # ---------------------------------------------------------------------------
@@ -186,50 +180,6 @@ async def get_voice_config(session_id: str, state=Depends(_get_server_state)):
         },
         "conversation_history": history,
     }
-
-
-@voice_router.post("/session/{session_id}/turn")
-async def sync_voice_turn(
-    session_id: str,
-    req: VoiceTurnRequest,
-    state=Depends(_get_server_state),
-):
-    voice_record = get_voice_session(session_id)
-    if not voice_record:
-        raise HTTPException(
-            status_code=401,
-            detail="No active voice session. Call /api/voice/session/start first.",
-        )
-
-    if req.role not in ("user", "assistant"):
-        raise HTTPException(status_code=400, detail="role must be 'user' or 'assistant'")
-
-    text = (req.text or "").strip()
-    if not text:
-        return {"success": True, "skipped": True}
-
-    load_fn = getattr(state, "load_stream_history_fn", None)
-    save_fn = getattr(state, "save_stream_history_fn", None)
-    if load_fn is None or save_fn is None:
-        raise HTTPException(status_code=500, detail="stream history functions not available on app.state")
-
-    from langchain_core.messages import HumanMessage, AIMessage
-
-    history = await load_fn(session_id)
-    history.append(HumanMessage(content=text) if req.role == "user" else AIMessage(content=text))
-    await save_fn(session_id, history)
-
-    append_voice_turn(session_id, req.role, text)
-
-    return {"success": True, "history_length": len(history)}
-
-
-@voice_router.get("/session/{session_id}/transcript")
-async def get_voice_transcript(session_id: str):
-    voice_record = get_voice_session(session_id)
-    if not voice_record:
-        raise HTTPException(status_code=404, detail="No active voice session for this session_id.")
-    return {"session_id": session_id, "transcript": voice_record.get("transcript", [])}
 
 
 @voice_router.post("/session/{session_id}/tool")

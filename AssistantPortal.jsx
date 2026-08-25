@@ -1089,8 +1089,9 @@ export default function AssistantPortal({ isOpen, onClose }) {
             });
         }
 
-        const sessionId = createVoiceChat();
+        const sessionId = voiceSessionIdRef.current || (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
         voiceSessionIdRef.current = sessionId;
+        createVoiceChat();
 
         const voiceParams = new URLSearchParams({ session_id: sessionId });
         const hostUrl = API_BASE_URL.replace('http://', 'ws://').replace('https://', 'wss://') || `ws://${window.location.host || 'localhost:8050'}`;

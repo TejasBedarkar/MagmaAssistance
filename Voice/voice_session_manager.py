@@ -38,10 +38,6 @@ async def create_voice_session(
     """
     token_data = await _fetch_ephemeral_token(openai_api_key, model, voice)
 
-    existing = _active_sessions.get(session_id)
-    if existing and existing.get("refresh_task"):
-        existing["refresh_task"].cancel()
-
     session_record = {
         "session_id": session_id,
         "user_id": user_id,
@@ -52,8 +48,12 @@ async def create_voice_session(
         "created_at": time.time(),
         "openai_api_key": openai_api_key,  # stored for refresh
         "refresh_task": None,
-        "transcript": existing.get("transcript", []) if existing else [],
     }
+
+    # Cancel any previous refresh task for this session_id
+    existing = _active_sessions.get(session_id)
+    if existing and existing.get("refresh_task"):
+        existing["refresh_task"].cancel()
 
     # Schedule proactive token refresh
     refresh_task = asyncio.create_task(
@@ -78,13 +78,6 @@ def get_voice_session(session_id: str) -> Optional[dict]:
         revoke_voice_session(session_id)
         return None
     return record
-
-
-def append_voice_turn(session_id: str, role: str, text: str) -> None:
-    record = _active_sessions.get(session_id)
-    if not record:
-        return
-    record.setdefault("transcript", []).append({"role": role, "text": text, "ts": time.time()})
 
 
 def revoke_voice_session(session_id: str) -> None:

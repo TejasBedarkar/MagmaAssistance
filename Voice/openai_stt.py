@@ -28,20 +28,14 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "gpt-4o-mini-transcribe")
 _client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
-async def transcribe(audio_bytes: bytes, language: str = "en", filename: str = "audio.webm") -> dict:
+async def transcribe(audio_bytes: bytes, language: str = "en") -> dict:
     """Transcribe raw audio bytes to text using OpenAI Whisper.
 
     Args:
-        audio_bytes: Raw audio bytes. Container format is inferred by
-                     OpenAI from `filename`'s extension — pass the filename
-                     matching what you actually sent (e.g. "audio.wav" for
-                     PCM wrapped in a WAV header, "audio.webm" for the
-                     browser's default WebM/Opus capture).
+        audio_bytes: Raw audio bytes. The browser sends WebM/Opus, which
+                     OpenAI's API handles natively — no re-encoding needed.
         language:    BCP-47 language tag hint (e.g. "en", "hi"). Optional;
                      passing it slightly improves accuracy and latency.
-        filename:    Fake filename used only to tell OpenAI the container
-                     format. Defaults to "audio.webm" for backward
-                     compatibility with existing callers.
 
     Returns:
         {"transcript": str}  — empty string if nothing was detected.
@@ -52,7 +46,7 @@ async def transcribe(audio_bytes: bytes, language: str = "en", filename: str = "
     # Wrap bytes in a file-like object. The .name tells the API the format.
     # OpenAI supports: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm.
     audio_file = io.BytesIO(audio_bytes)
-    audio_file.name = filename
+    audio_file.name = "audio.webm"
 
     try:
         result = await _client.audio.transcriptions.create(
