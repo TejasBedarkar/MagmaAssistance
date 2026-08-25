@@ -18,7 +18,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # OpenAI endpoint for ephemeral token generation
-_OPENAI_REALTIME_SESSIONS_URL = "https://api.openai.com/v1/realtime/sessions"
+_OPENAI_REALTIME_SESSIONS_URL = "https://api.openai.com/v1/realtime/client_secrets"
 _TOKEN_TTL_SECONDS = 50  # Refresh before the 60s OpenAI expiry
 
 # In-memory registry: session_id -> session metadata dict
@@ -99,8 +99,11 @@ async def _fetch_ephemeral_token(api_key: str, model: str, voice: str) -> dict:
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            json={"model": model, "voice": voice},
+            json={"session": {"modalities": ["audio", "text"], "model": model, "type": "realtime", "voice": voice}},
         )
+        if resp.status_code >= 400:
+            logger.error(f"OpenAI error {resp.status_code}: {resp.text}")
+
         resp.raise_for_status()
         return resp.json()
 

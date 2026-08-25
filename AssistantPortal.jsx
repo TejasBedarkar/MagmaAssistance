@@ -847,15 +847,14 @@ export default function AssistantPortal({ isOpen, onClose }) {
         setVoiceEvents((events) => [...events.slice(-5), { type, detail: String(detail || '') }]);
     };
 
-    const createVoiceChat = () => {
+    const createVoiceChat = (targetSessionId) => {
         if (voiceChatIdRef.current) return voiceChatIdRef.current;
-        const id = currentChatId || `voice-${Date.now()}`;
         if (!currentChatId) {
-            setChatHistory((prev) => [{ id, title: 'Live voice session', messages: [] }, ...prev]);
-            setCurrentChatId(id);
+            setChatHistory((prev) => [{ id: targetSessionId, title: 'Live voice session', messages: [] }, ...prev]);
+            setCurrentChatId(targetSessionId);
         }
-        voiceChatIdRef.current = id;
-        return id;
+        voiceChatIdRef.current = targetSessionId;
+        return targetSessionId;
     };
 
 
@@ -1119,10 +1118,10 @@ export default function AssistantPortal({ isOpen, onClose }) {
         // Chat share a single conversation history in the backend DB.
         // Previously this generated a random UUID which created a completely
         // separate history thread — context was always lost on Voice↔Chat switches.
-        const chatSessionId = currentChatId || `session-${Date.now()}`;
+        const chatSessionId = currentChatId || `voice-${Date.now()}`;
         const sessionId = chatSessionId;
         voiceSessionIdRef.current = sessionId;
-        createVoiceChat();
+        createVoiceChat(sessionId);
 
         const voiceParams = new URLSearchParams({ session_id: sessionId });
         const hostUrl = API_BASE_URL.replace('http://', 'ws://').replace('https://', 'wss://') || `ws://${window.location.host || 'localhost:8050'}`;
@@ -1218,7 +1217,6 @@ const openVoiceMode = () => {
         setVoiceTools([]);
         setPinnedChart(null);
         disconnectVoice();
-        voiceChatIdRef.current = null;
     };
 
     const handleOrbTap = () => {
@@ -1233,6 +1231,14 @@ const openVoiceMode = () => {
     useEffect(() => {
         voiceStatusRef.current = voiceStatus;
     }, [voiceStatus]);
+
+    // Keep voiceDisplayMessages in sync with the underlying text chat
+    // so the floating transcript window populates as the AI responds.
+    useEffect(() => {
+        if (isVoiceModeOpen) {
+            setVoiceDisplayMessages(activeMessages.map((msg) => ({ ...msg })));
+        }
+    }, [activeMessages, isVoiceModeOpen]);
 
     useEffect(() => {
         if (isVoiceModeOpen) {
