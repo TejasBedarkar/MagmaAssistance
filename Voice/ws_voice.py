@@ -16,6 +16,14 @@ import re
 import time
 from fastapi import WebSocket, WebSocketDisconnect
 
+_ws_bg_tasks = set()
+
+def safe_create_task(coro):
+    task = asyncio.create_task(coro)
+    _ws_bg_tasks.add(task)
+    task.add_done_callback(_ws_bg_tasks.discard)
+    return task
+
 
 def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, save_stream_history):
 
@@ -47,9 +55,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
         # ------------------------------------------------------------------ #
         # Shared conversation history (same sqlite as /api/chat/stream)       #
         # ------------------------------------------------------------------ #
-
-        history = await load_stream_history(session_id)
-
+        # (Moved inside run_turn to prevent state duplication across turns)
         # ------------------------------------------------------------------ #
         # Turn management                                                      #
         # ------------------------------------------------------------------ #
@@ -96,6 +102,9 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
             logger.info("[WS/voice] turn START  session=%s  text=%r", session_id, text[:120])
             state["speaking"] = True
             token_buf = ""   # accumulates cleaned text for speech
+            
+            history = await load_stream_history(session_id)
+            start_len = len(history)  # snapshot before turn mutates history
 
             try:
                 async for event in stream_agent_turn(
@@ -164,7 +173,11 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
                     pass
             finally:
                 state["speaking"] = False
-                asyncio.create_task(save_stream_history(session_id, list(history)))
+                # Save ONLY new messages from this turn (delta) — the checkpointer
+                # uses add_messages which appends, so saving full history would duplicate.
+                delta = history[start_len:]
+                if delta:
+                    safe_create_task(save_stream_history(session_id, delta))
 
         # ------------------------------------------------------------------ #
         # Main receive loop                                                   #

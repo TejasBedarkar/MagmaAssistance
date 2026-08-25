@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import os
 import re
@@ -386,6 +387,19 @@ else:
     logger.info("No ERP tools registered.")
 
 
+from fastapi import BackgroundTasks
+
+# Python 3.11+ asyncio can garbage collect background tasks if no strong reference is kept.
+# We store them here to prevent them from being killed mid-execution (e.g. while saving to SQLite).
+_bg_tasks = set()
+_checkpoint_conn = None  # global aiosqlite connection, used to force commits after saves
+
+def safe_create_task(coro):
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs once at server startup and once at shutdown (FastAPI lifespan
@@ -411,17 +425,19 @@ async def lifespan(app: FastAPI):
     import aiosqlite
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
     
-    global agent_graph
-    # We maintain a connection pool for the lifespan of the server
-    conn = await aiosqlite.connect("checkpoints.sqlite", check_same_thread=False)
+    global agent_graph, _checkpoint_conn
+    # isolation_level=None = autocommit mode so every write is immediately visible
+    # to subsequent reads on the same connection (fixes WAL not-visible-to-self bug)
+    _checkpoint_conn = await aiosqlite.connect("stream_history.sqlite", isolation_level=None)
     try:
-        saver = AsyncSqliteSaver(conn)
+        saver = AsyncSqliteSaver(_checkpoint_conn)
         await saver.setup()
         agent_graph = build_agent_graph(checkpointer=saver)
         logger.info("AsyncSqliteSaver persistent memory ready.")
         yield
     finally:
-        await conn.close()
+        await _checkpoint_conn.close()
+        _checkpoint_conn = None
 
 
 app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
@@ -468,7 +484,10 @@ app.include_router(voice_router)
 #    against "<task label>. <new message>" instead of the raw message
 #    alone, which keeps retrieval accurate on short follow-ups ("what's
 #    her phone number?") that wouldn't embed well on their own.
-MAX_HISTORY_MESSAGES = 12  # messages, not tokens -- len() is used as the counter below
+MAX_HISTORY_TOKENS = 60000  # Approximated: 1 token ~= 4 chars
+
+def _approx_tokens(messages: list) -> int:
+    return sum(len(str(m.content)) // 4 for m in messages)
 
 
 class ChatState(TypedDict):
@@ -1029,10 +1048,17 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     WS path. Keeps its own `history` list (caller-owned, per-connection)
     instead of the LangGraph checkpointer, so the existing text-chat graph
     and its slot-filling flow are untouched. Yields token/tool_call/
-    tool_result/done event dicts in call order."""
+    tool_result/done event dicts in call order.
+    
+    IMPORTANT: We track start_len so callers can extract only the NEW messages
+    added this turn (the delta) for saving. The checkpointer uses add_messages
+    which appends — so saving the full list would duplicate every message.
+    """
     history = history if history is not None else []
+    start_len = len(history)  # snapshot before we mutate
     history.append(HumanMessage(content=text))
-    trimmed = trim_messages(history, max_tokens=MAX_HISTORY_MESSAGES, token_counter=len, strategy="last", include_system=False)
+    # Trim for LLM context window — this is a separate list, does NOT affect history
+    trimmed = trim_messages(history, max_tokens=MAX_HISTORY_TOKENS, token_counter=_approx_tokens, strategy="last", include_system=False)
 
     candidate_tools = []
     if ALL_TOOLS:
@@ -1054,45 +1080,71 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     call_messages = [SystemMessage(content="\n".join(system_parts)), *trimmed]
 
     max_rounds = 4
-    for round_number in range(max_rounds + 1):
+    try:
+        for round_number in range(max_rounds + 1):
+            content = ""
+            tool_calls = []
+            async for event in _stream_full_reply(call_messages, tools=openai_tools):
+                if event["type"] == "token":
+                    yield {"type": "token", "text": event["text"]}
+                else:
+                    content = event["content"]
+                    tool_calls = event["tool_calls"]
+
+            if not tool_calls:
+                ai_msg = AIMessage(content=content)
+                history.append(ai_msg)
+                # Yield the delta (only newly added messages) so callers can save it
+                yield {"type": "done", "text": content, "_delta": history[start_len:]}
+                return
+
+            if round_number == max_rounds:
+                break
+
+            ai_msg = AIMessage(content=content, tool_calls=tool_calls)
+            call_messages.append(ai_msg)
+            history.append(ai_msg)
+            for tc in tool_calls:
+                yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
+                result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
+                yield {"type": "tool_result", "name": tc["name"], "result": result}
+                t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
+                call_messages.append(t_msg)
+                history.append(t_msg)
+
         content = ""
-        tool_calls = []
-        async for event in _stream_full_reply(call_messages, tools=openai_tools):
+        async for event in _stream_full_reply(call_messages, tools=None):
             if event["type"] == "token":
                 yield {"type": "token", "text": event["text"]}
             else:
                 content = event["content"]
-                tool_calls = event["tool_calls"]
-
-        if not tool_calls:
-            ai_msg = AIMessage(content=content)
-            history.append(ai_msg)
-            yield {"type": "done", "text": content}
-            return
-
-        if round_number == max_rounds:
-            break
-
-        ai_msg = AIMessage(content=content, tool_calls=tool_calls)
-        call_messages.append(ai_msg)
+        ai_msg = AIMessage(content=content)
         history.append(ai_msg)
-        for tc in tool_calls:
-            yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
-            result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
-            yield {"type": "tool_result", "name": tc["name"], "result": result}
-            t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
-            call_messages.append(t_msg)
-            history.append(t_msg)
-
-    content = ""
-    async for event in _stream_full_reply(call_messages, tools=None):
-        if event["type"] == "token":
-            yield {"type": "token", "text": event["text"]}
-        else:
-            content = event["content"]
-    ai_msg = AIMessage(content=content)
-    history.append(ai_msg)
-    yield {"type": "done", "text": content}
+        yield {"type": "done", "text": content, "_delta": history[start_len:]}
+    except asyncio.CancelledError:
+        # Clean up ONLY if we have a dangling AIMessage with tool_calls that lacks matching ToolMessages
+        if history:
+            last_msg = history[-1]
+            if isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None):
+                history.pop()
+            elif isinstance(last_msg, ToolMessage):
+                # Count how many ToolMessages we have at the end
+                tool_msg_count = 0
+                for msg in reversed(history):
+                    if isinstance(msg, ToolMessage):
+                        tool_msg_count += 1
+                    else:
+                        break
+                
+                # Check the AIMessage that preceded these ToolMessages
+                if len(history) > tool_msg_count:
+                    ai_msg = history[-(tool_msg_count + 1)]
+                    if isinstance(ai_msg, AIMessage) and getattr(ai_msg, "tool_calls", None):
+                        if len(ai_msg.tool_calls) != tool_msg_count:
+                            # Incomplete tool execution sequence! Pop them all to prevent OpenAI 400 errors.
+                            for _ in range(tool_msg_count + 1):
+                                history.pop()
+        raise
 
 
 _FAKE_NAME_RE = re.compile(r'"name"\s*:\s*"(?P<name>[a-zA-Z_][\w\-.]*)"')
@@ -1544,8 +1596,8 @@ async def general_node(state: ChatState) -> dict:
     
     history = trim_messages(
         state["messages"],
-        max_tokens=MAX_HISTORY_MESSAGES,
-        token_counter=len,
+        max_tokens=MAX_HISTORY_TOKENS,
+        token_counter=_approx_tokens,
         strategy="last",
         include_system=False,
     )
@@ -1859,27 +1911,35 @@ async def chat(req: ChatRequest):
     return {"reply": reply, "audio": audio_b64}
 
 async def load_stream_history(session_id: str) -> list:
-    import aiosqlite, json
-    from langchain_core.messages import messages_from_dict
-    async with aiosqlite.connect("stream_history.sqlite") as conn:
-        await conn.execute("CREATE TABLE IF NOT EXISTS stream_history (session_id TEXT PRIMARY KEY, history TEXT)")
-        async with conn.execute("SELECT history FROM stream_history WHERE session_id = ?", (session_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                try:
-                    return messages_from_dict(json.loads(row[0]))
-                except Exception:
-                    pass
+    global agent_graph
+    config = {"configurable": {"thread_id": session_id}}
+    state = await agent_graph.aget_state(config)
+    if state and state.values and "messages" in state.values:
+        return list(state.values["messages"])
     return []
 
-async def save_stream_history(session_id: str, history: list):
-    import aiosqlite, json
-    from langchain_core.messages import messages_to_dict
-    async with aiosqlite.connect("stream_history.sqlite") as conn:
-        await conn.execute("CREATE TABLE IF NOT EXISTS stream_history (session_id TEXT PRIMARY KEY, history TEXT)")
-        hist_str = json.dumps(messages_to_dict(history))
-        await conn.execute("INSERT OR REPLACE INTO stream_history (session_id, history) VALUES (?, ?)", (session_id, hist_str))
-        await conn.commit()
+async def save_stream_history(session_id: str, new_messages: list):
+    """Append ONLY new_messages to the checkpointer for this session.
+    
+    CRITICAL: The ChatState.messages field uses the add_messages reducer,
+    which APPENDS to existing messages. Passing the full history list here
+    would cause exponential duplication (2x on turn 2, 3x on turn 3...).
+    Always pass only the delta (new messages from this turn).
+    """
+    if not new_messages:
+        return
+    global agent_graph, _checkpoint_conn
+    config = {"configurable": {"thread_id": session_id}}
+    await agent_graph.aupdate_state(config, {"messages": new_messages}, as_node="intake")
+    # Force commit so the next aget_state call on the same connection sees the new data.
+    # aiosqlite with isolation_level=None is autocommit, but LangGraph may wrap writes
+    # in transactions internally. This ensures they're flushed.
+    if _checkpoint_conn:
+        try:
+            await _checkpoint_conn.commit()
+        except Exception:
+            pass  # Already committed in autocommit mode, safe to ignore
+
 
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest):
@@ -1894,6 +1954,7 @@ async def chat_stream(req: ChatRequest):
         raise HTTPException(status_code=400, detail="message is required")
 
     history = await load_stream_history(req.session_id)
+    start_len = len(history)  # snapshot before the turn mutates history
 
     async def event_gen():
         # Flush the SSE response and its CORS headers through Dev Tunnels
@@ -1903,13 +1964,17 @@ async def chat_stream(req: ChatRequest):
         yield ": connected\n\n"
         try:
             async for event in stream_agent_turn(text, session_id=req.session_id, user_id=req.user_id, history=history):
-                yield f"data: {json.dumps(event)}\n\n"
+                # Strip internal _delta key before sending to browser
+                browser_event = {k: v for k, v in event.items() if k != "_delta"}
+                yield f"data: {json.dumps(browser_event)}\n\n"
         except Exception as exc:  # noqa: BLE001
             logger.exception("Streaming agent turn failed: %s", text)
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
         finally:
-            import asyncio
-            asyncio.create_task(save_stream_history(req.session_id, list(history)))
+            # Save ONLY the new messages from this turn (delta), not the full history
+            delta = history[start_len:]
+            if delta:
+                safe_create_task(save_stream_history(req.session_id, delta))
             
         yield "data: [DONE]\n\n"
 

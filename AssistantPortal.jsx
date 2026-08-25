@@ -793,12 +793,20 @@ export default function AssistantPortal({ isOpen, onClose }) {
         utterance.pitch = 1.0;
         const voice = pickTtsVoice();
         if (voice) utterance.voice = voice;
+        // Keep utterance in memory to prevent Chrome's garbage collection bug from killing it before onend fires
+        window._activeUtterances = window._activeUtterances || [];
+        window._activeUtterances.push(utterance);
+
         utterance.onstart = () => {
             setVoiceStatus('speaking');
             console.log('[MAGMA VOICE] TTS speaking:', text.slice(0, 80));
         };
-        utterance.onend = () => { drainTtsQueue(); };
+        utterance.onend = () => { 
+            window._activeUtterances = window._activeUtterances.filter(u => u !== utterance);
+            drainTtsQueue(); 
+        };
         utterance.onerror = (e) => {
+            window._activeUtterances = window._activeUtterances.filter(u => u !== utterance);
             console.error('[MAGMA VOICE] TTS error:', e.error);
             drainTtsQueue();
         };
@@ -1089,7 +1097,12 @@ export default function AssistantPortal({ isOpen, onClose }) {
             });
         }
 
-        const sessionId = voiceSessionIdRef.current || (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        // CRITICAL: Use the same session_id as the current text chat so Voice and
+        // Chat share a single conversation history in the backend DB.
+        // Previously this generated a random UUID which created a completely
+        // separate history thread — context was always lost on Voice↔Chat switches.
+        const chatSessionId = currentChatId || `session-${Date.now()}`;
+        const sessionId = chatSessionId;
         voiceSessionIdRef.current = sessionId;
         createVoiceChat();
 
