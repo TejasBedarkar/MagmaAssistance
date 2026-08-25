@@ -169,6 +169,22 @@ def _is_non_official_host(netloc):
 
 
 def _fetch_soup(url):
+    # 1. Attempt Tavily Extract to bypass bot protection and render JS
+    if _tavily_client:
+        try:
+            res = _tavily_client.extract(urls=[url])
+            results = res.get("results", [])
+            if results and results[0].get("raw_content"):
+                markdown = results[0]["raw_content"]
+                # Convert markdown links [text](url) to HTML <a href="url">text</a>
+                html = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', markdown)
+                # Ensure the text is parseable by beautifulsoup
+                html_doc = f"<html><body><p>{html}</p></body></html>"
+                return BeautifulSoup(html_doc, "html.parser")
+        except Exception as e:
+            logger.warning("Tavily extract failed for %s: %s", url, e)
+
+    # 2. Fallback to standard requests if Tavily is unavailable or fails
     try:
         resp = requests.get(url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
         resp.raise_for_status()
@@ -587,12 +603,15 @@ def web_company_extract(url: str, company_name: Optional[str] = None) -> str:
         lines = [f"Contact extraction for: {url}",
                  f"Pages scanned: {', '.join(pages_tried)}\n"]
 
+        primary_email = "NOT FOUND"
         if contacts["emails"]:
-            lines.append(f"Email:       {contacts['emails'][0]}")
+            primary_email = contacts["emails"][0]
+            lines.append(f"Email:       {primary_email}")
             if len(contacts["emails"]) > 1:
                 lines.append(f"  (also: {', '.join(contacts['emails'][1:])})")
         elif fallback_emails:
-            lines.append(f"Email:       {fallback_emails[0]} (found via broad web search)")
+            primary_email = fallback_emails[0]
+            lines.append(f"Email:       {primary_email} (found via broad web search)")
             if len(fallback_emails) > 1:
                 lines.append(f"  (also: {', '.join(fallback_emails[1:])})")
         else:
