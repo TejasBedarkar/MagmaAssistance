@@ -765,16 +765,34 @@ export default function AssistantPortal({ isOpen, onClose }) {
 
     // ---- Web Speech TTS helpers ----
 
-    // Pick the best available en-IN or en-GB voice from speechSynthesis.
-    // Falls back to any English voice, then the browser default.
     const pickTtsVoice = () => {
         const voices = window.speechSynthesis?.getVoices() || [];
-        return (
-            voices.find(v => v.lang === 'en-IN') ||
-            voices.find(v => v.lang === 'en-GB') ||
-            voices.find(v => v.lang.startsWith('en')) ||
-            null
+        
+        // 1. Prioritize known high-quality Indian voices (macOS, Windows, Chrome OS)
+        let bestVoice = voices.find(v => 
+            v.name.includes('Rishi') || 
+            v.name.includes('Veena') || 
+            v.name.includes('Microsoft Heera') ||
+            v.name.includes('Microsoft Ravi') ||
+            (v.name.includes('Google') && v.lang.includes('IN'))
         );
+        
+        // 2. Fallback to generic en-IN language code
+        if (!bestVoice) {
+            bestVoice = voices.find(v => v.lang === 'en-IN' || v.lang === 'en_IN');
+        }
+        
+        // 3. Fallback to British English (handles Indian names better than US English)
+        if (!bestVoice) {
+            bestVoice = voices.find(v => v.lang === 'en-GB' || v.lang === 'en_GB');
+        }
+        
+        // 4. Any English voice
+        if (!bestVoice) {
+            bestVoice = voices.find(v => v.lang.startsWith('en'));
+        }
+        
+        return bestVoice || null;
     };
 
     // Drain the TTS sentence queue — called after each utterance ends.

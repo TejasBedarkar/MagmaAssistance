@@ -262,29 +262,42 @@ def _extract_contacts_from_soup(soup):
 
 
 def _extract_description(soup):
+    """Gathers up to ~1000 chars of descriptive text from the page.
+    The LLM will summarize this into a concise 2-3 sentences."""
+    snippets = []
+    
+    # 1. Meta descriptions
     for selector in [
         {"property": "og:description"},
         {"name": "description"},
-        {"name": "twitter:description"},
     ]:
         tag = soup.find("meta", attrs=selector)
-        if tag and tag.get("content", "").strip() and len(tag["content"].strip()) > 30:
-            return tag["content"].strip()[:400]
+        if tag and tag.get("content", "").strip():
+            desc = tag["content"].strip()
+            if len(desc) > 40 and desc not in snippets:
+                snippets.append(desc)
+                
+    # 2. JSON-LD description
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
             items = data if isinstance(data, list) else [data]
             for item in items:
                 desc = item.get("description", "")
-                if desc and len(desc) > 30:
-                    return desc[:400]
+                if desc and len(desc) > 40 and desc not in snippets:
+                    snippets.append(desc)
         except Exception:
             pass
+            
+    # 3. Substantial paragraphs
     for p in soup.find_all("p"):
         text = p.get_text(" ", strip=True)
-        if len(text) > 60:
-            return text[:400]
-    return ""
+        if len(text) > 80 and text not in snippets:
+            snippets.append(text)
+        if len(snippets) >= 5:  # Cap at 5 snippets
+            break
+            
+    return " | ".join(snippets)[:1000]
 
 
 def _extract_person_names(soup):
@@ -547,14 +560,43 @@ def web_company_extract(url: str, company_name: Optional[str] = None) -> str:
                     break
                 time.sleep(0.3)
 
+        # Fallback: If no email found on the official site, execute a broad web search automatically
+        fallback_emails = []
+        if not contacts["emails"]:
+            search_query = f"{company_name or urlparse(url).netloc.replace('www.', '')} contact email address"
+            try:
+                # Use Tavily if available
+                if _tavily_client:
+                    resp = _tavily_client.search(query=search_query, max_results=10)
+                    results = resp.get("results", [])
+                else:
+                    resp = requests.get(f"{_SEARXNG_URL}/search", params={"q": search_query, "format": "json"}, timeout=_REQUEST_TIMEOUT)
+                    results = resp.json().get("results", [])
+                    
+                # Scan search snippets for emails
+                combined_text = " ".join([r.get("content", "") + " " + r.get("title", "") for r in results])
+                for match in _EMAIL_RE.finditer(combined_text):
+                    addr = match.group().lower()
+                    local = addr.split("@")[0]
+                    if local not in _GENERIC_EMAIL_PREFIXES and addr not in fallback_emails:
+                        fallback_emails.append(addr)
+            except Exception as e:
+                logger.warning(f"Fallback email search failed: {e}")
+
         # Build output
         lines = [f"Contact extraction for: {url}",
                  f"Pages scanned: {', '.join(pages_tried)}\n"]
 
-        primary_email = contacts["emails"][0] if contacts["emails"] else "NOT FOUND"
-        lines.append(f"Email:       {primary_email}")
-        if len(contacts["emails"]) > 1:
-            lines.append(f"  (also: {', '.join(contacts['emails'][1:])})")
+        if contacts["emails"]:
+            lines.append(f"Email:       {contacts['emails'][0]}")
+            if len(contacts["emails"]) > 1:
+                lines.append(f"  (also: {', '.join(contacts['emails'][1:])})")
+        elif fallback_emails:
+            lines.append(f"Email:       {fallback_emails[0]} (found via broad web search)")
+            if len(fallback_emails) > 1:
+                lines.append(f"  (also: {', '.join(fallback_emails[1:])})")
+        else:
+            lines.append(f"Email:       NOT FOUND")
 
         primary_phone = contacts["phones"][0] if contacts["phones"] else "NOT FOUND"
         lines.append(f"Phone:       {primary_phone}")
