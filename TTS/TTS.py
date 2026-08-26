@@ -88,3 +88,4 @@ class OpenAITTS:
 # Backward-compatible alias -- older code imported the ElevenLabs-backed
 # class under this name.
 ELTTS = OpenAITTS
+# tts works

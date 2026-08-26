@@ -8,6 +8,7 @@ import json
 import sys
 import ast
 import httpx
+import asyncio
 from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -1600,6 +1601,7 @@ async def general_node(state: ChatState) -> dict:
         token_counter=_approx_tokens,
         strategy="last",
         include_system=False,
+        start_on="human"
     )
     
     if not tool_rag:

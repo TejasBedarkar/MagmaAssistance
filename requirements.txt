@@ -28,6 +28,7 @@ langgraph
 langgraph-checkpoint
 langgraph-cli
 langgraph-sdk
+langgraph-checkpoint-sqlite
 langsmith
 huggingface_hub
 sounddevice
@@ -60,3 +61,5 @@ lxml
 psycopg2-binary
 boto3
 openai-agents[voice]
+livekit
+livekit-api
