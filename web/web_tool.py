@@ -196,9 +196,26 @@ def _fetch_soup(url):
         return None
 
 
-def _extract_from_schema(item, emails, phones, socials):
+def _extract_from_schema(item, emails, phones, socials, addresses):
     if not isinstance(item, dict):
         return
+        
+    # Address extraction
+    if item.get("@type") == "PostalAddress":
+        addr_parts = []
+        for k in ("streetAddress", "addressLocality", "addressRegion", "postalCode", "addressCountry"):
+            val = item.get(k)
+            if val and isinstance(val, str):
+                addr_parts.append(val)
+        if addr_parts:
+            full_addr = ", ".join(addr_parts)
+            if full_addr not in addresses:
+                addresses.append(full_addr)
+    else:
+        addr = item.get("address")
+        if isinstance(addr, str) and addr not in addresses:
+            addresses.append(addr)
+
     for field in ("email", "contactEmail"):
         v = item.get(field, "")
         if v and "@" in v and v.lower() not in emails:
@@ -217,14 +234,14 @@ def _extract_from_schema(item, emails, phones, socials):
     for key in ("contactPoint", "address", "founder", "employee", "member"):
         child = item.get(key)
         if isinstance(child, dict):
-            _extract_from_schema(child, emails, phones, socials)
+            _extract_from_schema(child, emails, phones, socials, addresses)
         elif isinstance(child, list):
             for c in child:
-                _extract_from_schema(c, emails, phones, socials)
+                _extract_from_schema(c, emails, phones, socials, addresses)
 
 
 def _extract_contacts_from_soup(soup):
-    emails, phones, whatsapp, socials = [], [], [], {}
+    emails, phones, whatsapp, socials, addresses = [], [], [], {}, []
     page_text = soup.get_text(" ", strip=True)
 
     # 1. mailto:/tel:/wa.me links
@@ -265,15 +282,22 @@ def _extract_contacts_from_soup(soup):
             data = json.loads(script.string or "")
             items = data if isinstance(data, list) else [data]
             for item in items:
-                _extract_from_schema(item, emails, phones, socials)
+                _extract_from_schema(item, emails, phones, socials, addresses)
         except Exception:
             pass
+
+    # HTML <address> tags
+    for tag in soup.find_all("address"):
+        text = tag.get_text(", ", strip=True)
+        if text and len(text) < 150 and text not in addresses:
+            addresses.append(text)
 
     return {
         "emails":   list(dict.fromkeys(emails))[:5],
         "phones":   list(dict.fromkeys(phones))[:5],
         "whatsapp": list(dict.fromkeys(whatsapp))[:3],
         "socials":  socials,
+        "addresses": list(dict.fromkeys(addresses))[:3]
     }
 
 
@@ -561,7 +585,7 @@ def web_company_extract(url: str, company_name: Optional[str] = None) -> str:
                 if not sub_soup:
                     continue
                 sub_contacts = _extract_contacts_from_soup(sub_soup)
-                for key in ("emails", "phones", "whatsapp"):
+                for key in ("emails", "phones", "whatsapp", "addresses"):
                     for val in sub_contacts[key]:
                         if val not in contacts[key]:
                             contacts[key].append(val)
@@ -624,6 +648,11 @@ def web_company_extract(url: str, company_name: Optional[str] = None) -> str:
 
         if contacts["whatsapp"]:
             lines.append(f"WhatsApp:    {contacts['whatsapp'][0]}")
+
+        if contacts["addresses"]:
+            lines.append(f"\nAddress:     {contacts['addresses'][0]}")
+            if len(contacts["addresses"]) > 1:
+                lines.append(f"  (also: {', '.join(contacts['addresses'][1:])})")
 
         if contacts["socials"]:
             lines.append("\nSocial Profiles:")

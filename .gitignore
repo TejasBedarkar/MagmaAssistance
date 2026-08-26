@@ -56,3 +56,11 @@ checkpoints.sqlite*
 # SQLite WAL files
 *.sqlite-shm
 *.sqlite-wal
+
+# Temporary and scratch files
+scratch/
+*.jsx
+test_*.py
+last_history.json
+*.bundle.js
+
