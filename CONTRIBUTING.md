@@ -114,86 +114,72 @@ fixes
 
 ## 6. Local setup
 
-> Historically the team ran only MagmaAssistance locally and pointed `.env`
-> `ERP_URL` at a **shared hosted Frappe**. For the cleanup we run **fully local**
-> so nobody's test writes leak into a shared ERP and deleting code can't break
-> a shared box. Pick one mode below.
+### For P1 / P2 (agent consolidation + dead-code removal) — this is all you need
 
-### Mode A — fully local (recommended for the cleanup)
-
-**One-time Frappe setup** (skip the steps you've already done):
+P1/P2 only delete/rewrite code inside **MagmaAssistance**. You do **not** need a
+working Frappe/ERPNext for this. You only need to prove the server still boots
+and the request pipeline still runs after your change.
 
 ```bash
-cd frappe-bench-v16
-
-# 1. Make magnaerp.local the DEFAULT site — otherwise bare-IP calls from
-#    erp_client (http://127.0.0.1:8000/...) have no site to route to and 404.
-bench use magnaerp.local
-
-# 2. Confirm frappe + erpnext + custom_ui are installed on the site
-bench --site magnaerp.local list-apps        # expect all three
-
-# 3. If erpnext / custom_ui are NOT listed:
-bench --site magnaerp.local install-app erpnext
-bench --site magnaerp.local install-app custom_ui
-bench --site magnaerp.local migrate
+cd MagmaAssistance
+source venv/bin/activate
+python server.py            # http://127.0.0.1:8050
 ```
 
-**One-time API keys** (the prod keys in `.env` do NOT work against local):
-
-1. `bench start`, open `http://magnaerp.local:8000`, log in as Administrator
-2. Avatar → **My Settings → API Access → Generate Keys**
-3. Put them in `MagmaAssistance/.env` (local only, never commit):
-   ```
-   ERP_URL=http://127.0.0.1:8000
-   ERP_API_KEY=<local key>
-   ERP_API_SECRET=<local secret>
-   ```
-   Keep a copy of the real prod `.env` values somewhere safe first.
-
-**Run it** (two terminals):
-
-```bash
-# Terminal 1 — Frappe
-cd frappe-bench-v16 && bench start            # http://127.0.0.1:8000
-
-# Terminal 2 — MagmaAssistance
-cd MagmaAssistance && source venv/bin/activate && python server.py   # :8050
+Healthy startup looks like:
 ```
+AsyncSqliteSaver persistent memory ready.
+Uvicorn running on http://0.0.0.0:8050
+```
+(`Could not apply Postgres schema` is fine — Postgres is optional and is being
+removed in P2. `Skipping HuggingFace ToolRAG indexing` is normal.)
 
-### Mode B — point at a shared dev Frappe
-
-Only MagmaAssistance runs on your machine. In `.env` set `ERP_URL` +
-`ERP_API_KEY` / `ERP_API_SECRET` to the shared dev/staging Frappe. Lighter
-setup, but you share ERP state with everyone else — don't use it for
-destructive testing.
-
-### Notes (both modes)
-
-- **Never commit `.env`.** It's per-developer.
-- Postgres audit fails gracefully if no Postgres runs — fine locally, and
-  Postgres is being removed in P2 anyway. (If you *do* have local Postgres,
-  the schema auto-applies on startup.)
-- **Frontend local dev:** in `custom_ui/.../ChatArea.jsx` set
-  `API_BASE_URL = 'http://localhost:8050'` and work on the `dev/local` branch —
-  **never** commit that line to a branch that can reach `main`.
-- Startup is healthy when you see: `AsyncSqliteSaver persistent memory ready.`
-  and `Uvicorn running on http://0.0.0.0:8050`.
-
-### Smoke check
-
+**Smoke check** — run before every push:
 ```bash
 curl -s http://localhost:8050/api/health          # {"status":"ok"}
 
 curl -sN -X POST http://localhost:8050/api/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{"message":"show me all customers","session_id":"smoke"}'
-# expect: connected -> tool_call(erp_data_tool) -> tool_result(a list) -> tokens -> done
+```
+**Pass =** you see `: connected` → `tool_call` → `tool_result` → `token` events →
+`done`, and **no Python traceback** in the server log.
+
+The `tool_result` may be a real customer list *or* an ERP error
+(`404 /api/resource/Customer`, `403`, connection refused) — **that is fine.**
+It only means no ERP is wired; the pipeline itself ran end to end, which is what
+P1/P2 needs to verify. Do the same curl before and after your change and compare
+the event shape.
+
+`.env` — leave it as-is, don't commit changes to it.
+
+### For P3 (identity / RBAC) — you also need a real local Frappe
+
+P3 tests that different users get different permissions, so it needs real Frappe
+users and data.
+
+```bash
+cd frappe-bench-v16
+
+# make magnaerp.local the default site (else bare-IP calls from erp_client 404)
+bench use magnaerp.local
+bench --site magnaerp.local list-apps          # expect frappe, erpnext, custom_ui
+
+bench start                                     # http://127.0.0.1:8000
 ```
 
-If `tool_result` shows `404 ... /api/resource/Customer` → you skipped
-`bench use magnaerp.local`. If `403` → the `.env` API key/secret is wrong or
-the user has no permission on `Customer`.
+Then generate **local** API keys (the prod keys in `.env` won't work locally):
+Frappe desk → log in as Administrator → avatar → **My Settings → API Access →
+Generate Keys** → put them in `MagmaAssistance/.env` (`ERP_URL=http://127.0.0.1:8000`,
+`ERP_API_KEY`, `ERP_API_SECRET`). Keep a copy of the prod values somewhere safe first.
+
+After this the smoke `tool_result` should return an actual list. `404` = you
+skipped `bench use`; `403` = wrong key/secret or the user lacks `Customer` permission.
+
+### Frontend local dev (P3 only)
+
+In `custom_ui/.../ChatArea.jsx` set `API_BASE_URL = 'http://localhost:8050'`, work
+on the `dev/local` branch, and **never** commit that line toward `main`.
 
 ---
 
