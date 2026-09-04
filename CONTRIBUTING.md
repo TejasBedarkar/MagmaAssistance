@@ -112,23 +112,88 @@ fixes
 
 ---
 
-## 6. Running locally
+## 6. Local setup
+
+> Historically the team ran only MagmaAssistance locally and pointed `.env`
+> `ERP_URL` at a **shared hosted Frappe**. For the cleanup we run **fully local**
+> so nobody's test writes leak into a shared ERP and deleting code can't break
+> a shared box. Pick one mode below.
+
+### Mode A — fully local (recommended for the cleanup)
+
+**One-time Frappe setup** (skip the steps you've already done):
+
+```bash
+cd frappe-bench-v16
+
+# 1. Make magnaerp.local the DEFAULT site — otherwise bare-IP calls from
+#    erp_client (http://127.0.0.1:8000/...) have no site to route to and 404.
+bench use magnaerp.local
+
+# 2. Confirm frappe + erpnext + custom_ui are installed on the site
+bench --site magnaerp.local list-apps        # expect all three
+
+# 3. If erpnext / custom_ui are NOT listed:
+bench --site magnaerp.local install-app erpnext
+bench --site magnaerp.local install-app custom_ui
+bench --site magnaerp.local migrate
+```
+
+**One-time API keys** (the prod keys in `.env` do NOT work against local):
+
+1. `bench start`, open `http://magnaerp.local:8000`, log in as Administrator
+2. Avatar → **My Settings → API Access → Generate Keys**
+3. Put them in `MagmaAssistance/.env` (local only, never commit):
+   ```
+   ERP_URL=http://127.0.0.1:8000
+   ERP_API_KEY=<local key>
+   ERP_API_SECRET=<local secret>
+   ```
+   Keep a copy of the real prod `.env` values somewhere safe first.
+
+**Run it** (two terminals):
 
 ```bash
 # Terminal 1 — Frappe
-cd frappe-bench-v16 && bench start          # http://127.0.0.1:8000
+cd frappe-bench-v16 && bench start            # http://127.0.0.1:8000
 
 # Terminal 2 — MagmaAssistance
-cd MagmaAssistance
-source venv/bin/activate
-python server.py                            # http://127.0.0.1:8050
+cd MagmaAssistance && source venv/bin/activate && python server.py   # :8050
 ```
 
-- `.env` is already wired to `127.0.0.1:8000` for ERP. Don't commit changes to it.
-- Postgres audit will fail gracefully if no Postgres is running — that's fine for
-  local dev (and Postgres is being removed in P2 anyway).
-- Frontend: in `custom_ui/.../ChatArea.jsx` set `API_BASE_URL = 'http://localhost:8050'`
-  **locally only** — never commit that change to a branch that could reach `main`.
+### Mode B — point at a shared dev Frappe
+
+Only MagmaAssistance runs on your machine. In `.env` set `ERP_URL` +
+`ERP_API_KEY` / `ERP_API_SECRET` to the shared dev/staging Frappe. Lighter
+setup, but you share ERP state with everyone else — don't use it for
+destructive testing.
+
+### Notes (both modes)
+
+- **Never commit `.env`.** It's per-developer.
+- Postgres audit fails gracefully if no Postgres runs — fine locally, and
+  Postgres is being removed in P2 anyway. (If you *do* have local Postgres,
+  the schema auto-applies on startup.)
+- **Frontend local dev:** in `custom_ui/.../ChatArea.jsx` set
+  `API_BASE_URL = 'http://localhost:8050'` and work on the `dev/local` branch —
+  **never** commit that line to a branch that can reach `main`.
+- Startup is healthy when you see: `AsyncSqliteSaver persistent memory ready.`
+  and `Uvicorn running on http://0.0.0.0:8050`.
+
+### Smoke check
+
+```bash
+curl -s http://localhost:8050/api/health          # {"status":"ok"}
+
+curl -sN -X POST http://localhost:8050/api/chat/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"show me all customers","session_id":"smoke"}'
+# expect: connected -> tool_call(erp_data_tool) -> tool_result(a list) -> tokens -> done
+```
+
+If `tool_result` shows `404 ... /api/resource/Customer` → you skipped
+`bench use magnaerp.local`. If `403` → the `.env` API key/secret is wrong or
+the user has no permission on `Customer`.
 
 ---
 
