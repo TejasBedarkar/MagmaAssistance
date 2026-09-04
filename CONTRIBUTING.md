@@ -8,16 +8,21 @@ frontend repo (`erp_theme`) with its own branch names — see the table.
 
 ## 1. Branch map — know before you push
 
-| Repo | Branch | What it is | Can I push to it? |
+| Repo (remote) | Branch | What it is | Can I push to it? |
 |---|---|---|---|
-| **MagmaAssistance** | `beta` | **PRODUCTION.** Auto-deploys to EC2 on every push (`.github/workflows/deploy.yml`). | **NO. Never. Not even a typo fix.** |
+| **MagmaAssistance** (`origin`) | `beta` | **PRODUCTION.** `.github/workflows/deploy.yml` auto-deploys to EC2 **on any push to `beta`**. | **NO. Never. Not even a typo fix.** |
 | MagmaAssistance | `cleanup/consolidation` | Integration branch for all cleanup work (P1–P5). | Only via **merged PR**. |
 | MagmaAssistance | `feat/*`, `fix/*`, `chore/*` | Your working branches, cut **from `cleanup/consolidation`**. | Yes — this is where you work. |
-| **erp_theme** (frontend) | `main` | **PRODUCTION** frontend. | **NO.** |
-| erp_theme | `feature/*` | Working branches, cut from `main`. | Yes. |
+| **erp_theme** (`upstream`) | `main` | **PRODUCTION** frontend. | **NO.** |
+| erp_theme | `dev/local` | Holds only the local `API_BASE_URL → localhost:8050` tweak for running the frontend on your machine. **Never merged.** | Yes, but keep it to that one change. |
+| erp_theme | `feature/*` | P3 working branches, cut **from `main`**. | Yes (P3 only — frontend is idle during P1/P2). |
 
-> During the cleanup, **nobody pushes to `beta` or `main`.** If a real prod
-> hotfix is needed, it goes through the lead (Shoaib) — not directly.
+> During the cleanup, **nobody pushes to `beta` or `main`.** Because deploy only
+> fires on a push to `beta`, freezing `beta` is all the protection needed — the
+> workflow file stays in place. A real prod hotfix goes through the lead (Shoaib).
+>
+> Frontend remote is **`upstream`**, not `origin` — adjust the `git push` commands
+> below accordingly for `erp_theme`.
 
 ---
 
@@ -103,11 +108,11 @@ fixes
 
 ## 5. Before you push — checklist
 
-- [ ] Local stack runs: `bench start` (Frappe :8000) + `venv/bin/python server.py` (:8050)
-- [ ] Smoke-test script passes (every live endpoint + each tool + a turn is recorded)
-- [ ] Sent one real chat message ("show me all customers") and got a sane reply
+- [ ] `python server.py` boots cleanly (P1/P2 — no Frappe needed; see §6)
+- [ ] Smoke check (§6) passes: `tool_call` → `tool_result` → `done`, no traceback.
+      Compare the event shape before vs after your change. (`smoke.sh` once it exists.)
 - [ ] `git status` clean except your intended changes
-- [ ] No secrets, no `.env`, no `*.sqlite`, no `venv/` in the diff
+- [ ] No secrets, no `.env`, no `*.sqlite`, no `venv/`, no `ERP/models/` in the diff
 - [ ] Commit messages follow §3
 
 ---
@@ -178,17 +183,23 @@ skipped `bench use`; `403` = wrong key/secret or the user lacks `Customer` permi
 
 ### Frontend local dev (P3 only)
 
-In `custom_ui/.../ChatArea.jsx` set `API_BASE_URL = 'http://localhost:8050'`, work
-on the `dev/local` branch, and **never** commit that line toward `main`.
+- Do P3 work on a `feature/…` branch cut from `main` (e.g. `feature/identity-wiring`).
+- To point the frontend at your local backend, change `API_BASE_URL` to
+  `http://localhost:8050` in `custom_ui/.../ChatArea.jsx` and `bench build --app custom_ui`.
+  Keep that change **uncommitted** (or on `dev/local` only) — it must never land in
+  a `feature/*` branch or `main`.
+- If the prod EC2 is back up, `ai.tjdem.online` works and you may not need the
+  local backend at all for frontend-only changes.
 
 ---
 
 ## 7. What NOT to do
 
-- ❌ Push to `beta` or `main`
-- ❌ Force-push a shared branch (`cleanup/consolidation`, `beta`, `main`)
+- ❌ Push to `beta` or `main` (any push to `beta` ships straight to prod)
+- ❌ Force-push a shared branch (`cleanup/consolidation`, `beta`, `main`, `dev/local`)
 - ❌ Commit `.env`, API keys, `*.sqlite`, `venv/`, `ERP/models/`
-- ❌ Re-enable `deploy.yml` without the lead's OK
+- ❌ Touch `.github/workflows/deploy.yml`
+- ❌ Merge `dev/local` anywhere, or commit the local `API_BASE_URL` change to any other branch
 - ❌ Delete anything in the "KEEP" or "DEAD but load-bearing" lists in
   `ARCHITECTURE.md` without reading the note there first
 - ❌ Mix unrelated changes in one PR

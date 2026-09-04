@@ -3,6 +3,11 @@
 > Status: **inherited system, under review.** This file is the source of truth for
 > what is live, what is dead, and what we are changing. Update it as work lands.
 > Written from a read-only code investigation (2026-09-04).
+>
+> **Current state (2026-09-04):** git branches + baseline tags in place (see §5).
+> The prod EC2 instance was accidentally deleted and is being rebuilt — code is
+> safe on GitHub. Cleanup work runs **fully local**; P1/P2 need only
+> `python server.py` (no Frappe) — see `CONTRIBUTING.md §6`.
 
 ---
 
@@ -21,9 +26,9 @@ Browser (React app, loaded from Frappe)
   │  fetch POST https://ai.tjdem.online/api/chat/stream   (SSE)   — NO auth header
   │  or  WebSocket  wss://ai.tjdem.online/ws/voice
   ▼
-MagmaAssistance  (EC2, systemd magmaassistance.service, port 8050)
+MagmaAssistance  (EC2, systemd magmaassistance.service, port 8050; LLM_MODEL=gpt-4o)
   server.py : stream_agent_turn()          ← hand-rolled ReAct loop, ≤4 tool rounds
-  server.py : _execute_tool()              ← single tool dispatch + Postgres audit
+  server.py : _execute_tool()              ← single tool dispatch + audit (SQLite in P2, Postgres today)
   ▼
 ERP_Unified/tools.py : erp_data_tool()     ← one generic tool for ANY doctype
   ▼
@@ -104,6 +109,11 @@ reuse its checkpointer (`aget_state`, `aupdate_state(..., as_node="intake")`).
 ### DORMANT — leave alone for now
 - `ERP/tool_rag.py` + `ERP/models/all-MiniLM-L6-v2` — bypassed while tool count ≤ 100. Revisit if tools > 30.
 
+### Nice-to-have (backlog, not in P1–P5)
+- `ERP/erp_client.py` sends no `Host` header, so local dev against a multi-site
+  bench needs a default site (`bench use magnaerp.local`). Optionally derive a
+  `Host` from `ERP_URL` so it works without one.
+
 ### Storage — what's actually used (do not confuse)
 | Store | Purpose | Status |
 |---|---|---|
@@ -129,32 +139,36 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 **Open decisions (product owner):**
 1. Tenancy: separate Frappe site per customer, or one site with company segregation?
 2. Realtime/WebRTC voice — product goal, or is browser Web Speech (free, current) enough?
+   *(Current lean: Web Speech is enough; WebRTC path is removed in P2, can return later.)*
+3. Multi-agent workflow — settled: single streaming agent + code-enforced write gate. Manufacturing planner = backlog.
 
 ---
 
 ## 5. Baselines & task plan
 
-### Production baseline
-| Repo | Prod branch | Baseline commit (GitHub HEAD, 2026-09-04) | Tag |
-|---|---|---|---|
-| MagmaAssistance | `beta` (auto-deploy via `.github/workflows/deploy.yml` → EC2) | `b4ec738f182c409ed97e719f3811f124cbcf6461` (Aug 26 — unchanged since) | `pre-cleanup-2026-09` (pending) |
-| custom_ui / erp_theme | `main` (deployed to the Frappe server) | `76e0268e938d373f3214dc95127d9cc0ed2f5b19` (Aug 31) | `pre-cleanup-2026-09` (pending) |
+### Repos, branches, tags
 
-> Note: the MagmaAssistance EC2 instance was accidentally deleted (~2026-09) and is being rebuilt.
-> The **code** baseline is safe (matches GitHub `beta` HEAD above). On rebuild, verify:
-> `.env` restored (all API keys), whether Postgres `magma_audit` was on the instance (`PGHOST=localhost` → audit history lost),
-> `stream_history.sqlite` was on the instance → conversation history lost. S3 file storage is separate and safe.
+| Repo (remote) | PROD — frozen, no pushes | Cleanup branch | Local-dev branch | Baseline tag |
+|---|---|---|---|---|
+| **MagmaAssistance** (`origin`) | `beta` @ `b4ec738` | `cleanup/consolidation` ✅ pushed | — | `pre-cleanup-2026-09` ✅ pushed → `b4ec738` |
+| **custom_ui / erp_theme** (`upstream`) | `main` @ `76e0268` | *(P3 cuts `feature/identity-wiring` from `main`)* | `dev/local` ✅ pushed | `pre-cleanup-2026-09` ✅ pushed → `76e0268` |
+
+- `frappe` / `erpnext` — stock, unmodified, own release tags. **Not tagged, not touched.**
+- **Nobody pushes to `beta` or `main` during the cleanup.** `deploy.yml` fires only on push to `beta`, so freezing `beta` is enough — the workflow file is left in place.
+- Prod EC2 instance was accidentally deleted (~2026-09), being rebuilt. Code is safe on GitHub. On rebuild: restore `.env` (all keys); `magma_audit` Postgres + `stream_history.sqlite` were on the box and are gone — acceptable (Postgres is being dropped; chat history is ephemeral). S3 files are safe.
 
 ### Tasks
 
-**P0 — Safety net (no code changes)**
-- [ ] Get prod HEAD + `git status` from EC2 and the Frappe server → fill the table above
-- [ ] Full clone of `erp_theme` (current bench clone is shallow, 1 commit)
-- [ ] Disable `deploy.yml` (or move all cleanup to a branch + staging) so nothing auto-ships mid-cleanup
-- [ ] Backups: copy `stream_history.sqlite`, `bench backup --with-files`, secure copy of `.env` (Postgres `magma_audit` likely already lost with the EC2 instance — see §5 note)
-- [ ] Smoke-test script: hits every live endpoint + each tool once, checks a turn is recorded
-- [ ] Tag both baselines (can be done now — SHAs known; does not need the server)
-- [ ] Run the full stack locally: `bench start` (Frappe :8000) + `venv/bin/python server.py` (:8050); set `ChatArea.jsx` `API_BASE_URL` to `http://localhost:8050` for dev
+**P0 — Safety net (no production changes)**
+- [x] Baseline SHAs captured from GitHub (`b4ec738` / `76e0268`) — EC2 was down, GitHub HEAD is authoritative since deploy = `git pull origin beta`
+- [x] `erp_theme` bench clone unshallowed (`git fetch upstream --unshallow`, 150 commits)
+- [x] Branches: `cleanup/consolidation` (backend), `dev/local` (frontend) — pushed
+- [x] Tags: `pre-cleanup-2026-09` on both repos — pushed
+- [x] `ARCHITECTURE.md` + `CONTRIBUTING.md` committed to `cleanup/consolidation`
+- [x] Manual smoke: `python server.py` boots, `/api/chat/stream` produces `tool_call`→`tool_result`→`done`, no traceback (ERP call 404 — expected, Frappe not wired locally)
+- [ ] Backups: `bench --site magnaerp.local backup --with-files`, secure copy of prod `.env`
+- [ ] **Dev A:** turn the §6 smoke curl into a repeatable `smoke.sh` on `cleanup/consolidation`
+- [ ] Tell the team: freeze `beta`/`main`, read `ARCHITECTURE.md` + `CONTRIBUTING.md`
 
 **P1 — Agent consolidation** *(Dev A, senior, ~1 wk, after P0)*
 - [ ] Replace `load/save_stream_history` graph-checkpointer calls with a bare `AsyncSqliteSaver`
@@ -171,11 +185,12 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 - [ ] Clean `.env` / `.env.example` / `requirements.txt`
 - [ ] Re-run smoke tests
 
-**P3 — Identity wiring** *(Dev C, senior, ~1–1.5 wk, parallel with P1)*
+**P3 — Identity wiring** *(Dev C, senior, ~1–1.5 wk, parallel with P1)* — **needs a real local Frappe** (`CONTRIBUTING.md §6`)
 - [ ] Frontend sends the Frappe user identity on every request (session cookie / header / token)
 - [ ] Backend resolves it on `/api/chat/stream` and `/ws/voice`; wrap `use_identity()` around the turn
 - [ ] Lock CORS to the frontend origin
 - [ ] Test: different Frappe users → permissions actually enforced
+- [ ] Frontend branch `feature/identity-wiring` cut from `main` (not `dev/local` — that only holds the local `API_BASE_URL` tweak)
 
 **P4 — Tenancy + capability gating** *(senior, ~2–3 wk, after P3 + decision #1)*
 - [ ] Per-tenant ERP routing
@@ -187,7 +202,7 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 - [ ] Carve 2,100-line `server.py` into `agent.py` / `routes_*.py` / `llm_client.py` — pure refactor
 
 ### Rough timeline
-Week 1: P0 · Weeks 2–3: P1 + P3 (parallel), P2 follows P1 · Weeks 4–7: P4
+P0 mostly done (backups + `smoke.sh` + team brief remain) · Weeks 1–2: P1 + P3 (parallel), P2 follows P1's first commit · Weeks 3–6: P4 · P5 low priority after P1+P2
 
 ---
 
@@ -199,4 +214,4 @@ Week 1: P0 · Weeks 2–3: P1 + P3 (parallel), P2 follows P1 · Weeks 4–7: P4
 4. `LLM/LLM.py` → `GENERAL_ERP_PROMPT`
 5. `custom_ui/.../AssistantPortal.jsx` → `streamAssistantTurn` + the `/ws/voice` block
 6. `custom_ui/api/metadata.py` + `auth.py` — the RBAC building block
-7. `db/schema.sql` + `db/postgres_audit_log.py`
+7. `db/postgres_audit_log.py` + `audit_log.py` (root) — the audit story (being merged into one SQLite module in P2)
