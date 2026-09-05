@@ -167,10 +167,10 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 - [x] `ARCHITECTURE.md` + `CONTRIBUTING.md` committed to `cleanup/consolidation`
 - [x] Manual smoke: `python server.py` boots, `/api/chat/stream` produces `tool_call`→`tool_result`→`done`, no traceback (ERP call 404 — expected, Frappe not wired locally)
 - [ ] Backups: `bench --site magnaerp.local backup --with-files`, secure copy of prod `.env`
-- [ ] **Dev A:** turn the §6 smoke curl into a repeatable `smoke.py` on `cleanup/consolidation`
+- [ ] Turn the §6 smoke curl into a repeatable `smoke.py` on `cleanup/consolidation` — in progress
 - [ ] Tell the team: freeze `beta`/`main`, read `ARCHITECTURE.md` + `CONTRIBUTING.md`
 
-**P1 — Agent consolidation** *(Dev A, senior, ~1 wk, after P0)*
+**P1 — Agent consolidation** *(~1 wk, after P0)*
 - [ ] Replace `load/save_stream_history` graph-checkpointer calls with a bare `AsyncSqliteSaver`
 - [ ] Verify multi-turn memory still persists (streaming + voice)
 - [ ] Add code-enforced write-approval gate in `_execute_tool` (create/update/submit/send_email → stash + return proposal; next turn "yes" → execute stashed payload deterministically)
@@ -178,27 +178,27 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 - [ ] Re-point or retire `MagnaCLI.py`
 - [ ] Re-run smoke tests
 
-**P2 — Dead code removal** *(Dev B, ~4 days, after P1's first commit)*
+**P2 — Dead code removal** *(~4 days, after P1's first commit)*
 - [ ] Verify `ocr_po_tool.py` is kept (`/api/upload-po`)
 - [ ] Delete MCP files, remaining unregistered `ERP/tools/*`, WebRTC voice path, LiveKit, `_build_fallback_chart`, `_is_unqualified_approval`
 - [ ] **Audit → SQLite:** rewrite `db/postgres_audit_log.py` on `sqlite3` (reuse `audit_log.py` root as the base; keep the same public function names so `server.py` call sites don't change). Add the newer functions it needs: `time_tool_call`, `record_file_upload`, `tool_stats`. Delete `db/schema.sql`, `db/init_db.py`, `psycopg2-binary`, all `PG*` env vars, `long_term_memory` + `token_details`. Delete the orphan root `audit_log.py` once harvested.
 - [ ] Clean `.env` / `.env.example` / `requirements.txt`
 - [ ] Re-run smoke tests
 
-**P3 — Identity wiring** *(Dev C, senior, ~1–1.5 wk, parallel with P1)* — **needs a real local Frappe** (`CONTRIBUTING.md §6`)
+**P3 — Identity wiring** *(~1–1.5 wk, parallel with P1)* — **needs a real local Frappe** (`CONTRIBUTING.md §6`)
 - [ ] Frontend sends the Frappe user identity on every request (session cookie / header / token)
 - [ ] Backend resolves it on `/api/chat/stream` and `/ws/voice`; wrap `use_identity()` around the turn
 - [ ] Lock CORS to the frontend origin
 - [ ] Test: different Frappe users → permissions actually enforced
 - [ ] Frontend branch `feature/identity-wiring` cut from `main` (not `dev/local` — that only holds the local `API_BASE_URL` tweak)
 
-**P4 — Tenancy + capability gating** *(senior, ~2–3 wk, after P3 + decision #1)*
+**P4 — Tenancy + capability gating** *(~2–3 wk, after P3 + decision #1)*
 - [ ] Per-tenant ERP routing
 - [ ] Filter tools + doctypes by the customer's purchased modules (`get_user_allowed_modules`)
 - [ ] Pre-execution permission check in `_execute_tool`
 - [ ] Trim the system prompt per tenant
 
-**P5 — Split `server.py`** *(Dev B, ~3 days, low priority, after P1+P2)*
+**P5 — Split `server.py`** *(~3 days, low priority, after P1+P2)*
 - [ ] Carve 2,100-line `server.py` into `agent.py` / `routes_*.py` / `llm_client.py` — pure refactor
 
 ### Rough timeline
