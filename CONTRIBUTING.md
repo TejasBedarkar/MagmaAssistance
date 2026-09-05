@@ -110,7 +110,7 @@ fixes
 
 - [ ] `python server.py` boots cleanly (P1/P2 — no Frappe needed; see §6)
 - [ ] Smoke check (§6) passes: `tool_call` → `tool_result` → `done`, no traceback.
-      Compare the event shape before vs after your change. (`smoke.sh` once it exists.)
+      Compare the event shape before vs after your change. (`smoke.py` once it exists.)
 - [ ] `git status` clean except your intended changes
 - [ ] No secrets, no `.env`, no `*.sqlite`, no `venv/`, no `ERP/models/` in the diff
 - [ ] Commit messages follow §3

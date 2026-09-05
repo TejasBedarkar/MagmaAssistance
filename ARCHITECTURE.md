@@ -167,7 +167,7 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 - [x] `ARCHITECTURE.md` + `CONTRIBUTING.md` committed to `cleanup/consolidation`
 - [x] Manual smoke: `python server.py` boots, `/api/chat/stream` produces `tool_call`→`tool_result`→`done`, no traceback (ERP call 404 — expected, Frappe not wired locally)
 - [ ] Backups: `bench --site magnaerp.local backup --with-files`, secure copy of prod `.env`
-- [ ] **Dev A:** turn the §6 smoke curl into a repeatable `smoke.sh` on `cleanup/consolidation`
+- [ ] **Dev A:** turn the §6 smoke curl into a repeatable `smoke.py` on `cleanup/consolidation`
 - [ ] Tell the team: freeze `beta`/`main`, read `ARCHITECTURE.md` + `CONTRIBUTING.md`
 
 **P1 — Agent consolidation** *(Dev A, senior, ~1 wk, after P0)*
@@ -202,7 +202,7 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 - [ ] Carve 2,100-line `server.py` into `agent.py` / `routes_*.py` / `llm_client.py` — pure refactor
 
 ### Rough timeline
-P0 mostly done (backups + `smoke.sh` + team brief remain) · Weeks 1–2: P1 + P3 (parallel), P2 follows P1's first commit · Weeks 3–6: P4 · P5 low priority after P1+P2
+P0 mostly done (backups + `smoke.py` + team brief remain) · Weeks 1–2: P1 + P3 (parallel), P2 follows P1's first commit · Weeks 3–6: P4 · P5 low priority after P1+P2
 
 ---
 
