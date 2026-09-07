@@ -88,12 +88,42 @@ def _clean_schema_for_openai(schema: dict) -> dict:
     return cleaned
 
 
+def _normalize_tool_choice(tool_choice: Any) -> Any:
+    """Translates LangChain's generic tool_choice values into what the
+    OpenAI-compatible /chat/completions API actually accepts.
+    with_structured_output() calls bind_tools(tool_choice="any", ...) to
+    mean "you must call some tool"; OpenAI's wire format for that is the
+    string "required", not "any". A tool_choice naming one specific tool
+    (e.g. "auto"/"none", or a bare tool name) is passed through as-is,
+    except a bare name is wrapped in the {"type": "function", ...} shape
+    OpenAI expects."""
+    if tool_choice in ("auto", "none", "required"):
+        return tool_choice
+    if tool_choice in ("any", True):
+        return "required"
+    if isinstance(tool_choice, str):
+        return {"type": "function", "function": {"name": tool_choice}}
+    return tool_choice  # already a dict in OpenAI's shape, or None
+
+
 class OpenAIChatModel(BaseChatModel):
     model_name: str
     temperature: float
     api_key: str
     base_url: str
     bound_tools: Optional[List[Any]] = None
+    # Set by bind_tools() when called with tool_choice=... (e.g. by
+    # with_structured_output(), which calls bind_tools([schema],
+    # tool_choice="any", ...) to force the model to actually call the
+    # schema "tool" instead of replying with plain text). Previously
+    # bind_tools() silently swallowed this via **kwargs and never sent
+    # tool_choice to the API at all -- so a model could just chat back
+    # instead of calling the tool, with_structured_output's parser would
+    # get zero tool_calls, PydanticToolsParser returns None, and the
+    # caller's next attribute access (e.g. intent.category) blew up with
+    # AttributeError. Since that ran unconditionally on every turn in
+    # supervisor_node, it took down /api/chat for every message.
+    bound_tool_choice: Optional[Any] = None
 
     def _generate(
         self,
@@ -135,6 +165,8 @@ class OpenAIChatModel(BaseChatModel):
         
         if self.bound_tools:
             data["tools"] = self.bound_tools
+        if self.bound_tool_choice is not None:
+            data["tool_choice"] = _normalize_tool_choice(self.bound_tool_choice)
 
         # If the model hits LLM_MAX_TOKENS mid-reply (finish_reason ==
         # "length"), ask it to continue from where it left off instead
@@ -229,6 +261,7 @@ class OpenAIChatModel(BaseChatModel):
             api_key=self.api_key,
             base_url=self.base_url,
             bound_tools=formatted_tools,
+            bound_tool_choice=kwargs.get("tool_choice"),
         )
 
 # Add model property to LLM class before importing Main/VoiceAssistant
@@ -422,18 +455,14 @@ async def lifespan(app: FastAPI):
             "PGPASSWORD/PGDATABASE in .env. Audit logging will fail until this is fixed."
         )
 
-    # Initialize AsyncSqliteSaver for persistent LangGraph memory
     import aiosqlite
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-    
-    global agent_graph, _checkpoint_conn
-    # isolation_level=None = autocommit mode so every write is immediately visible
-    # to subsequent reads on the same connection (fixes WAL not-visible-to-self bug)
+
+    global saver, _checkpoint_conn
     _checkpoint_conn = await aiosqlite.connect("stream_history.sqlite", isolation_level=None)
     try:
         saver = AsyncSqliteSaver(_checkpoint_conn)
         await saver.setup()
-        agent_graph = build_agent_graph(checkpointer=saver)
         logger.info("AsyncSqliteSaver persistent memory ready.")
         yield
     finally:
@@ -1462,8 +1491,8 @@ def summarize_node(state: ChatState) -> dict:
 from pydantic import BaseModel
 class IntentOutput(BaseModel):
     category: Literal["chitchat", "erp_query", "erp_write", "web_search"]
-    record_type: Optional[str]
-    entities: Dict[str, str]
+    record_type: Optional[str] = None
+    entities: Dict[str, str] = {}
 
 def supervisor_node(state: ChatState) -> dict:
     last_user_msg = _last_human_message(state["messages"]) or ""
@@ -1912,35 +1941,48 @@ async def chat(req: ChatRequest):
 
     return {"reply": reply, "audio": audio_b64}
 
+import copy
+from datetime import datetime, timezone
+from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.checkpoint.base.id import uuid6
+
 async def load_stream_history(session_id: str) -> list:
-    global agent_graph
+    global saver
     config = {"configurable": {"thread_id": session_id}}
-    state = await agent_graph.aget_state(config)
-    if state and state.values and "messages" in state.values:
-        return list(state.values["messages"])
+    tup = await saver.aget_tuple(config)
+    if tup and tup.checkpoint:
+        return list(tup.checkpoint["channel_values"].get("messages", []))
     return []
 
 async def save_stream_history(session_id: str, new_messages: list):
-    """Append ONLY new_messages to the checkpointer for this session.
-    
-    CRITICAL: The ChatState.messages field uses the add_messages reducer,
-    which APPENDS to existing messages. Passing the full history list here
-    would cause exponential duplication (2x on turn 2, 3x on turn 3...).
-    Always pass only the delta (new messages from this turn).
-    """
     if not new_messages:
         return
-    global agent_graph, _checkpoint_conn
+    global saver, _checkpoint_conn
     config = {"configurable": {"thread_id": session_id}}
-    await agent_graph.aupdate_state(config, {"messages": new_messages}, as_node="intake")
-    # Force commit so the next aget_state call on the same connection sees the new data.
-    # aiosqlite with isolation_level=None is autocommit, but LangGraph may wrap writes
-    # in transactions internally. This ensures they're flushed.
+
+    prev = await saver.aget_tuple(config)
+    if prev and prev.checkpoint:
+        checkpoint = copy.deepcopy(prev.checkpoint)
+        existing = list(checkpoint["channel_values"].get("messages", []))
+        checkpoint["channel_values"]["messages"] = existing + new_messages
+        version = checkpoint["channel_versions"].get("messages", 0) + 1
+    else:
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"]["messages"] = list(new_messages)
+        version = 1
+
+    checkpoint["id"] = str(uuid6(clock_seq=-2))
+    checkpoint["ts"] = datetime.now(timezone.utc).isoformat()
+    checkpoint["channel_versions"]["messages"] = version
+
+    metadata = {"source": "update", "step": -1, "writes": {}, "parents": {}}
+    await saver.aput(config, checkpoint, metadata, {"messages": version})
+
     if _checkpoint_conn:
         try:
             await _checkpoint_conn.commit()
         except Exception:
-            pass  # Already committed in autocommit mode, safe to ignore
+            pass
 
 
 @app.post("/api/chat/stream")
