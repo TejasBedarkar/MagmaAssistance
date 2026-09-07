@@ -63,3 +63,5 @@ boto3
 openai-agents[voice]
 livekit
 livekit-api
+
+websocket-client

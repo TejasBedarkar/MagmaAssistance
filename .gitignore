@@ -60,7 +60,7 @@ checkpoints.sqlite*
 # Temporary and scratch files
 scratch/
 *.jsx
-test_*.py
+# test_*.py
 last_history.json
 *.bundle.js
 
