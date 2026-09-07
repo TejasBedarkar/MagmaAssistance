@@ -21,7 +21,10 @@ import logging
 import os
 from typing import Any, Callable, Dict, Optional
 
-from livekit import api
+try:
+    from livekit import api
+except ImportError:
+    api = None
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from langchain_core.utils.function_calling import convert_to_openai_tool

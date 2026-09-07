@@ -238,6 +238,8 @@ GENERAL_ERP_PROMPT = (
     "- NEVER output pills while asking a clarifying question.\n"
 )
 
+DEFAULT_SYSTEM_PROMPT = GENERAL_ERP_PROMPT
+
 
 class LLM:
 

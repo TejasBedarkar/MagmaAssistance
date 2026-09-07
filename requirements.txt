@@ -16,7 +16,7 @@ fastmcp
 langchain-mcp-adapters
 
 # Agent pipeline (from Main.py)
-# NOTE: LLM/LLM.py talks to OpenRouter directly via `requests`, not
+# NOTE: LLM/LLM.py talks directly to OpenAI via `requests`, not
 # ChatOllama, so langchain-ollama is not actually imported anywhere --
 # only langchain-core (used for prompts/messages/output parsers) is needed.
 langchain
@@ -58,6 +58,12 @@ playsound==1.2.2
 ddgs
 beautifulsoup4
 lxml
+
+# Company website resolver + contact extractor (web/company_crawler/)
+rapidfuzz
+tldextract
+phonenumbers
+
 psycopg2-binary
 boto3
 openai-agents[voice]
