@@ -17,11 +17,20 @@ from smoke import fixtures
 
 def _upload(client: Client, filename: str) -> TestResult:
     content = fixtures.read(filename)
-    resp = client.post_multipart(
-        "/api/upload-document",
-        fields={"session_id": "smoke-filereading", "user_id": "smoke"},
-        files={"file": (filename, content)},
-    )
+    try:
+        resp = client.post_multipart(
+            "/api/upload-document",
+            fields={"session_id": "smoke-filereading", "user_id": "smoke"},
+            files={"file": (filename, content)},
+        )
+    except ClientError as exc:
+        # No S3 configured locally -- skip, don't fail.
+        if "S3_BUCKET_NAME" in str(exc):
+            return TestResult(
+                f"file_reading.{filename}", False, skipped=True,
+                detail="skipped -- S3 not configured (S3_BUCKET_NAME unset)",
+            )
+        raise
     body = json.loads(resp.read())
     ok = resp.status == 200 and bool(body.get("text") or body)
     return TestResult(f"file_reading.{filename}", ok, str(body)[:300])
