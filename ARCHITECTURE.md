@@ -178,12 +178,13 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 - [ ] Re-point or retire `MagnaCLI.py`
 - [ ] Re-run smoke tests
 
-**P2 — Dead code removal** *(~4 days, after P1's first commit)*
-- [ ] Verify `ocr_po_tool.py` is kept (`/api/upload-po`)
-- [ ] Delete MCP files, remaining unregistered `ERP/tools/*`, WebRTC voice path, LiveKit, `_build_fallback_chart`, `_is_unqualified_approval`
-- [ ] **Audit → SQLite:** rewrite `db/postgres_audit_log.py` on `sqlite3` (reuse `audit_log.py` root as the base; keep the same public function names so `server.py` call sites don't change). Add the newer functions it needs: `time_tool_call`, `record_file_upload`, `tool_stats`. Delete `db/schema.sql`, `db/init_db.py`, `psycopg2-binary`, all `PG*` env vars, `long_term_memory` + `token_details`. Delete the orphan root `audit_log.py` once harvested.
-- [ ] Clean `.env` / `.env.example` / `requirements.txt`
-- [ ] Re-run smoke tests
+**P2 — Dead code removal** *(completed on chore/p2-mcp-and-unregistered-tools)*
+- [x] Verify `ocr_po_tool.py` is kept (`/api/upload-po`)
+- [x] Delete MCP files, remaining unregistered `ERP/tools/*`, WebRTC voice path, LiveKit, `_build_fallback_chart`, `_is_unqualified_approval`
+- [x] **Audit → SQLite:** rewrite `db/postgres_audit_log.py` on `sqlite3` (reuse `audit_log.py` root as the base; keep the same public function names so `server.py` call sites don't change). Add the newer functions it needs: `time_tool_call`, `record_file_upload`, `tool_stats`. Delete `db/schema.sql`, `db/init_db.py`, `psycopg2-binary`, all `PG*` env vars, `long_term_memory` + `token_details`. Delete the orphan root `audit_log.py` once harvested.
+- [x] Clean `.env` / `.env.example` / `requirements.txt`
+- [x] Re-run smoke tests
+
 
 **P3 — Identity wiring** *(~1–1.5 wk, parallel with P1)* — **needs a real local Frappe** (`CONTRIBUTING.md §6`)
 - [ ] Frontend sends the Frappe user identity on every request (session cookie / header / token)
