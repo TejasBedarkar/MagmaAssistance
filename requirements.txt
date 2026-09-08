@@ -11,9 +11,6 @@ tavily-python>=0.7.0
 # LLM/LLM.py imports fitz for PDF OCR/rendering.
 PyMuPDF
 
-# MCP: server side (ERP/mcp_server.py) + client side (ERP/tools/mcp_tools.py)
-fastmcp
-langchain-mcp-adapters
 
 # Agent pipeline (from Main.py)
 # NOTE: LLM/LLM.py talks to OpenRouter directly via `requests`, not
@@ -60,6 +57,3 @@ beautifulsoup4
 lxml
 psycopg2-binary
 boto3
-openai-agents[voice]
-livekit
-livekit-api
