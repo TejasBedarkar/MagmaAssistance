@@ -1915,7 +1915,7 @@ from langgraph.checkpoint.base.id import uuid6
 
 async def load_stream_history(session_id: str) -> list:
     global saver
-    config = {"configurable": {"thread_id": session_id}}
+    config = {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
     tup = await saver.aget_tuple(config)
     if tup and tup.checkpoint:
         return list(tup.checkpoint["channel_values"].get("messages", []))
@@ -1925,7 +1925,7 @@ async def save_stream_history(session_id: str, new_messages: list):
     if not new_messages:
         return
     global saver, _checkpoint_conn
-    config = {"configurable": {"thread_id": session_id}}
+    config = {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
 
     prev = await saver.aget_tuple(config)
     if prev and prev.checkpoint:
