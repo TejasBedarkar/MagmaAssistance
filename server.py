@@ -422,18 +422,14 @@ async def lifespan(app: FastAPI):
             "PGPASSWORD/PGDATABASE in .env. Audit logging will fail until this is fixed."
         )
 
-    # Initialize AsyncSqliteSaver for persistent LangGraph memory
     import aiosqlite
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-    
-    global agent_graph, _checkpoint_conn
-    # isolation_level=None = autocommit mode so every write is immediately visible
-    # to subsequent reads on the same connection (fixes WAL not-visible-to-self bug)
+
+    global saver, _checkpoint_conn
     _checkpoint_conn = await aiosqlite.connect("stream_history.sqlite", isolation_level=None)
     try:
         saver = AsyncSqliteSaver(_checkpoint_conn)
         await saver.setup()
-        agent_graph = build_agent_graph(checkpointer=saver)
         logger.info("AsyncSqliteSaver persistent memory ready.")
         yield
     finally:
@@ -1929,35 +1925,48 @@ async def chat(req: ChatRequest):
 
     return {"reply": reply, "audio": audio_b64}
 
+import copy
+from datetime import datetime, timezone
+from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.checkpoint.base.id import uuid6
+
 async def load_stream_history(session_id: str) -> list:
-    global agent_graph
-    config = {"configurable": {"thread_id": session_id}}
-    state = await agent_graph.aget_state(config)
-    if state and state.values and "messages" in state.values:
-        return list(state.values["messages"])
+    global saver
+    config = {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
+    tup = await saver.aget_tuple(config)
+    if tup and tup.checkpoint:
+        return list(tup.checkpoint["channel_values"].get("messages", []))
     return []
 
 async def save_stream_history(session_id: str, new_messages: list):
-    """Append ONLY new_messages to the checkpointer for this session.
-    
-    CRITICAL: The ChatState.messages field uses the add_messages reducer,
-    which APPENDS to existing messages. Passing the full history list here
-    would cause exponential duplication (2x on turn 2, 3x on turn 3...).
-    Always pass only the delta (new messages from this turn).
-    """
     if not new_messages:
         return
-    global agent_graph, _checkpoint_conn
-    config = {"configurable": {"thread_id": session_id}}
-    await agent_graph.aupdate_state(config, {"messages": new_messages}, as_node="intake")
-    # Force commit so the next aget_state call on the same connection sees the new data.
-    # aiosqlite with isolation_level=None is autocommit, but LangGraph may wrap writes
-    # in transactions internally. This ensures they're flushed.
+    global saver, _checkpoint_conn
+    config = {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
+
+    prev = await saver.aget_tuple(config)
+    if prev and prev.checkpoint:
+        checkpoint = copy.deepcopy(prev.checkpoint)
+        existing = list(checkpoint["channel_values"].get("messages", []))
+        checkpoint["channel_values"]["messages"] = existing + new_messages
+        version = checkpoint["channel_versions"].get("messages", 0) + 1
+    else:
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"]["messages"] = list(new_messages)
+        version = 1
+
+    checkpoint["id"] = str(uuid6(clock_seq=-2))
+    checkpoint["ts"] = datetime.now(timezone.utc).isoformat()
+    checkpoint["channel_versions"]["messages"] = version
+
+    metadata = {"source": "update", "step": -1, "writes": {}, "parents": {}}
+    await saver.aput(config, checkpoint, metadata, {"messages": version})
+
     if _checkpoint_conn:
         try:
             await _checkpoint_conn.commit()
         except Exception:
-            pass  # Already committed in autocommit mode, safe to ignore
+            pass
 
 
 @app.post("/api/chat/stream")
