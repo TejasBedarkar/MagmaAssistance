@@ -677,15 +677,22 @@ async def upload_purchase_order_file(
 
         # 3.5. Store the original file in S3 and record who uploaded it
         # and when -- independent of whether OCR later decides it's a PO
-        # or not, so the original document is never lost.
-        upload_meta = s3_storage.upload_file(
-            file_bytes=file_bytes,
-            original_filename=file.filename,
-            content_type=file.content_type,
-            upload_kind="purchase_order",
-            session_id=session_id,
-            user_id=user_id,
-        )
+        # or not, so the original document is never lost. Skipped when
+        # S3 isn't configured (e.g. running locally with no AWS creds)
+        # instead of raising -- OCR extraction and PO creation still run,
+        # they just don't have an S3-backed copy of the source file.
+        upload_meta = None
+        if s3_storage.is_configured():
+            upload_meta = s3_storage.upload_file(
+                file_bytes=file_bytes,
+                original_filename=file.filename,
+                content_type=file.content_type,
+                upload_kind="purchase_order",
+                session_id=session_id,
+                user_id=user_id,
+            )
+        else:
+            logger.info("S3 not configured -- skipping original-file storage for '%s'.", file.filename)
 
         # 4. Trigger Vision OCR Extraction from LLM.py. ocr_result["is_po"]
         # tells us which branch this document fell into.
@@ -702,9 +709,10 @@ async def upload_purchase_order_file(
                 "text": ocr_result.get("raw_text", ""),
                 "injected": False,
             }
-            audit_log.record_file_upload(
-                **upload_meta, extracted_metadata=ocr_result, status="processed",
-            )
+            if upload_meta:
+                audit_log.record_file_upload(
+                    **upload_meta, extracted_metadata=ocr_result, status="processed",
+                )
             return DocumentUploadResponse(
                 status="not_a_po",
                 filename=file.filename,
@@ -730,9 +738,10 @@ async def upload_purchase_order_file(
         )
         logger.info("PO auto-create result: %s", creation_result)
 
-        audit_log.record_file_upload(
-            **upload_meta, extracted_metadata=ocr_result, status="processed",
-        )
+        if upload_meta:
+            audit_log.record_file_upload(
+                **upload_meta, extracted_metadata=ocr_result, status="processed",
+            )
 
         return DocumentUploadResponse(
             status="success",
@@ -815,7 +824,10 @@ async def upload_general_document(
 ):
     """Reads ANY PDF or image (not just Purchase Orders), extracts its
     full text, and stores it against session_id so the user can ask
-    follow-up questions about it in normal chat."""
+    follow-up questions about it in normal chat. Same S3-optional
+    behavior as /api/upload-po -- storing the original file is skipped
+    when S3 isn't configured, so this works for local testing with no
+    AWS credentials set."""
     allowed_types = ["image/jpeg", "image/png", "application/pdf", "image/jpg"]
 
     if file.content_type.lower() not in allowed_types:
@@ -831,14 +843,18 @@ async def upload_general_document(
 
         logger.info(f"File '{file.filename}' uploaded for session '{session_id}'. Extracting document text...")
 
-        upload_meta = s3_storage.upload_file(
-            file_bytes=file_bytes,
-            original_filename=file.filename,
-            content_type=file.content_type,
-            upload_kind="general_document",
-            session_id=session_id,
-            user_id=user_id,
-        )
+        upload_meta = None
+        if s3_storage.is_configured():
+            upload_meta = s3_storage.upload_file(
+                file_bytes=file_bytes,
+                original_filename=file.filename,
+                content_type=file.content_type,
+                upload_kind="general_document",
+                session_id=session_id,
+                user_id=user_id,
+            )
+        else:
+            logger.info("S3 not configured -- skipping original-file storage for '%s'.", file.filename)
 
         extraction = llm_ocr_engine.extract_document_text(file_bytes=file_bytes, mime_type=file.content_type)
 
@@ -848,15 +864,16 @@ async def upload_general_document(
             "injected": False,
         }
 
-        audit_log.record_file_upload(
-            **upload_meta,
-            extracted_metadata={
-                "page_count": extraction["page_count"],
-                "pages_read": extraction["pages_read"],
-                "method": extraction["method"],
-            },
-            status="processed",
-        )
+        if upload_meta:
+            audit_log.record_file_upload(
+                **upload_meta,
+                extracted_metadata={
+                    "page_count": extraction["page_count"],
+                    "pages_read": extraction["pages_read"],
+                    "method": extraction["method"],
+                },
+                status="processed",
+            )
 
         return GeneralDocumentUploadResponse(
             status="success",

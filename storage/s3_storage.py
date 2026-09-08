@@ -41,6 +41,16 @@ S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 _s3_client = None
 
 
+def is_configured() -> bool:
+    """True when S3_BUCKET_NAME is set, i.e. uploads have somewhere to go.
+
+    Callers use this to skip S3 storage entirely (rather than raise) when
+    running locally with no AWS credentials configured -- see the upload
+    handlers in server.py.
+    """
+    return bool(S3_BUCKET_NAME)
+
+
 def _client():
     global _s3_client
     if _s3_client is None:
