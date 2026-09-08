@@ -26,8 +26,7 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from LLM.LLM import LLM
-import db.postgres_audit_log as audit_log
-from db.init_db import apply_schema
+import db.audit_log as audit_log
 from storage import s3_storage
 from ERP.erp_client import erp_client, ERPIdentity, use_identity
 
@@ -408,20 +407,13 @@ async def lifespan(app: FastAPI):
     protocol). ERP tools are now loaded synchronously above at import
     time, so this only handles the Postgres audit-log schema."""
 
-    # Creates sessions / audit_log / file_uploads in Postgres if they
-    # don't exist yet (schema.sql is idempotent, so this is safe to run
-    # on every startup, not just the first). Doesn't crash the server if
-    # Postgres is misconfigured/unreachable -- it logs instead, so the
-    # rest of the app still comes up; audit logging just won't work
-    # until PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE are fixed in .env.
+    # Initialize SQLite audit database (creates sessions, conversation_log, file_uploads)
     try:
-        apply_schema()
-        logger.info("Postgres audit-log schema ready.")
+        audit_log.init_db()
+        logger.info("SQLite audit-log schema ready.")
     except Exception:
-        logger.exception(
-            "Could not apply Postgres schema -- check PGHOST/PGPORT/PGUSER/"
-            "PGPASSWORD/PGDATABASE in .env. Audit logging will fail until this is fixed."
-        )
+        logger.exception("Could not initialize SQLite audit schema.")
+
 
     # Initialize AsyncSqliteSaver for persistent LangGraph memory
     import aiosqlite
