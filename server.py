@@ -254,9 +254,10 @@ from ERP.tool_rag import ToolRAG
 # via ERP.dynamic_fields, keyed by session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS, pending_web_review_doctype
 from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
+from ERP.tools.ocr_po_tool import OCR_PO_TOOLS
 from web.web_tool import WEB_TOOLS
 
-ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
+ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS, *OCR_PO_TOOLS]
 ALL_REQUIRED_FIELDS: dict = {}
 ALL_FIELD_PARSERS: dict = {}
 
