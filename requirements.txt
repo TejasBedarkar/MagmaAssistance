@@ -21,10 +21,12 @@ langchain-core
 langchain-openai
 langchain-community
 
+# langgraph-cli/langgraph-sdk (LangGraph Studio) were dropped along with
+# langgraph.json/build_studio_graph -- langgraph/langgraph-checkpoint*
+# stay: AsyncSqliteSaver still backs stream_history.sqlite for the live
+# /api/chat/stream and /ws/voice history.
 langgraph
 langgraph-checkpoint
-langgraph-cli
-langgraph-sdk
 langgraph-checkpoint-sqlite
 langsmith
 huggingface_hub
