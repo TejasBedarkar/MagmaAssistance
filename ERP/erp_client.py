@@ -158,9 +158,7 @@ class ERPClient:
             logging.warning("ERP_URL is not set — ERP tools will fail until it's configured in .env")
 
         self.session = requests.Session()
-        if self.api_key and self.api_secret:
-            self.session.headers.update({"Authorization": f"token {self.api_key}:{self.api_secret}"})
-        else:
+        if not (self.api_key and self.api_secret):
             logging.warning(
                 "ERP_API_KEY / ERP_API_SECRET not set — ERP requests will be "
                 "unauthenticated and will likely fail with a 403."
