@@ -58,7 +58,8 @@ import os
 import time
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 
@@ -77,20 +78,29 @@ META_CACHE_TTL_SECONDS = 3600
 
 
 class ERPIdentity:
-    """A real ERPNext user's own credentials, resolved once (via
-    resolve_identity(), below) and bound for the duration of one agent
-    turn. Distinct from the module-level shared service account."""
+    """A real ERPNext user's own credentials or session, resolved once (via
+    resolve_identity() or resolve_session_identity()) and bound for the
+    duration of one agent turn. Distinct from the module-level shared
+    service account."""
 
-    __slots__ = ("api_key", "api_secret", "user", "roles")
+    __slots__ = ("api_key", "api_secret", "sid", "user", "roles")
 
-    def __init__(self, api_key: str, api_secret: str, user: str = None, roles=None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        sid: Optional[str] = None,
+        user: Optional[str] = None,
+        roles: Optional[list] = None,
+    ):
         self.api_key = api_key
         self.api_secret = api_secret
+        self.sid = sid
         self.user = user
         self.roles = roles or []
 
     def __repr__(self):
-        return f"ERPIdentity(user={self.user!r}, roles={self.roles!r})"
+        return f"ERPIdentity(user={self.user!r}, sid={bool(self.sid)}, roles={self.roles!r})"
 
 
 # Per-async-task identity binding. contextvars propagate correctly through
@@ -164,19 +174,33 @@ class ERPClient:
     # ---------------------------------------------------------------
 
     def _auth_headers(self) -> dict:
-        """Authorization header for the current call: the bound
-        ERPIdentity's own key/secret if one is active (see use_identity
+        """Authorization and/or Cookie header for the current call: the bound
+        ERPIdentity's own key/secret or session cookie if active (see use_identity
         in this module), otherwise this client's shared service-account
-        key. Every request-issuing method below passes this explicitly
-        (it overrides self.session's baked-in default header for that
-        one request) so a bound identity is actually honored everywhere,
-        not just on one endpoint."""
+        key. Also attaches Host header if required for local multi-tenant bench.
+        Every request-issuing method below passes this explicitly so a bound
+        identity is actually honored everywhere, not just on one endpoint."""
+        headers = {}
+        site_name = os.getenv("FRAPPE_SITE_NAME")
+        if site_name:
+            headers["Host"] = site_name
+        elif self.base_url:
+            parsed = urlparse(self.base_url)
+            if parsed.hostname and parsed.hostname not in ("localhost", "127.0.0.1", "0.0.0.0"):
+                headers["Host"] = parsed.hostname
+
         identity = _active_identity.get()
-        if identity and identity.api_key and identity.api_secret:
-            return {"Authorization": f"token {identity.api_key}:{identity.api_secret}"}
+        if identity:
+            if identity.api_key and identity.api_secret:
+                headers["Authorization"] = f"token {identity.api_key}:{identity.api_secret}"
+                return headers
+            if identity.sid:
+                headers["Cookie"] = f"sid={identity.sid}"
+                return headers
+
         if self.api_key and self.api_secret:
-            return {"Authorization": f"token {self.api_key}:{self.api_secret}"}
-        return {}
+            headers["Authorization"] = f"token {self.api_key}:{self.api_secret}"
+        return headers
 
     def resolve_identity(self, api_key: str, api_secret: str) -> "ERPIdentity":
         """Validate a person's own ERPNext API key/secret and fetch their
@@ -227,6 +251,49 @@ class ERPClient:
             logging.exception("Could not fetch roles for ERPNext user '%s'", user)
 
         return ERPIdentity(api_key=api_key, api_secret=api_secret, user=user, roles=roles)
+
+    def resolve_session_identity(self, sid: str, user_id: Optional[str] = None) -> "ERPIdentity":
+        """Validate a person's Frappe session cookie (sid) and fetch their
+        roles using Frappe's stock endpoints:
+          1. GET /api/method/frappe.auth.get_logged_user with Cookie: sid=<sid>
+          2. GET /api/resource/User/<user> to read user's roles child table.
+        Raises PermissionError if the session is invalid or Guest.
+        """
+        if not self.base_url:
+            raise RuntimeError("ERP_URL is not configured.")
+
+        headers = {"Cookie": f"sid={sid}"}
+        site_name = os.getenv("FRAPPE_SITE_NAME")
+        if site_name:
+            headers["Host"] = site_name
+        elif self.base_url:
+            parsed = urlparse(self.base_url)
+            if parsed.hostname and parsed.hostname not in ("localhost", "127.0.0.1", "0.0.0.0"):
+                headers["Host"] = parsed.hostname
+
+        who_url = f"{self.base_url}/api/method/frappe.auth.get_logged_user"
+        response = requests.get(who_url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS)
+        if response.status_code in (401, 403):
+            raise PermissionError("Frappe session is not valid or has expired.")
+        response.raise_for_status()
+        user = response.json().get("message")
+        if not user or user == "Guest":
+            raise PermissionError("Frappe session is unauthenticated (Guest).")
+
+        roles = []
+        try:
+            user_url = f"{self.base_url}/api/resource/User/{user}"
+            user_response = requests.get(
+                user_url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS,
+                params={"fields": json.dumps(["roles"])},
+            )
+            if user_response.ok:
+                role_rows = user_response.json().get("data", {}).get("roles", []) or []
+                roles = [r.get("role") for r in role_rows if r.get("role")]
+        except Exception:
+            logging.exception("Could not fetch roles for Frappe session user '%s'", user)
+
+        return ERPIdentity(sid=sid, user=user, roles=roles)
 
     def _identity_tag(self):
         """A short, cache-key-safe tag for whoever is currently bound

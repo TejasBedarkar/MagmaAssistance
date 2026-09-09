@@ -440,12 +440,26 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
 
 # Allow CORS requests from frontend
+_cors_origins_env = os.environ.get("ALLOWED_ORIGINS")
+if _cors_origins_env:
+    ALLOWED_ORIGINS = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+else:
+    ALLOWED_ORIGINS = [
+        "http://localhost:8001",
+        "http://127.0.0.1:8001",
+        "http://magna.local:8001",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8050",
+        "http://127.0.0.1:8050",
+    ]
+
+ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    # The browser API calls do not use cookies. Combining credentials with a
-    # wildcard origin is needlessly fragile across browsers/proxies.
-    allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -776,20 +790,23 @@ session_identities: Dict[str, ERPIdentity] = {}
 
 class SessionIdentifyRequest(BaseModel):
     session_id: str
-    erp_api_key: str
-    erp_api_secret: str
+    erp_api_key: Optional[str] = None
+    erp_api_secret: Optional[str] = None
+    sid: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 @app.post("/api/session/identify")
 async def identify_session(req: SessionIdentifyRequest):
-    """Bind a real ERPNext user to a chat session, via their own personal
-    API key/secret (ERPNext: User menu -> My Settings -> API Access ->
-    Generate Keys). Call this once when a person starts or resumes a
-    session, before /api/chat. From then on, every ERP tool call in that
-    session is made with their own credentials and enforced by Frappe's
-    own permission checks -- no custom ERPNext app required."""
+    """Bind a real ERPNext user to a chat session, via their personal
+    API key/secret or active Frappe session cookie (sid)."""
     try:
-        identity = erp_client.resolve_identity(req.erp_api_key, req.erp_api_secret)
+        if req.erp_api_key and req.erp_api_secret:
+            identity = erp_client.resolve_identity(req.erp_api_key, req.erp_api_secret)
+        elif req.sid:
+            identity = erp_client.resolve_session_identity(req.sid, user_id=req.user_id)
+        else:
+            raise HTTPException(status_code=400, detail="Either erp_api_key/secret or sid must be provided.")
     except PermissionError as e:
         raise HTTPException(status_code=401, detail=str(e))
     session_identities[req.session_id] = identity
@@ -1897,6 +1914,7 @@ class ChatRequest(BaseModel):
 
     session_id: str = "default"
     user_id: Optional[str] = None  # who's asking -- pass from auth/frontend once available
+    sid: Optional[str] = None      # Frappe session cookie (sid) for per-user RBAC
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
@@ -1981,6 +1999,15 @@ async def chat_stream(req: ChatRequest):
     if not text:
         raise HTTPException(status_code=400, detail="message is required")
 
+    # Resolve per-user ERP identity (if sid or API credentials provided)
+    identity = session_identities.get(req.session_id)
+    if not identity and req.sid:
+        try:
+            identity = erp_client.resolve_session_identity(req.sid, user_id=req.user_id)
+            session_identities[req.session_id] = identity
+        except Exception as exc:
+            logger.warning("Could not resolve session identity for %s: %s", req.session_id, exc)
+
     history = await load_stream_history(req.session_id)
     start_len = len(history)  # snapshot before the turn mutates history
 
@@ -1990,11 +2017,13 @@ async def chat_stream(req: ChatRequest):
         # long enough that the tunnel otherwise produces its own timeout
         # response, which the browser misleadingly reports as a CORS failure.
         yield ": connected\n\n"
+        effective_user_id = identity.user if identity else req.user_id
         try:
-            async for event in stream_agent_turn(text, session_id=req.session_id, user_id=req.user_id, history=history):
-                # Strip internal _delta key before sending to browser
-                browser_event = {k: v for k, v in event.items() if k != "_delta"}
-                yield f"data: {json.dumps(browser_event)}\n\n"
+            with use_identity(identity):
+                async for event in stream_agent_turn(text, session_id=req.session_id, user_id=effective_user_id, history=history):
+                    # Strip internal _delta key before sending to browser
+                    browser_event = {k: v for k, v in event.items() if k != "_delta"}
+                    yield f"data: {json.dumps(browser_event)}\n\n"
         except Exception as exc:  # noqa: BLE001
             logger.exception("Streaming agent turn failed: %s", text)
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"

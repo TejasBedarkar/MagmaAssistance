@@ -16,6 +16,8 @@ import re
 import time
 from fastapi import WebSocket, WebSocketDisconnect
 
+from ERP.erp_client import use_identity, erp_client
+
 _ws_bg_tasks = set()
 
 def safe_create_task(coro):
@@ -28,9 +30,9 @@ def safe_create_task(coro):
 def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, save_stream_history):
 
     @app.websocket("/ws/voice")
-    async def ws_voice(ws: WebSocket, session_id: str = "voice-default", user_id: str = None):
+    async def ws_voice(ws: WebSocket, session_id: str = "voice-default", user_id: str = None, sid: str = None):
         await ws.accept()
-        logger.info("[WS/voice] OPEN  session=%s user=%s", session_id, user_id)
+        logger.info("[WS/voice] OPEN  session=%s user=%s sid=%s", session_id, user_id, bool(sid))
 
         class ConnectionClosed(Exception):
             """Raised when a background task tries to use a closed websocket."""
@@ -108,60 +110,70 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
             history = await load_stream_history(session_id)
             start_len = len(history)  # snapshot before turn mutates history
 
+            identity = getattr(app.state, "session_identities", {}).get(session_id)
+            if not identity and sid:
+                try:
+                    identity = erp_client.resolve_session_identity(sid, user_id=user_id)
+                    if hasattr(app.state, "session_identities"):
+                        app.state.session_identities[session_id] = identity
+                except Exception as exc:
+                    logger.warning("[WS/voice] Could not resolve session identity: %s", exc)
+
             try:
-                history = await load_stream_history(session_id)
-                async for event in stream_agent_turn(
-                    text, session_id=session_id, user_id=user_id, history=history
-                ):
-                    etype = event["type"]
+                effective_user = identity.user if identity else user_id
+                with use_identity(identity):
+                    async for event in stream_agent_turn(
+                        text, session_id=session_id, user_id=effective_user, history=history
+                    ):
+                        etype = event["type"]
 
-                    if etype == "token":
-                        raw = event["text"]
-                        await send_json({"type": "token", "text": raw})
-                        token_buf += raw
+                        if etype == "token":
+                            raw = event["text"]
+                            await send_json({"type": "token", "text": raw})
+                            token_buf += raw
 
-                        # Emit a voice_sentence whenever a sentence boundary
-                        # is detected so speechSynthesis can start speaking
-                        # before the full reply is done — low latency.
-                        parts = re.split(r'(?<=[.!?\u0964])\s+', token_buf)
-                        if len(parts) > 1:
-                            for sentence in parts[:-1]:
-                                cleaned = clean_for_speech(sentence)
-                                if cleaned:
-                                    await send_json({"type": "voice_sentence", "text": cleaned})
-                            token_buf = parts[-1]
+                            # Emit a voice_sentence whenever a sentence boundary
+                            # is detected so speechSynthesis can start speaking
+                            # before the full reply is done — low latency.
+                            parts = re.split(r'(?<=[.!?\u0964])\s+', token_buf)
+                            if len(parts) > 1:
+                                for sentence in parts[:-1]:
+                                    cleaned = clean_for_speech(sentence)
+                                    if cleaned:
+                                        await send_json({"type": "voice_sentence", "text": cleaned})
+                                token_buf = parts[-1]
 
-                    elif etype == "tool_call":
-                        logger.info(
-                            "[WS/voice] tool_call  name=%s  args=%s",
-                            event["name"], str(event.get("args", {}))[:200]
-                        )
-                        await send_json({
-                            "type": "tool_call",
-                            "name": event["name"],
-                            "args": event.get("args", {})
-                        })
+                        elif etype == "tool_call":
+                            logger.info(
+                                "[WS/voice] tool_call  name=%s  args=%s",
+                                event["name"], str(event.get("args", {}))[:200]
+                            )
+                            await send_json({
+                                "type": "tool_call",
+                                "name": event["name"],
+                                "args": event.get("args", {})
+                            })
 
-                    elif etype == "tool_result":
-                        logger.info(
-                            "[WS/voice] tool_result  name=%s  result=%s",
-                            event["name"], str(event.get("result", ""))[:200]
-                        )
-                        await send_json({
-                            "type": "tool_result",
-                            "name": event["name"],
-                            "result": str(event.get("result", ""))
-                        })
+                        elif etype == "tool_result":
+                            logger.info(
+                                "[WS/voice] tool_result  name=%s  result=%s",
+                                event["name"], str(event.get("result", ""))[:200]
+                            )
+                            await send_json({
+                                "type": "tool_result",
+                                "name": event["name"],
+                                "result": str(event.get("result", ""))
+                            })
 
-                    elif etype == "done":
-                        # Flush any remaining text in the buffer
-                        final = clean_for_speech(token_buf)
-                        if final:
-                            await send_json({"type": "voice_sentence", "text": final})
-                        token_buf = ""
-                        elapsed = (time.monotonic() - t0) * 1000
-                        logger.info("[WS/voice] turn DONE  %.0fms  session=%s", elapsed, session_id)
-                        await send_json({"type": "done"})
+                        elif etype == "done":
+                            # Flush any remaining text in the buffer
+                            final = clean_for_speech(token_buf)
+                            if final:
+                                await send_json({"type": "voice_sentence", "text": final})
+                            token_buf = ""
+                            elapsed = (time.monotonic() - t0) * 1000
+                            logger.info("[WS/voice] turn DONE  %.0fms  session=%s", elapsed, session_id)
+                            await send_json({"type": "done"})
 
             except asyncio.CancelledError:
                 logger.info("[WS/voice] turn CANCELLED  session=%s", session_id)
