@@ -6,6 +6,16 @@ Command-line client for the MagmaAssistance FastAPI/uvicorn backend
 (server.py). Talks to the same endpoints the web UI would, so you can
 use/test the backend without touching the UI yet.
 
+NOTE: The old bundled /api/chat and /query endpoints were removed from
+server.py along with the dead LangGraph agent (see ARCHITECTURE.md,
+"Agent consolidation"). `chat` now streams through the live
+/api/chat/stream endpoint under the hood and just returns the final
+reply text. There is no REST replacement for /query's one-shot
+audio-file transcription -- the live backend only does realtime voice
+over the /ws/voice WebSocket (see Voice/ws_voice.py) -- so the old
+mic-recording `voice`/`/voice` flow has been retired; those commands
+now just point you at that instead of silently 404ing.
+
 Usage:
     python magma_cli.py                       # interactive chat REPL
     python magma_cli.py --url http://localhost:8050
@@ -85,15 +95,6 @@ class MagmaClient:
         r.raise_for_status()
         return r.json()
 
-    def chat(self, message: str) -> dict:
-        payload = {"message": message, "session_id": self.session_id}
-        if self.user_id:
-            payload["user_id"] = self.user_id
-        r = requests.post(self._url("/api/chat"), json=payload, timeout=120)
-        if not r.ok:
-            self._raise_with_detail(r)
-        return r.json()
-
     def chat_stream(self, message: str):
         payload = {"message": message, "session_id": self.session_id}
         if self.user_id:
@@ -115,6 +116,22 @@ class MagmaClient:
                 except Exception:
                     continue
                 yield event
+
+    def chat(self, message: str) -> dict:
+        """One-shot, non-streaming chat. /api/chat was removed along with
+        the dead LangGraph agent, so this drains /api/chat/stream (the
+        live endpoint) and returns just the final reply text -- same
+        `{"reply": ...}` shape callers already expect."""
+        reply = ""
+        for event in self.chat_stream(message):
+            etype = event.get("type")
+            if etype == "token":
+                reply += event.get("text", "")
+            elif etype == "done":
+                reply = event.get("text", reply)
+            elif etype == "error":
+                raise RuntimeError(event.get("message", "agent error"))
+        return {"reply": reply}
 
     def identify_session(self, api_key: str, api_secret: str) -> dict:
         payload = {
@@ -180,16 +197,6 @@ class MagmaClient:
             f.write(r.content)
         return out_path
 
-    def query_audio(self, filepath: str) -> dict:
-        content_type = "audio/wav"
-        with open(filepath, "rb") as f:
-            files = {"file": (os.path.basename(filepath), f, content_type)}
-            data = {"session_id": self.session_id, "user_id": self.user_id or "cli-user"}
-            r = requests.post(self._url("/query"), files=files, data=data, timeout=120)
-        if not r.ok:
-            self._raise_with_detail(r)
-        return r.json()
-
     @staticmethod
     def _raise_with_detail(r: "requests.Response"):
         try:
@@ -215,71 +222,15 @@ def _print_json(obj) -> None:
     print(json.dumps(obj, indent=2, ensure_ascii=False))
 
 
-def _record_wav(seconds: float, samplerate: int = 16000) -> str:
-    import sounddevice as sd
-    import soundfile as sf
-    import tempfile
-
-    frames = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=1, dtype="float32")
-    sd.wait()
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    sf.write(path, frames, samplerate)
-    return path
-
-
-def _play_audio_bytes(audio_b64: str) -> None:
-    import base64
-    import tempfile
-
-    audio_bytes = base64.b64decode(audio_b64)
-    fd, path = tempfile.mkstemp(suffix=".mp3")
-    os.close(fd)
-    with open(path, "wb") as f:
-        f.write(audio_bytes)
-    try:
-        from playsound import playsound
-        playsound(path)
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
-
-
-def run_voice_loop(client: MagmaClient, seconds: float = 5.0):
-    try:
-        import sounddevice  # noqa: F401
-        import soundfile  # noqa: F401
-    except ImportError:
-        print("Voice mode needs: pip install sounddevice soundfile playsound")
-        return
-
-    print(f"Voice mode. Recording {seconds}s per turn. Press Ctrl+C to stop.\n")
-    while True:
-        try:
-            input("Press Enter to speak...")
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye.")
-            break
-
-        wav_path = _record_wav(seconds)
-        try:
-            result = client.query_audio(wav_path)
-        except Exception as e:
-            print(f"[error] {e}\n")
-            continue
-        finally:
-            if os.path.exists(wav_path):
-                os.remove(wav_path)
-
-        print(f"You said: {result.get('query', '')}")
-        print(f"AI: {result.get('response', '')}\n")
-
-        audio_b64 = result.get("audio")
-        if audio_b64:
-            try:
-                _play_audio_bytes(audio_b64)
-            except Exception as e:
-                print(f"[warning] could not play audio reply: {e}\n")
+def voice_retired_notice():
+    print(
+        "File-based voice mode is retired -- it called /query, which was\n"
+        "removed along with the dead LangGraph agent (see ARCHITECTURE.md).\n"
+        "The live backend only does realtime voice over the /ws/voice\n"
+        "WebSocket (see Voice/ws_voice.py); this CLI doesn't speak that\n"
+        "protocol yet. Use the web UI's voice mode for now, or type your\n"
+        "message here instead -- text chat still works."
+    )
 
 
 # ---- interactive REPL ------------------------------------------------------
@@ -289,7 +240,7 @@ Commands:
   <message>                 send a chat message
   /session [name]           show or switch session id (current: {session})
   /login [key] [secret]     bind ERPNext credentials (defaults to .env's ERP_API_KEY/SECRET)
-  /voice [seconds]          start a mic-based voice conversation loop (fixed-duration)
+  /voice                    file-based voice mode is retired -- shows why + where realtime voice lives
   /logout                   unbind credentials from this session
   /upload <path>            upload a general document (PDF/JPEG/PNG)
   /uploadpo <path>          upload a Purchase Order document
@@ -299,8 +250,6 @@ Commands:
   /audit export [id]        export audit log to a local JSON file
   /help                     show this help
   /quit                     exit
-
-Run `python magma_voice.py` separately for realtime full-duplex voice with barge-in.
 """
 
 
@@ -391,8 +340,7 @@ def _handle_command(client: MagmaClient, line: str) -> bool:
             print(f"[error] {e}")
 
     elif cmd == "/voice":
-        seconds = float(parts[1]) if len(parts) >= 2 else 5.0
-        run_voice_loop(client, seconds)
+        voice_retired_notice()
 
     elif cmd == "/logout":
         try:
@@ -483,8 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_upload_po = sub.add_parser("upload-po", help="Upload a Purchase Order document")
     p_upload_po.add_argument("path")
 
-    p_voice = sub.add_parser("voice", help="Mic-based voice conversation loop")
-    p_voice.add_argument("--seconds", type=float, default=5.0)
+    p_voice = sub.add_parser("voice", help="File-based voice mode is retired -- shows why + where realtime voice lives")
 
     p_audit = sub.add_parser("audit", help="Audit log operations")
     audit_sub = p_audit.add_subparsers(dest="audit_command")
@@ -531,7 +478,7 @@ def main():
             _print_json(client.upload_po(args.path))
 
         elif args.command == "voice":
-            run_voice_loop(client, args.seconds)
+            voice_retired_notice()
 
         elif args.command == "audit":
             if args.audit_command == "sessions":
