@@ -889,12 +889,125 @@ async def upload_general_document(
         raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
 
 
+# ---------------------------------------------------------------------
+# Code-enforced write-approval gate (ARCHITECTURE.md P1)
+# ---------------------------------------------------------------------
+#
+# _execute_tool is the one choke point every tool call passes through
+# (see its docstring below), so it's also the right place to enforce
+# "no write reaches ERPNext without an explicit human 'yes'" in CODE
+# rather than as a prompt instruction the model might skip, misfire, or
+# reconstruct incorrectly. This replaces the ad-hoc, web_enriched-only,
+# model-trusted `approved=True` re-call pattern in
+# ERP_Unified/tools._run_create (still there, still harmless, but no
+# longer the only gate; see the note above `_is_write_call`).
+#
+# Mechanism, in two turns:
+#   Turn N   — the model calls a write tool. _execute_tool intercepts it,
+#              STASHES the exact (tool_name, args) it was about to run
+#              keyed by session_id, and returns a proposal string instead
+#              of touching ERPNext. The model relays that proposal to the
+#              user as the tool result; nothing has been written yet.
+#   Turn N+1 — stream_agent_turn() checks, before calling the LLM at all,
+#              whether this session has a pending proposal AND the new
+#              user message is an unambiguous "yes". If so it calls
+#              _execute_tool(bypass_gate=True) with the EXACT stashed
+#              args from turn N — not whatever the model might produce
+#              this turn — so approval always executes the reviewed
+#              payload, byte for byte. A clear "no" cancels it, also
+#              without any model involvement. Anything else (a
+#              correction, a new question) drops the stale proposal and
+#              falls through to normal handling, so an old approval can
+#              never be replayed against a payload the user never saw.
+#
+# One pending proposal per session_id: a second write call before the
+# first is resolved simply replaces it (the newer proposal is the one
+# still on the table).
+_PENDING_APPROVALS: dict[str, dict] = {}
+
+# Which tools are gated, and — for erp_data_tool specifically — which of
+# its `operation` values count as a write. list/get never touch this
+# gate; only create/update/submit do. erp_send_email is always gated
+# since every call sends real email.
+_GATED_WRITE_OPERATIONS = {
+    "create", "insert", "add", "new",       # CREATE_OPERATIONS
+    "update", "edit", "modify", "set",      # UPDATE_OPERATIONS
+    "submit",                               # SUBMIT_OPERATIONS
+}
+_ALWAYS_GATED_TOOLS = {"erp_send_email"}
+
+
+def _is_write_call(tool_name: str, args: dict) -> bool:
+    if tool_name in _ALWAYS_GATED_TOOLS:
+        return True
+    if tool_name == "erp_data_tool":
+        operation = str((args or {}).get("operation") or "").strip().lower()
+        return operation in _GATED_WRITE_OPERATIONS
+    return False
+
+
+def _describe_pending_action(tool_name: str, args: dict) -> str:
+    """Human-readable one/two-liner for the proposal message. Kept
+    separate from the raw stashed args so the exact payload that will
+    be executed on approval is never reconstructed from this text."""
+    args = args or {}
+    if tool_name == "erp_send_email":
+        recipients = args.get("recipients", "(no recipient given)")
+        subject = args.get("subject", "(no subject)")
+        return f"Send an email to {recipients} — subject: \"{subject}\""
+
+    if tool_name == "erp_data_tool":
+        operation = str(args.get("operation") or "").strip().lower()
+        doctype = args.get("doctype", "record")
+        if operation in ("submit",):
+            return f"Submit {doctype} '{args.get('name')}'"
+        if operation in ("update", "edit", "modify", "set"):
+            fields = ", ".join(
+                f"{k}={v}" for k, v in (args.get("data") or {}).items()
+            ) or "(no fields given)"
+            return f"Update {doctype} '{args.get('name')}' — set {fields}"
+        # create / insert / add / new
+        fields = ", ".join(
+            f"{k}={v}" for k, v in (args.get("data") or {}).items()
+        ) or "(no fields given)"
+        suffix = " and submit it" if args.get("submit") else ""
+        return f"Create a new {doctype}{suffix} — {fields}"
+
+    return f"Run {tool_name} with {args}"
+
+
+_YES_RE = re.compile(
+    r"^\s*(yes|yep|yeah|yup|confirm(?:ed)?|approve[d]?|go ahead|do it|"
+    r"proceed|sounds good|ok(?:ay)?(?:,)?\s*(do it|go ahead|proceed)?|"
+    r"send it|create it|submit it)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+_NO_RE = re.compile(
+    r"^\s*(no|nope|nah|cancel|don'?t|stop|abort|never ?mind)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_write_approval(message: str) -> bool:
+    """Unambiguous 'yes' only. A correction that happens to start with
+    an affirmative word ("yes but change the amount to 500") must NOT
+    match — the regex is anchored end-to-end (`$`) so any trailing
+    content beyond a short stock phrase falls through to `else` in the
+    caller instead of being treated as consent."""
+    return bool(_YES_RE.match((message or "").strip()))
+
+
+def _is_write_rejection(message: str) -> bool:
+    return bool(_NO_RE.match((message or "").strip()))
+
+
 async def _execute_tool(
     tool_name: str,
     args: dict,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
     prompt_text: Optional[str] = None,
+    bypass_gate: bool = False,
 ):
     """Async because MCP-sourced tools (ERP/mcp_server.py, loaded via
     ERP/tools/mcp_tools.py) only implement `.ainvoke()`, not the sync
@@ -907,7 +1020,29 @@ async def _execute_tool(
     args, result, how long it took, and who prompted it) regardless of
     success — this is the one choke point all tool execution passes
     through, so it's the cheapest place to record "what actions did the
-    agent actually take" for later review."""
+    agent actually take" for later review.
+
+    `bypass_gate=True` is used ONLY by stream_agent_turn's deterministic
+    "yes" handler, to actually run a previously-approved, stashed
+    payload. Every other caller goes through the normal path below,
+    where a write call is intercepted and stashed instead of executed.
+    """
+    if not bypass_gate and session_id and _is_write_call(tool_name, args):
+        effective_args = _sanitize_tool_args(tool_name, args) or {}
+        if tool_name == "erp_data_tool":
+            effective_args = {**effective_args, "session_id": session_id}
+        _PENDING_APPROVALS[session_id] = {"tool_name": tool_name, "args": effective_args}
+        proposal = (
+            f"PROPOSED ACTION (not yet executed): {_describe_pending_action(tool_name, effective_args)}\n"
+            "Nothing has been written to the ERP yet. Ask the user to confirm "
+            "with a plain \"yes\" (or tell you what to change) before anything happens."
+        )
+        audit_log.log_turn(
+            session_id, "tool", proposal, tool_name=tool_name, tool_args=effective_args,
+            user_id=user_id, prompt_text=prompt_text, tool_status="awaiting_approval",
+        )
+        return proposal
+
     tool = tool_map.get(tool_name)
     if tool is None:
         result = f"Tool '{tool_name}' is not available."
@@ -929,9 +1064,12 @@ async def _execute_tool(
         if session_id:
             audit_log.log_turn(
                 session_id, "tool", str(result), tool_name=tool_name, tool_args=effective_args,
-                user_id=user_id, prompt_text=prompt_text, tool_status="success",
+                user_id=user_id, prompt_text=prompt_text,
+                tool_status="approved_executed" if bypass_gate else "success",
                 duration_ms=elapsed(),
             )
+        if bypass_gate and session_id:
+            _PENDING_APPROVALS.pop(session_id, None)
         return result
     except PermissionError as e:
         # Raised by erp_client when a bound per-user ERPIdentity (see
@@ -946,6 +1084,8 @@ async def _execute_tool(
                 user_id=user_id, prompt_text=prompt_text, tool_status="permission_denied",
                 error_message=str(e),
             )
+            if bypass_gate:
+                _PENDING_APPROVALS.pop(session_id, None)
         return failure
     except Exception as e:
         logger.exception("Tool '%s' failed", tool_name)
@@ -956,6 +1096,8 @@ async def _execute_tool(
                 user_id=user_id, prompt_text=prompt_text, tool_status="error",
                 error_message=str(e),
             )
+            if bypass_gate:
+                _PENDING_APPROVALS.pop(session_id, None)
         return failure
 
 
@@ -1058,18 +1200,77 @@ async def _stream_full_reply(call_messages, tools=None):
 
 
 async def stream_agent_turn(text, session_id=None, user_id=None, history=None, task_context=None):
-    """Streaming twin of agent_node/generate_reply for the realtime voice
-    WS path. Keeps its own `history` list (caller-owned, per-connection)
-    instead of the LangGraph checkpointer, so the existing text-chat graph
-    and its slot-filling flow are untouched. Yields token/tool_call/
-    tool_result/done event dicts in call order.
-    
+    """The live agent loop for both /api/chat/stream (text) and /ws/voice
+    (voice). Keeps its own `history` list (caller-owned, per-connection),
+    backed by the bare AsyncSqliteSaver on stream_history.sqlite (see
+    load_stream_history/save_stream_history below) rather than a
+    LangGraph-compiled graph. Yields token/tool_call/tool_result/done
+    event dicts in call order.
+
     IMPORTANT: We track start_len so callers can extract only the NEW messages
     added this turn (the delta) for saving. The checkpointer uses add_messages
     which appends — so saving the full list would duplicate every message.
     """
     history = history if history is not None else []
     start_len = len(history)  # snapshot before we mutate
+
+    # --- code-enforced write-approval gate: resolve a pending proposal
+    # from the PREVIOUS turn before the LLM ever sees this message. See
+    # the block above _execute_tool for the full mechanism. ---
+    pending = _PENDING_APPROVALS.get(session_id) if session_id else None
+    if pending and _is_write_approval(text):
+        history.append(HumanMessage(content=text))
+        yield {"type": "tool_call", "name": pending["tool_name"], "args": pending["args"]}
+        result = await _execute_tool(
+            pending["tool_name"], pending["args"],
+            session_id=session_id, user_id=user_id, prompt_text=text,
+            bypass_gate=True,
+        )
+        yield {"type": "tool_result", "name": pending["tool_name"], "result": result}
+        # Let the model phrase the confirmation naturally from the real
+        # result, but the write itself already happened above, exactly
+        # against the stashed payload -- this call cannot cause a second
+        # write, it only produces prose.
+        summary_messages = [
+            SystemMessage(content=assistant.llm.system_prompt),
+            HumanMessage(
+                content=(
+                    f"The user approved the pending action and it has now been executed. "
+                    f"Tool result: {result}\nReply with a brief confirmation of what was done "
+                    f"(or, if the result shows a failure, say so plainly). Do not call any tools."
+                )
+            ),
+        ]
+        content = ""
+        async for event in _stream_full_reply(summary_messages, tools=None):
+            if event["type"] == "token":
+                yield {"type": "token", "text": event["text"]}
+            else:
+                content = event["content"]
+        history.append(AIMessage(content=content))
+        yield {"type": "done", "text": content, "_delta": history[start_len:]}
+        return
+
+    if pending and _is_write_rejection(text):
+        _PENDING_APPROVALS.pop(session_id, None)
+        history.append(HumanMessage(content=text))
+        cancel_text = "Okay, I've cancelled that — nothing was changed."
+        history.append(AIMessage(content=cancel_text))
+        audit_log.log_turn(session_id, "tool", cancel_text, tool_name=pending["tool_name"],
+                            tool_args=pending["args"], user_id=user_id, prompt_text=text,
+                            tool_status="rejected")
+        yield {"type": "done", "text": cancel_text, "_delta": history[start_len:]}
+        return
+
+    if pending:
+        # Neither a clean "yes" nor a clean "no" -- e.g. a correction
+        # ("change the amount to 500") or an unrelated new message. The
+        # stale proposal must not be executable by a later stray "yes",
+        # so drop it and fall through to normal handling; if the user
+        # still wants the action, the model will call the tool again
+        # (with corrected args, if any) and a fresh proposal is stashed.
+        _PENDING_APPROVALS.pop(session_id, None)
+
     history.append(HumanMessage(content=text))
     # Trim for LLM context window — this is a separate list, does NOT affect history
     trimmed = trim_messages(history, max_tokens=MAX_HISTORY_TOKENS, token_counter=_approx_tokens, strategy="last", include_system=False)
