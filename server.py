@@ -431,22 +431,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
 
-# Allow CORS requests from frontend
+# Allow CORS requests from frontend.
+# Default stays permissive ("*", no credentials) so existing deployments
+# keep working untouched -- the current per-user identity flow passes `sid`
+# in the request body, not as a cookie, so credentialed CORS isn't needed
+# yet. Set ALLOWED_ORIGINS (comma-separated) to lock this down and enable
+# credentialed requests once the browser starts sending the session cookie.
 _cors_origins_env = os.environ.get("ALLOWED_ORIGINS")
 if _cors_origins_env:
     ALLOWED_ORIGINS = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
 else:
-    ALLOWED_ORIGINS = [
-        "http://localhost:8001",
-        "http://127.0.0.1:8001",
-        "http://magna.local:8001",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:8050",
-        "http://127.0.0.1:8050",
-    ]
-
-ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
+    ALLOWED_ORIGINS = ["*"]
+    ALLOW_CREDENTIALS = False
 
 app.add_middleware(
     CORSMiddleware,
