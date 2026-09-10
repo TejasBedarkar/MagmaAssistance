@@ -1,7 +1,0 @@
-{
-  "dependencies": ["."],
-  "graphs": {
-    "magma-agent": "server:build_studio_graph"
-  },
-  "env": ".env"
-}

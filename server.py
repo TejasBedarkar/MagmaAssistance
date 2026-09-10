@@ -14,16 +14,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage, BaseMessage, trim_messages, RemoveMessage
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage, BaseMessage, trim_messages
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.outputs import ChatResult, ChatGeneration
-from typing import List, Optional, Any, Sequence, Dict, Union, Callable, Annotated, TypedDict, Literal
+from typing import List, Optional, Any, Sequence, Dict, Union, Callable
 import requests
 import sqlite3
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langgraph.checkpoint.sqlite import SqliteSaver
 
 from LLM.LLM import LLM
 import db.postgres_audit_log as audit_log
@@ -248,17 +244,14 @@ from ERP.tool_rag import ToolRAG
 
 # Migrated to the single generic ERP_Unified.erp_data_tool gateway —
 # the old per-doctype tools (ERP/tools/*.py's create_lead, update_lead,
-# etc.) are no longer registered, so ALL_REQUIRED_FIELDS/ALL_FIELD_PARSERS
-# (which only had entries keyed by those old tool names) aren't needed
-# either; erp_data_tool does its own missing-field prompting internally
-# via ERP.dynamic_fields, keyed by session_id instead of by tool name.
+# etc.) are no longer registered; erp_data_tool does its own
+# missing-field prompting internally via ERP.dynamic_fields, keyed by
+# session_id instead of by tool name.
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS, pending_web_review_doctype
 from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
 from web.web_tool import WEB_TOOLS
 
 ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
-ALL_REQUIRED_FIELDS: dict = {}
-ALL_FIELD_PARSERS: dict = {}
 
 
 # Configure logging
@@ -277,8 +270,8 @@ logger = logging.getLogger("agent-server")
 # ---------------------------------------------------------------------
 # LangSmith tracing (optional -- no-op if LANGCHAIN_API_KEY isn't set)
 # ---------------------------------------------------------------------
-# LangChain/LangGraph runnables (assistant.llm.model, text_chain,
-# agent_graph) are auto-instrumented by LangSmith's callback handler the
+# LangChain runnables (assistant.llm.model and friends) are
+# auto-instrumented by LangSmith's callback handler the
 # moment LANGCHAIN_TRACING_V2=true and LANGCHAIN_API_KEY are present in
 # the environment -- no code changes needed for those. This block just:
 #   1. sets a sane default project name (so traces aren't dumped into
@@ -351,7 +344,6 @@ assistant = VoiceAssistant(
     tts_voice=TTS_VOICE,
     speak_replies=False,
 )
-text_chain = assistant.prompt | assistant.llm.model | StrOutputParser()
 
 
 TOOL_RAG_TOP_K = int(os.environ.get("TOOL_RAG_TOP_K", "3"))
@@ -471,95 +463,19 @@ app.include_router(voice_router)
 
 
 # ---------------------------------------------------------------------
-# Memory: LangGraph state + checkpointer, keyed by session_id
+# Memory: per-session message history, trimmed to a token budget
 # ---------------------------------------------------------------------
 #
-# Two layers, both persisted per session_id via a MemorySaver checkpointer
-# (swap for SqliteSaver/Postgres if this needs to survive a restart):
-#
-# 1. SHORT-TERM MEMORY -- state["messages"], accumulated automatically by
-#    the `add_messages` reducer. Previously each /api/chat call only sent
-#    [SystemMessage, HumanMessage(text)] with zero memory of earlier turns
-#    in the session; now the full conversation is kept in the checkpointer
-#    and a trimmed window (MAX_HISTORY_MESSAGES) is sent to the LLM each
-#    turn, so latency/cost stay flat as a session grows.
-#
-# 2. TASK-CONTEXT MEMORY -- state["current_task"], state["task_slots"],
-#    state["pending_tool"], state["pending_missing"]. This replaces the old
-#    global `_pending_actions` dict one-for-one for slot-filling (a
-#    create/update tool call missing a required field opens a flow that
-#    asks for each missing field across turns, exactly as before) and adds
-#    on top of it: `current_task` is a short label kept alive across turns
-#    of the SAME task and cleared only when a lightweight classifier
-#    decides the user has switched topics. ToolRAG retrieval is queried
-#    against "<task label>. <new message>" instead of the raw message
-#    alone, which keeps retrieval accurate on short follow-ups ("what's
-#    her phone number?") that wouldn't embed well on their own.
+# stream_agent_turn keeps a caller-owned `history` list per session (see
+# load_stream_history/save_stream_history below, backed by
+# stream_history.sqlite) and sends a trimmed window of it to the LLM each
+# turn via trim_messages(..., max_tokens=MAX_HISTORY_TOKENS), so
+# latency/cost stay flat as a session grows.
 MAX_HISTORY_TOKENS = 60000  # Approximated: 1 token ~= 4 chars
 
 def _approx_tokens(messages: list) -> int:
     return sum(len(str(m.content)) // 4 for m in messages)
 
-
-class ChatState(TypedDict):
-    messages: Annotated[list, add_messages]
-    summary: str           # Rolling memory summary
-    current_task: Optional[str]
-    task_slots: dict
-    pending_tool: Optional[str]
-    pending_missing: list  # ordered [(field, question), ...] still to collect
-    session_id: str        # thread id, passed through so nodes can attribute audit_log entries
-    user_id: Optional[str] # who prompted this turn, passed through for the same reason
-    
-    # Multi-Agent Workflow State
-    intent_category: Optional[str]
-    extracted_entities: dict
-    research_context: Optional[str]
-    erp_context: Optional[str]
-    proposal: Optional[str]
-
-
-# Values a model sometimes invents in place of a real answer when it
-# doesn't actually know one, instead of leaving the field blank so
-# slot-filling can ask. Treated as "still missing" so a required field
-# (e.g. company, warehouse) can't be silently satisfied by a guess.
-_PLACEHOLDER_VALUES = {
-    "default", "n/a", "na", "none", "null", "unknown",
-    "not specified", "not sure", "unspecified", "todo", "tbd", "-",
-}
-
-
-def _missing_fields(tool_name: str, args: dict) -> list:
-    """Ordered (field, question) pairs required for `tool_name` that are
-    absent, empty, or filled with a placeholder-like guess in `args`."""
-    required = ALL_REQUIRED_FIELDS.get(tool_name, [])
-    args = args or {}
-    missing = []
-    for field, question in required:
-        value = args.get(field)
-        if not value:
-            missing.append((field, question))
-        elif isinstance(value, str) and value.strip().lower() in _PLACEHOLDER_VALUES:
-            missing.append((field, question))
-    return missing
-
-
-def _last_human_message(messages) -> Optional[str]:
-    for m in reversed(messages):
-        if isinstance(m, HumanMessage):
-            return m.content
-    return None
-
-
-def _parse_json_loose(text: str) -> dict:
-    """Classifier replies sometimes get ```json-fenced despite instructions
-    not to -- strip that before parsing instead of failing outright."""
-    cleaned = (text or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:]
-    return json.loads(cleaned.strip())
 
 
 def _flatten_scalar(value):
@@ -773,19 +689,22 @@ async def upload_purchase_order_file(
 # =====================================================================
 # Separate from /api/upload-po above -- that endpoint's strict Purchase
 # Order JSON extraction / auto-create-in-ERPNext flow is untouched.
-# This lets a user upload any PDF/image and then just ask questions
-# about it in normal chat (/api/chat, /query); the extracted text is
-# stashed here per session_id and injected into the conversation once
-# by generate_reply() below.
+# This lets a user upload any PDF/image; the extracted text is stashed
+# here per session_id. NOTE: the code that used to inject this into the
+# conversation lived in generate_reply(), which has been removed along
+# with /api/chat and /query -- nothing currently re-surfaces this text
+# into the live /api/chat/stream or /ws/voice paths. Needs re-wiring if
+# "ask questions about an uploaded document" is still a required flow.
 document_store: Dict[str, Dict[str, Any]] = {}  # session_id -> {filename, text, injected}
 
 # session_id -> ERPIdentity: the real ERPNext user each chat session is
-# acting as, resolved via /api/session/identify. generate_reply() binds
-# this around the agent turn so every erp_data_tool call for that turn
-# runs with THAT PERSON'S OWN ERPNext credentials -- and is therefore
-# gated by Frappe's own, built-in role/permission engine -- instead of
-# the shared service account. A session with nothing here just keeps
-# using the shared service account, same as before this was wired up.
+# acting as, resolved via /api/session/identify. NOTE: binding this
+# around the agent turn (so every erp_data_tool call runs with THAT
+# PERSON'S OWN ERPNext credentials, gated by Frappe's own permission
+# engine) used to happen in generate_reply(), which has been removed.
+# It is not currently wired into /api/chat/stream or /ws/voice -- see
+# ARCHITECTURE.md P3 (identity wiring). Sessions with nothing here just
+# keep using the shared service account, same as before this was wired up.
 session_identities: Dict[str, ERPIdentity] = {}
 
 class SessionIdentifyRequest(BaseModel):
@@ -906,12 +825,140 @@ async def upload_general_document(
         raise HTTPException(status_code=500, detail=f"Failed to process uploaded file: {str(e)}")
 
 
+# ---------------------------------------------------------------------
+# Code-enforced write-approval gate (ARCHITECTURE.md P1)
+# ---------------------------------------------------------------------
+#
+# _execute_tool is the one choke point every tool call passes through
+# (see its docstring below), so it's also the right place to enforce
+# "no write reaches ERPNext without an explicit human 'yes'" in CODE
+# rather than as a prompt instruction the model might skip, misfire, or
+# reconstruct incorrectly. This replaces the ad-hoc, web_enriched-only,
+# model-trusted `approved=True` re-call pattern in
+# ERP_Unified/tools._run_create (still there, still harmless, but no
+# longer the only gate; see the note above `_is_write_call`).
+#
+# Mechanism, in two turns:
+#   Turn N   — the model calls a write tool. _execute_tool intercepts it,
+#              STASHES the exact (tool_name, args) it was about to run
+#              keyed by session_id, and returns a proposal string instead
+#              of touching ERPNext. The model relays that proposal to the
+#              user as the tool result; nothing has been written yet.
+#   Turn N+1 — stream_agent_turn() checks, before calling the LLM at all,
+#              whether this session has a pending proposal AND the new
+#              user message is an unambiguous "yes". If so it calls
+#              _execute_tool(bypass_gate=True) with the EXACT stashed
+#              args from turn N — not whatever the model might produce
+#              this turn — so approval always executes the reviewed
+#              payload, byte for byte. A clear "no" cancels it, also
+#              without any model involvement. Anything else (a
+#              correction, a new question) drops the stale proposal and
+#              falls through to normal handling, so an old approval can
+#              never be replayed against a payload the user never saw.
+#
+# One pending proposal per session_id: a second write call before the
+# first is resolved simply replaces it (the newer proposal is the one
+# still on the table).
+_PENDING_APPROVALS: dict[str, dict] = {}
+
+# Which tools are gated, and — for erp_data_tool specifically — which of
+# its `operation` values count as a write. list/get never touch this
+# gate; only create/update/submit do. erp_send_email is always gated
+# since every call sends real email.
+_GATED_WRITE_OPERATIONS = {
+    "create", "insert", "add", "new",       # CREATE_OPERATIONS
+    "update", "edit", "modify", "set",      # UPDATE_OPERATIONS
+    "submit",                               # SUBMIT_OPERATIONS
+}
+_ALWAYS_GATED_TOOLS = {"erp_send_email"}
+
+
+def _is_write_call(tool_name: str, args: dict) -> bool:
+    if tool_name in _ALWAYS_GATED_TOOLS:
+        return True
+    if tool_name == "erp_data_tool":
+        operation = str((args or {}).get("operation") or "").strip().lower()
+        return operation in _GATED_WRITE_OPERATIONS
+    return False
+
+
+def _describe_pending_action(tool_name: str, args: dict) -> str:
+    """Human-readable one/two-liner for the proposal message. Kept
+    separate from the raw stashed args so the exact payload that will
+    be executed on approval is never reconstructed from this text."""
+    args = args or {}
+    if tool_name == "erp_send_email":
+        recipients = args.get("recipients", "(no recipient given)")
+        subject = args.get("subject", "(no subject)")
+        return f"Send an email to {recipients} — subject: \"{subject}\""
+
+    if tool_name == "erp_data_tool":
+        operation = str(args.get("operation") or "").strip().lower()
+        doctype = args.get("doctype", "record")
+        if operation in ("submit",):
+            return f"Submit {doctype} '{args.get('name')}'"
+        if operation in ("update", "edit", "modify", "set"):
+            fields = ", ".join(
+                f"{k}={v}" for k, v in (args.get("data") or {}).items()
+            ) or "(no fields given)"
+            return f"Update {doctype} '{args.get('name')}' — set {fields}"
+        # create / insert / add / new
+        fields = ", ".join(
+            f"{k}={v}" for k, v in (args.get("data") or {}).items()
+        ) or "(no fields given)"
+        suffix = " and submit it" if args.get("submit") else ""
+        return f"Create a new {doctype}{suffix} — {fields}"
+
+    return f"Run {tool_name} with {args}"
+
+
+# An affirmative opener. The message must START with one of these.
+_YES_RE = re.compile(
+    r"^\s*(y|yes|yep|yeah|yup|ya|sure|ok|okay|confirm(?:ed)?|approved?|"
+    r"go ahead|do it|go for it|proceed|send it|create it|submit it|"
+    r"please do|sounds good|looks good|correct|affirmative)\b",
+    re.IGNORECASE,
+)
+_NO_RE = re.compile(
+    r"^\s*(no|nope|nah|cancel|don'?t|stop|abort|never ?mind)\b",
+    re.IGNORECASE,
+)
+# Words that turn an apparent "yes" into a correction / conditional, so
+# it must NOT count as consent even though it opens with an affirmative.
+_CORRECTION_RE = re.compile(
+    r"\b(but|however|wait|hold on|actually|instead|except|change|"
+    r"different|rather|update|remove|use|make it|first|before|"
+    r"only if|unless|not )\b|\?",
+    re.IGNORECASE,
+)
+
+
+def _is_write_approval(message: str) -> bool:
+    """True only for an unambiguous go-ahead. Accepts natural phrasings
+    ("yes", "yes create it", "sure go ahead", "ok do it") but rejects
+    anything carrying a correction or condition ("yes but change the
+    amount", "yes, use a different email") — those fall through to normal
+    handling so the stale proposal is dropped, never replayed against a
+    payload the user did not fully approve."""
+    text = (message or "").strip()
+    if not text or len(text.split()) > 10:
+        return False
+    if _CORRECTION_RE.search(text):
+        return False
+    return bool(_YES_RE.match(text))
+
+
+def _is_write_rejection(message: str) -> bool:
+    return bool(_NO_RE.match((message or "").strip()))
+
+
 async def _execute_tool(
     tool_name: str,
     args: dict,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
     prompt_text: Optional[str] = None,
+    bypass_gate: bool = False,
 ):
     """Async because MCP-sourced tools (ERP/mcp_server.py, loaded via
     ERP/tools/mcp_tools.py) only implement `.ainvoke()`, not the sync
@@ -924,7 +971,29 @@ async def _execute_tool(
     args, result, how long it took, and who prompted it) regardless of
     success — this is the one choke point all tool execution passes
     through, so it's the cheapest place to record "what actions did the
-    agent actually take" for later review."""
+    agent actually take" for later review.
+
+    `bypass_gate=True` is used ONLY by stream_agent_turn's deterministic
+    "yes" handler, to actually run a previously-approved, stashed
+    payload. Every other caller goes through the normal path below,
+    where a write call is intercepted and stashed instead of executed.
+    """
+    if not bypass_gate and session_id and _is_write_call(tool_name, args):
+        effective_args = _sanitize_tool_args(tool_name, args) or {}
+        if tool_name == "erp_data_tool":
+            effective_args = {**effective_args, "session_id": session_id}
+        _PENDING_APPROVALS[session_id] = {"tool_name": tool_name, "args": effective_args}
+        proposal = (
+            f"PROPOSED ACTION (not yet executed): {_describe_pending_action(tool_name, effective_args)}\n"
+            "Nothing has been written to the ERP yet. Ask the user to confirm "
+            "with a plain \"yes\" (or tell you what to change) before anything happens."
+        )
+        audit_log.log_turn(
+            session_id, "tool", proposal, tool_name=tool_name, tool_args=effective_args,
+            user_id=user_id, prompt_text=prompt_text, tool_status="awaiting_approval",
+        )
+        return proposal
+
     tool = tool_map.get(tool_name)
     if tool is None:
         result = f"Tool '{tool_name}' is not available."
@@ -946,9 +1015,12 @@ async def _execute_tool(
         if session_id:
             audit_log.log_turn(
                 session_id, "tool", str(result), tool_name=tool_name, tool_args=effective_args,
-                user_id=user_id, prompt_text=prompt_text, tool_status="success",
+                user_id=user_id, prompt_text=prompt_text,
+                tool_status="approved_executed" if bypass_gate else "success",
                 duration_ms=elapsed(),
             )
+        if bypass_gate and session_id:
+            _PENDING_APPROVALS.pop(session_id, None)
         return result
     except PermissionError as e:
         # Raised by erp_client when a bound per-user ERPIdentity (see
@@ -963,6 +1035,8 @@ async def _execute_tool(
                 user_id=user_id, prompt_text=prompt_text, tool_status="permission_denied",
                 error_message=str(e),
             )
+            if bypass_gate:
+                _PENDING_APPROVALS.pop(session_id, None)
         return failure
     except Exception as e:
         logger.exception("Tool '%s' failed", tool_name)
@@ -973,6 +1047,8 @@ async def _execute_tool(
                 user_id=user_id, prompt_text=prompt_text, tool_status="error",
                 error_message=str(e),
             )
+            if bypass_gate:
+                _PENDING_APPROVALS.pop(session_id, None)
         return failure
 
 
@@ -1075,18 +1151,77 @@ async def _stream_full_reply(call_messages, tools=None):
 
 
 async def stream_agent_turn(text, session_id=None, user_id=None, history=None, task_context=None):
-    """Streaming twin of agent_node/generate_reply for the realtime voice
-    WS path. Keeps its own `history` list (caller-owned, per-connection)
-    instead of the LangGraph checkpointer, so the existing text-chat graph
-    and its slot-filling flow are untouched. Yields token/tool_call/
-    tool_result/done event dicts in call order.
-    
+    """The live agent loop for both /api/chat/stream (text) and /ws/voice
+    (voice). Keeps its own `history` list (caller-owned, per-connection),
+    backed by the bare AsyncSqliteSaver on stream_history.sqlite (see
+    load_stream_history/save_stream_history below) rather than a
+    LangGraph-compiled graph. Yields token/tool_call/tool_result/done
+    event dicts in call order.
+
     IMPORTANT: We track start_len so callers can extract only the NEW messages
-    added this turn (the delta) for saving. The checkpointer uses add_messages
-    which appends — so saving the full list would duplicate every message.
+    added this turn (the delta) for saving, since load/save_stream_history
+    append rather than overwrite.
     """
     history = history if history is not None else []
     start_len = len(history)  # snapshot before we mutate
+
+    # --- code-enforced write-approval gate: resolve a pending proposal
+    # from the PREVIOUS turn before the LLM ever sees this message. See
+    # the block above _execute_tool for the full mechanism. ---
+    pending = _PENDING_APPROVALS.get(session_id) if session_id else None
+    if pending and _is_write_approval(text):
+        history.append(HumanMessage(content=text))
+        yield {"type": "tool_call", "name": pending["tool_name"], "args": pending["args"]}
+        result = await _execute_tool(
+            pending["tool_name"], pending["args"],
+            session_id=session_id, user_id=user_id, prompt_text=text,
+            bypass_gate=True,
+        )
+        yield {"type": "tool_result", "name": pending["tool_name"], "result": result}
+        # Let the model phrase the confirmation naturally from the real
+        # result, but the write itself already happened above, exactly
+        # against the stashed payload -- this call cannot cause a second
+        # write, it only produces prose.
+        summary_messages = [
+            SystemMessage(content=assistant.llm.system_prompt),
+            HumanMessage(
+                content=(
+                    f"The user approved the pending action and it has now been executed. "
+                    f"Tool result: {result}\nReply with a brief confirmation of what was done "
+                    f"(or, if the result shows a failure, say so plainly). Do not call any tools."
+                )
+            ),
+        ]
+        content = ""
+        async for event in _stream_full_reply(summary_messages, tools=None):
+            if event["type"] == "token":
+                yield {"type": "token", "text": event["text"]}
+            else:
+                content = event["content"]
+        history.append(AIMessage(content=content))
+        yield {"type": "done", "text": content, "_delta": history[start_len:]}
+        return
+
+    if pending and _is_write_rejection(text):
+        _PENDING_APPROVALS.pop(session_id, None)
+        history.append(HumanMessage(content=text))
+        cancel_text = "Okay, I've cancelled that — nothing was changed."
+        history.append(AIMessage(content=cancel_text))
+        audit_log.log_turn(session_id, "tool", cancel_text, tool_name=pending["tool_name"],
+                            tool_args=pending["args"], user_id=user_id, prompt_text=text,
+                            tool_status="rejected")
+        yield {"type": "done", "text": cancel_text, "_delta": history[start_len:]}
+        return
+
+    if pending:
+        # Neither a clean "yes" nor a clean "no" -- e.g. a correction
+        # ("change the amount to 500") or an unrelated new message. The
+        # stale proposal must not be executable by a later stray "yes",
+        # so drop it and fall through to normal handling; if the user
+        # still wants the action, the model will call the tool again
+        # (with corrected args, if any) and a fresh proposal is stashed.
+        _PENDING_APPROVALS.pop(session_id, None)
+
     history.append(HumanMessage(content=text))
     # Trim for LLM context window — this is a separate list, does NOT affect history
     trimmed = trim_messages(history, max_tokens=MAX_HISTORY_TOKENS, token_counter=_approx_tokens, strategy="last", include_system=False)
@@ -1176,154 +1311,6 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                             for _ in range(tool_msg_count + 1):
                                 history.pop()
         raise
-
-
-_FAKE_NAME_RE = re.compile(r'"name"\s*:\s*"(?P<name>[a-zA-Z_][\w\-.]*)"')
-_FAKE_KV_STR_RE = re.compile(r'"(?P<key>[a-zA-Z_]\w*)"\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"')
-_FAKE_KV_NUM_RE = re.compile(r'"(?P<key>[a-zA-Z_]\w*)"\s*:\s*(?P<value>-?\d+(?:\.\d+)?)\b')
-
-
-def _extract_fake_tool_call(content: str):
-    """Some local models via Ollama (llama3.2 and similar) occasionally
-    reply with a plain-text approximation of a tool call instead of using
-    the real function-calling protocol, e.g.:
-        {"name":"create_customer","parameters={"lead_id":"","customer_name":"Sujay"}}
-    This is often broken well beyond a single typo — note the missing
-    colon/closing quote around "parameters" above, which means the
-    "parameters" value isn't even a validly nested object, so a strict
-    brace-matching parse won't survive it either. Rather than trying to
-    fully parse the structure, this pulls out the tool name, then scrapes
-    any "key":"value" or "key":123 pairs found anywhere after it — good
-    enough to recover the user's actual intent from what is essentially
-    a hallucinated shape. Returns None if `content` doesn't look like an
-    attempted tool call, or names a tool that doesn't exist.
-    """
-    text = (content or "").strip()
-    if not text.startswith("{") or '"name"' not in text or "parameters" not in text.lower():
-        return None
-
-    name_match = _FAKE_NAME_RE.search(text)
-    if not name_match:
-        return None
-
-    name = name_match.group("name")
-    if name not in tool_map:
-        return None
-
-    # Only look at text after "parameters" so we don't re-capture "name"
-    # itself as if it were an argument.
-    params_idx = text.lower().find("parameters")
-    tail = text[params_idx:] if params_idx != -1 else text
-
-    args = {}
-    for m in _FAKE_KV_STR_RE.finditer(tail):
-        args.setdefault(m.group("key"), m.group("value"))
-    for m in _FAKE_KV_NUM_RE.finditer(tail):
-        key = m.group("key")
-        if key in args:
-            continue
-        value = m.group("value")
-        args[key] = float(value) if "." in value else int(value)
-
-    if not args:
-        return None
-
-    return {"name": name, "args": args, "id": "fake-tool-call-0"}
-
-
-_CLASSIFY_SYSTEM = (
-    "You track whether a new user message continues the SAME task as before, "
-    "or starts a NEW, unrelated task, for an ERP sales assistant.\n"
-    "Reply with ONLY a compact JSON object, nothing else: "
-    '{"same_task": true|false, "task_label": "<3-6 word label for the CURRENT task after this message>"}\n'
-    "Rules:\n"
-    "- A follow-up about the same record/order/lead/customer, or the user "
-    "supplying info the assistant just asked for, is the SAME task.\n"
-    "- A greeting, thanks, or closing remark right after a task is finished "
-    "does NOT start a new task; keep same_task=true with the same label.\n"
-    "- A request about a different customer/record/action/topic is a NEW task."
-)
-
-
-def intake_node(state: ChatState) -> dict:
-    """If a slot-filling flow is open (pending_tool set), this turn's
-    message is the answer to the next missing field — merge it in and
-    either ask the next question or hand off to execute_pending once the
-    record is complete. Otherwise, no-op and fall through to classify_task."""
-    pending_tool = state.get("pending_tool")
-    pending_missing = state.get("pending_missing") or []
-    if not pending_tool or not pending_missing:
-        return {}
-
-    last_user_msg = _last_human_message(state["messages"]) or ""
-    field, _question = pending_missing[0]
-    parser = ALL_FIELD_PARSERS.get((pending_tool, field))
-    value = parser(last_user_msg) if parser else last_user_msg.strip()
-
-    slots = {**(state.get("task_slots") or {}), field: value}
-    remaining = pending_missing[1:]
-
-    if remaining:
-        return {
-            "task_slots": slots,
-            "pending_missing": remaining,
-            "messages": [AIMessage(content=remaining[0][1])],
-        }
-
-    # All required fields collected -- clear the queue so the router sends
-    # this to execute_pending. pending_tool/task_slots stay set until the
-    # tool call actually runs (execute_pending clears them after).
-    return {"task_slots": slots, "pending_missing": []}
-
-
-def _route_after_intake(state: ChatState) -> str:
-    if state.get("pending_tool"):
-        return END if state.get("pending_missing") else "execute_pending"
-    return "classify_task"
-
-
-def classify_task_node(state: ChatState) -> dict:
-    """Task-context memory: keeps `current_task` alive across turns of the
-    same task, and only resets it when the topic genuinely changes."""
-    last_user_msg = _last_human_message(state["messages"])
-    if last_user_msg is None:
-        return {}
-
-    current_task = state.get("current_task")
-    if current_task is None:
-        return {"current_task": last_user_msg[:60]}
-
-    prompt = f"Active task: {current_task}\nNew user message: {last_user_msg}"
-    try:
-        resp = assistant.llm.model.invoke(
-            [SystemMessage(content=_CLASSIFY_SYSTEM), HumanMessage(content=prompt)]
-        )
-        parsed = _parse_json_loose(resp.content)
-        same_task = bool(parsed.get("same_task"))
-        task_label = parsed.get("task_label") or current_task
-    except Exception as exc:  # noqa: BLE001
-        # Fail safe toward continuity rather than losing progress over a
-        # transient classification error.
-        logger.warning("Task classification failed (%s); assuming same task.", exc)
-        same_task, task_label = True, current_task
-
-    return {"current_task": task_label}
-
-
-def _plain_reply(history, task_context: Optional[str] = None) -> str:
-    """Used when no ERP tool is needed for this turn (plain chat, or
-    Q&A about an uploaded document). Unlike text_chain.invoke(), which
-    only ever sees the single latest message, this sends the full
-    trimmed history -- including any injected '[System note: the user
-    uploaded a document...]' context from generate_reply() -- so a
-    follow-up like 'solve problem 3 from that PDF' actually has the
-    document content available instead of being answered blind."""
-    system_parts = [assistant.llm.system_prompt, f"Current date: {datetime.now().astimezone():%Y-%m-%d}."]
-    if task_context:
-        system_parts.append(f"\nCurrent task in progress: {task_context}.")
-    call_messages = [SystemMessage(content="\n".join(system_parts)), *history]
-    response = assistant.llm.model.invoke(call_messages)
-    return response.content
 
 
 def _is_unqualified_approval(message: str) -> bool:
@@ -1463,388 +1450,6 @@ def _build_fallback_chart(results: list, query_lower: str) -> Optional[str]:
     return None
 
 
-
-# --- 1. Summarize Node (Rolling Memory) ---
-def summarize_node(state: ChatState) -> dict:
-    messages = state.get("messages", [])
-    summary = state.get("summary", "")
-    
-    # If messages exceed threshold
-    if len(messages) > 10:
-        # Keep last 4 messages, summarize the rest
-        to_summarize = messages[:-4]
-        
-        prompt = (
-            f"Summarize the following conversation history. "
-            f"Include any important entities, facts, or context.\n"
-            f"Previous Summary: {summary}\n"
-            f"New Messages: {to_summarize}"
-        )
-        new_summary_msg = assistant.llm.model.invoke(prompt)
-        new_summary = new_summary_msg.content
-        
-        # Remove old messages from state
-        delete_messages = [RemoveMessage(id=m.id) for m in to_summarize if getattr(m, 'id', None)]
-        return {"summary": new_summary, "messages": delete_messages}
-    return {}
-
-# --- 2. Supervisor Node ---
-from pydantic import BaseModel
-class IntentOutput(BaseModel):
-    category: Literal["chitchat", "erp_query", "erp_write", "web_search"]
-    record_type: Optional[str]
-    entities: Dict[str, str]
-
-def supervisor_node(state: ChatState) -> dict:
-    last_user_msg = _last_human_message(state["messages"]) or ""
-    summary = state.get("summary", "")
-    
-    context_msg = f"Context: {summary}\n" if summary else ""
-    
-    from LLM.LLM import INTENT_SYSTEM_PROMPT
-    llm_intent = assistant.llm.model.with_structured_output(IntentOutput)
-    
-    intent = llm_intent.invoke([
-        SystemMessage(content=INTENT_SYSTEM_PROMPT),
-        HumanMessage(content=context_msg + last_user_msg)
-    ])
-    
-    logger.info("Intent classified: category=%s, entities=%s", intent.category, intent.entities)
-    
-    return {
-        "intent_category": intent.category,
-        "extracted_entities": intent.entities
-    }
-
-def route_from_supervisor(state: ChatState) -> str:
-    cat = state.get("intent_category")
-    if cat in ("erp_write", "web_search"):
-        return "web_research_node"
-    else:
-        return "general_node"
-
-# --- 3. Web Research Node ---
-async def web_research_node(state: ChatState) -> dict:
-    from LLM.LLM import RESEARCH_SYSTEM_PROMPT
-    entities = state.get("extracted_entities", {})
-    last_user_msg = _last_human_message(state["messages"]) or ""
-    
-    web_tools = [t for t in ALL_TOOLS if t.name in ("web_search", "web_company_lookup", "web_fetch_page")]
-    search_llm = assistant.llm.model.bind_tools(web_tools)
-    
-    call_messages = [
-        SystemMessage(content=RESEARCH_SYSTEM_PROMPT), 
-        HumanMessage(content=f"Research these entities: {entities}. Original request: {last_user_msg}")
-    ]
-    
-    for _ in range(2):
-        response = search_llm.invoke(call_messages)
-        if not response.tool_calls:
-            break
-            
-        call_messages.append(response)
-        for tc in response.tool_calls:
-            result = await _execute_tool(
-                tc["name"], tc.get("args") or {},
-                session_id=state.get("session_id"), user_id=state.get("user_id"),
-                prompt_text=last_user_msg
-            )
-            call_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-            
-    final_response = search_llm.invoke(call_messages)
-    
-    if state.get("intent_category") == "web_search":
-        return {"messages": [AIMessage(content=final_response.content)], "research_context": final_response.content}
-    return {"research_context": final_response.content}
-
-def route_after_research(state: ChatState) -> str:
-    if state.get("intent_category") == "web_search":
-        return END
-    return "erp_context_node"
-
-# --- 4. ERP Context Node ---
-async def erp_context_node(state: ChatState) -> dict:
-    entities = state.get("extracted_entities", {})
-    if not entities:
-        return {"erp_context": "No entities to lookup"}
-        
-    erp_tools = [t for t in ALL_TOOLS if t.name in ("erp_data_tool", "erp_describe_fields")]
-    context_llm = assistant.llm.model.bind_tools(erp_tools)
-    
-    prompt = (
-        "You are an internal ERP Researcher. Query the ERP system to gather context. "
-        "For example, if creating a Task assigned to a person, find their Employee ID. "
-        f"Entities: {entities}\n"
-        "Return a summary of what you found."
-    )
-    
-    call_messages = [SystemMessage(content=prompt), HumanMessage(content="Gather internal ERP context.")]
-    response = context_llm.invoke(call_messages)
-    
-    if response.tool_calls:
-        call_messages.append(response)
-        for tc in response.tool_calls:
-            result = await _execute_tool(
-                tc["name"], tc.get("args") or {},
-                session_id=state.get("session_id"), user_id=state.get("user_id")
-            )
-            call_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-        final = context_llm.invoke(call_messages)
-        return {"erp_context": final.content}
-    return {"erp_context": response.content}
-
-# --- 5. Proposal Node ---
-def proposal_node(state: ChatState) -> dict:
-    from LLM.LLM import PROPOSAL_SYSTEM_PROMPT
-    entities = state.get("extracted_entities", {})
-    research = state.get("research_context", "")
-    erp_ctx = state.get("erp_context", "")
-    
-    prop_msgs = [
-        SystemMessage(content=PROPOSAL_SYSTEM_PROMPT),
-        HumanMessage(content=f"Entities: {entities}\nWeb Research: {research}\nERP Context: {erp_ctx}")
-    ]
-    prop_response = assistant.llm.model.invoke(prop_msgs)
-    
-    doctype = entities.get("record_type", "Lead")
-    args = {"operation": "create", "doctype": doctype, "approved": True}
-    if "person" in entities: args["lead_name"] = entities["person"]
-    if "company" in entities: args["company_name"] = entities["company"]
-    if doctype == "Task" and "project" in entities: args["project"] = entities["project"]
-    
-    return {
-        "pending_tool": "erp_data_tool",
-        "task_slots": args,
-        "pending_missing": [("approval", prop_response.content)],
-        "messages": [AIMessage(content=prop_response.content)]
-    }
-
-# --- 6. General Node (Fallback / Chitchat / ERP Query) ---
-from langchain_core.messages import trim_messages
-async def general_node(state: ChatState) -> dict:
-    last_user_msg = _last_human_message(state["messages"]) or ""
-    task_context = state.get("current_task")
-    
-    history = trim_messages(
-        state["messages"],
-        max_tokens=MAX_HISTORY_TOKENS,
-        token_counter=_approx_tokens,
-        strategy="last",
-        include_system=False,
-        start_on="human"
-    )
-    
-    if not tool_rag:
-        reply = _plain_reply(history, task_context)
-        return {"messages": [AIMessage(content=reply)]}
-        
-    candidate_tools = list(ALL_TOOLS) if len(ALL_TOOLS) <= TOOL_RAG_BYPASS_THRESHOLD else tool_rag.retrieve(last_user_msg)
-    
-    intent_cat = state.get("intent_category")
-    if intent_cat in ("chitchat", "erp_query"):
-        _WEB = {"web_search", "web_fetch_page", "web_crawl", "web_company_lookup"}
-        candidate_tools = [t for t in candidate_tools if t.name not in _WEB]
-        
-    llm_with_tools = assistant.llm.model.bind_tools(candidate_tools)
-    import datetime
-    current_date_str = datetime.date.today().strftime("%Y-%m-%d")
-    system_parts = [
-        assistant.llm.system_prompt,
-        f"\nCURRENT SYSTEM DATE: {current_date_str}",
-        "\nSENIOR ERP EXPERT & BUSINESS INTELLIGENCE DIRECTIVE:",
-        "- You are an expert ERP Analyst. Automatically generate charts for tabular data without asking.",
-        "- ALWAYS retrieve records using erp_data_tool before charting.",
-        "- PROACTIVE PROPOSALS: When the user describes a business scenario (e.g., building a dashboard), proactively extract details into structured fields (Project, Objective, Technology), present a formatted proposal, and ask 'Should I create this Project?'. Do NOT call the tool during the proposal.",
-        "- FAST-TRACK CREATION: When the user confirms your proposal, you MUST call erp_data_tool with the extracted data and set `approved=True` to create it immediately without a second review."
-    ]
-    if task_context:
-        system_parts.append(f"\nCurrent task in progress: {task_context}.")
-        
-    call_messages = [SystemMessage(content="\n".join(system_parts)), *history]
-    
-    response = llm_with_tools.invoke(call_messages)
-    if not response.tool_calls:
-        # Check for fake tool calls
-        recovered = _extract_fake_tool_call(response.content)
-        if not recovered:
-            return {"messages": [response]}
-        response.tool_calls = [recovered]
-        
-    call_messages.append(response)
-    results = []
-    
-    for tool_call in response.tool_calls:
-        tool_name = tool_call["name"]
-        if tool_name in ALL_REQUIRED_FIELDS:
-            args = _sanitize_tool_args(tool_name, tool_call.get("args") or {})
-            missing = _missing_fields(tool_name, args)
-            if missing:
-                return {
-                    "current_task": task_context or f"{tool_name} for {last_user_msg[:40]}",
-                    "pending_tool": tool_name,
-                    "task_slots": args,
-                    "pending_missing": missing,
-                    "messages": [AIMessage(content=missing[0][1])],
-                }
-    
-    for tool_call in response.tool_calls:
-        result = await _execute_tool(
-            tool_call["name"], tool_call.get("args") or {},
-            session_id=state.get("session_id"), user_id=state.get("user_id"), prompt_text=last_user_msg
-        )
-        results.append((tool_call, result))
-        call_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
-        
-    final_response = llm_with_tools.invoke(call_messages)
-    return {"messages": [final_response]}
-
-# --- 7. Graph Definition ---
-async def execute_pending_node(state: ChatState) -> dict:
-    """Runs the write tool once every required field has been collected
-    across turns, then clears the slot-filling state (current_task is
-    kept, so a follow-up like 'thanks' still resolves against it)."""
-    tool_name = state["pending_tool"]
-    args = state.get("task_slots") or {}
-
-    result = await _execute_tool(
-        tool_name, args, session_id=state.get("session_id"),
-        user_id=state.get("user_id"),
-        prompt_text=_last_human_message(state["messages"]),
-    )
-    logger.info("Tool '%s' raw result: %s", tool_name, result)
-
-    summary_prompt = (
-        f"The '{tool_name}' tool was just called with {args} and returned: {result}\n"
-        "Give the user a short, professional confirmation (1-2 sentences)."
-    )
-    summary = text_chain.invoke({"input": summary_prompt})
-
-    return {
-        "messages": [AIMessage(content=summary)],
-        "pending_tool": None,
-        "task_slots": {},
-        "pending_missing": [],
-    }
-
-def build_agent_graph(checkpointer=None, use_platform_persistence=False):
-    graph = StateGraph(ChatState)
-    graph.add_node("intake", intake_node)
-    graph.add_node("classify_task", classify_task_node)
-    
-    graph.add_node("summarize_node", summarize_node)
-    graph.add_node("supervisor_node", supervisor_node)
-    graph.add_node("web_research_node", web_research_node)
-    graph.add_node("erp_context_node", erp_context_node)
-    graph.add_node("proposal_node", proposal_node)
-    graph.add_node("general_node", general_node)
-    
-    graph.add_node("execute_pending", execute_pending_node)
-
-    graph.set_entry_point("intake")
-    
-    def route_intake(state):
-        if state.get("pending_missing"):
-            return "execute_pending"
-        return "classify_task"
-        
-    graph.add_conditional_edges("intake", route_intake, {"execute_pending": "execute_pending", "classify_task": "classify_task"})
-    graph.add_edge("classify_task", "summarize_node")
-    graph.add_edge("summarize_node", "supervisor_node")
-    
-    graph.add_conditional_edges("supervisor_node", route_from_supervisor, {"web_research_node": "web_research_node", "general_node": "general_node"})
-    
-    graph.add_conditional_edges("web_research_node", route_after_research, {END: END, "erp_context_node": "erp_context_node"})
-    graph.add_edge("erp_context_node", "proposal_node")
-    
-    graph.add_edge("proposal_node", END)
-    graph.add_edge("general_node", END)
-    graph.add_edge("execute_pending", END)
-
-    if use_platform_persistence:
-        return graph.compile()
-        
-    if checkpointer is None:
-        from langgraph.checkpoint.memory import MemorySaver
-        checkpointer = MemorySaver()
-        
-    return graph.compile(checkpointer=checkpointer)
-
-agent_graph = build_agent_graph()  # defaults to MemorySaver until lifespan overrides it
-
-
-def build_studio_graph():
-    """Entry point for langgraph.json / Studio only."""
-    return build_agent_graph(use_platform_persistence=True)
-
-
-async def generate_reply(text: str, session_id: str = "default", user_id: Optional[str] = None) -> str:
-    """Returns the assistant's reply text for a user message.
-
-    `session_id` is a LangGraph checkpointer thread_id: it carries the
-    full conversation (short-term memory) and the current task label /
-    any open slot-filling flow (task-context memory) across calls, in
-    place of the old global `_pending_actions` dict.
-
-    `user_id` identifies who prompted this turn -- pass it from your
-    auth layer once you have one; defaults to "anonymous" so logging
-    still works without auth wired up yet.
-
-    Separately, every user message, assistant reply, and tool action for
-    this session is written to `audit_log` (Postgres, durable across
-    restarts), including how long each step took and who prompted it --
-    see /api/audit/sessions below.
-    """
-    user_id = user_id or "anonymous"
-    audit_log.log_turn(session_id, "user", text, user_id=user_id, prompt_text=text)
-
-    initial_messages = [HumanMessage(content=text)]
-
-    doc = document_store.get(session_id)
-    if doc and not doc["injected"]:
-        # Fires once, on the first chat turn after an /api/upload-document
-        # call for this session -- after that it stays in the LangGraph
-        # checkpointer's message history like any other turn, so it isn't
-        # re-sent (and re-billed) on every subsequent message.
-        doc_context = (
-            f"[System note: the user uploaded a document named "
-            f"'{doc['filename']}'. Its full extracted content is below -- "
-            f"use it to answer any questions they ask about it.]\n\n"
-            f"{doc['text'][:40000]}"
-        )
-        initial_messages = [SystemMessage(content=doc_context)] + initial_messages
-        doc["injected"] = True
-
-    config = {
-        "configurable": {"thread_id": session_id},
-        # Purely for LangSmith trace organization -- harmless no-op when
-        # tracing is disabled. Lets you filter/search runs by session in
-        # the LangSmith UI instead of scrolling through everything.
-        "run_name": "magma-agent-turn",
-        "tags": [f"session:{session_id}"],
-        "metadata": {"session_id": session_id},
-    }
-    # Bind this session's real ERPNext identity (if one was set via
-    # /api/session/identify) for the duration of the turn -- every
-    # erp_data_tool call made anywhere in the graph below will run with
-    # that person's own ERPNext credentials, so Frappe's own permission
-    # engine enforces exactly what they're allowed to do. Sessions with
-    # no identity bound behave exactly as before (shared service
-    # account, no per-user RBAC).
-    identity = session_identities.get(session_id)
-    with audit_log.time_tool_call() as elapsed:
-        with use_identity(identity):
-            result = await agent_graph.ainvoke(
-                {"messages": initial_messages, "session_id": session_id, "user_id": user_id},
-                config,
-            )
-    reply = result["messages"][-1].content
-
-    audit_log.log_turn(
-        session_id, "assistant", reply, user_id=user_id, prompt_text=text,
-        duration_ms=elapsed(),
-    )
-    return reply
-
 def _get_tts_audio(text: str):
     """Synthesizes `text` to a WAV file and returns its raw bytes, or None
     if synthesis failed. Mirrors the old Flask backend's TTS step."""
@@ -1915,33 +1520,6 @@ class ChatRequest(BaseModel):
     session_id: str = "default"
     user_id: Optional[str] = None  # who's asking -- pass from auth/frontend once available
     sid: Optional[str] = None      # Frappe session cookie (sid) for per-user RBAC
-
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
-    """Restored old-style JSON contract: { message } in, { reply, audio } out.
-    `session_id` is optional and only matters if you want independent
-    slot-filling conversations for multiple users; a single local user can
-    ignore it and let it default."""
-
-    text = (req.message or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="message is required")
-
-    try:
-        reply = await generate_reply(text, req.session_id, user_id=req.user_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Agent failed to process message: %s", text)
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    audio_b64 = None
-    try:
-        wav_bytes = _get_tts_audio(reply)
-        if wav_bytes:
-            audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-    except Exception:
-        logger.exception("TTS step failed; returning text-only reply")
-
-    return {"reply": reply, "audio": audio_b64}
 
 import copy
 from datetime import datetime, timezone
@@ -2043,65 +1621,6 @@ async def chat_stream(req: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
-
-@app.post("/query")
-async def handle_query(
-    query: str = Form(None),
-
-    file: UploadFile = File(None),
-    session_id: str = Form("default"),
-    user_id: str = Form("anonymous"),
-
-):
-    """Exposes endpoint to query MagmaAssistance using either text or audio files."""
-    if not query and not file:
-        raise HTTPException(status_code=400, detail="Either 'query' (text) or 'file' (audio) must be provided.")
-
-    query_text = ""
-
-    # 1. Handle Audio input (STT using Whisper)
-    if file:
-        temp_dir = "temp"
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_file_path = os.path.join(temp_dir, file.filename)
-        try:
-            with open(temp_file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            logger.info(f"Saved uploaded audio file to {temp_file_path}")
-            
-            # Transcribe audio file to text
-            query_text = assistant.whisper.transcribe_file(temp_file_path)
-            logger.info(f"Transcribed Audio Text: {query_text}")
-        except Exception as e:
-            logger.error(f"Error handling uploaded file: {e}")
-            raise HTTPException(status_code=500, detail=f"Error transcribing audio file: {e}")
-        finally:
-            # Clean up temp file
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-    else:
-        query_text = query
-
-    # 2. Get response from MagmaAssistance agent
-    logger.info(f"Processing query: '{query_text}'")
-    response_text = await generate_reply(query_text, session_id, user_id=user_id)
-
-    # 3. Synthesize the reply to speech too, same as /api/chat, so the
-    # frontend has something to play regardless of which endpoint it uses.
-    audio_b64 = None
-    try:
-        wav_bytes = _get_tts_audio(response_text)
-        if wav_bytes:
-            audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-    except Exception:
-        logger.exception("TTS step failed; returning text-only reply")
-
-    return {
-        "query": query_text,
-        "response": response_text,
-        "audio": audio_b64,
-
-    }
 
 @app.get("/api/audit/sessions")
 def list_audit_sessions(since: str = None, limit: int = 100):
