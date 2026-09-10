@@ -159,7 +159,7 @@ If P4 mixes these, the multi-site migration is painful; if clean, it's a small c
 ### Other decisions
 
 - **Realtime/WebRTC voice** — not a product goal for now. Browser Web Speech (free, current)
-  is enough. The WebRTC path was removed in P2; can return later if needed.
+  is enough. The WebRTC path is slated for deletion in P2 (not done yet); can return later if needed.
 - **Multi-agent workflow** — settled: single streaming agent + code-enforced write gate
   (both shipped in P1). Manufacturing multi-step planner = backlog.
 
@@ -206,12 +206,13 @@ If P4 mixes these, the multi-site migration is painful; if clean, it's a small c
 - [ ] Clean `.env` / `.env.example` / `requirements.txt`
 - [ ] Re-run smoke tests
 
-**P3 — Identity wiring** *(~1–1.5 wk, parallel with P1)* — **needs a real local Frappe** (`CONTRIBUTING.md §6`)
-- [ ] Frontend sends the Frappe user identity on every request (session cookie / header / token)
-- [ ] Backend resolves it on `/api/chat/stream` and `/ws/voice`; wrap `use_identity()` around the turn
-- [ ] Lock CORS to the frontend origin
-- [ ] Test: different Frappe users → permissions actually enforced
-- [ ] Frontend branch `feature/identity-wiring` cut from `main` (not `dev/local` — that only holds the local `API_BASE_URL` tweak)
+**P3 — Identity wiring** — **done + merged (2026-09-10, `d24d5f9`)**
+- [x] Backend resolves identity on `/api/chat/stream` and `/ws/voice`; `use_identity()` wraps the turn
+- [x] `/api/session/identify` accepts API key/secret **or** a Frappe session cookie (`sid`); `sid` also accepted inline on the chat request
+- [x] Roles resolved via `custom_ui.api.auth.me`, falling back to stock `User` doctype
+- [x] CORS: default stays permissive (`*`, no credentials); strict allowlist + credentialed CORS only when `ALLOWED_ORIGINS` env is set
+- [ ] **Prod deploy gate:** set `ALLOWED_ORIGINS` in EC2 `.env` before P3 reaches `beta` (`CONTRIBUTING.md §6`)
+- [ ] **Not yet end-to-end:** browser `sid`-cookie flow needs frontend `credentials:'include'` + Frappe cookie domain `.tjdem.online`; the API key/secret path works today
 
 **P4 — Capability gating (single-site now, multi-site-ready)** *(~2–3 wk, after P3)*
 Tenancy is decided (see §4): **single ERPNext site now**, customers = `Company` records;
@@ -273,7 +274,7 @@ could silently break.
 `db/postgres_audit_log.py` — handled in P2 (audit → SQLite). `MagnaCLI.py` — dev tool.
 
 ### Rough timeline
-P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · P2 ~60% (MCP / unused tools / dead deps merged; audit→SQLite in progress) · P3 identity wiring in review · **order: P2-audit → P3 → P5 → P4** (P5 splits `server.py` etc. so P4's tenant/gating code lands in clean modules; P5 has no P4 dependency)
+P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · P2 ~60% (MCP / unused tools / dead deps merged; audit→SQLite + WebRTC delete + `_build_fallback_chart`/`_is_unqualified_approval` still pending) · **P3 done + merged (2026-09-10, `d24d5f9`)** · **order: P2-audit → P5 → P4** (P5 splits `server.py` etc. so P4's tenant/gating code lands in clean modules; P5 has no P4 dependency)
 
 ---
 
