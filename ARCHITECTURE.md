@@ -136,11 +136,32 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 | Capability gating (HR customer → only HR tools + doctypes) | None. Everyone gets the full toolset + manufacturing prompt. |
 | Write-approval gate enforced in code | Only a prompt instruction + a half-built `_PENDING_CREATES` for web-enriched creates. |
 
-**Open decisions (product owner):**
-1. Tenancy: separate Frappe site per customer, or one site with company segregation?
-2. Realtime/WebRTC voice — product goal, or is browser Web Speech (free, current) enough?
-   *(Current lean: Web Speech is enough; WebRTC path is removed in P2, can return later.)*
-3. Multi-agent workflow — settled: single streaming agent + code-enforced write gate. Manufacturing planner = backlog.
+### Tenancy model — DECIDED (2026-09, with management)
+
+**Target state (when sold as SaaS):** one Frappe **site + database per customer** —
+`acme.magnaerp.com` / `acme_db`, `beta.magnaerp.com` / `beta_db`, etc. One shared
+bench (code) hosts many sites. Physical data isolation; blast radius = one customer;
+per-customer upgrades. Cost is infra (RAM/disk grows with sites) + ops (N sites to
+back up / patch / monitor).
+
+**For now (current phase):** **single site, customers = ERPNext `Company` records.**
+No new infra. Isolation is logical (ERPNext multi-company + permissions), not physical.
+Acceptable for pilot / few trusted customers; revisit before arm's-length SaaS sales.
+
+**What this means for P4 — build the capability layer once, portable to both:**
+Keep two concerns strictly separate in code:
+1. **"Which ERP to connect to"** — one isolated function (`get_erp_client(tenant)`).
+   Today: always the single site. Later: look up the customer's site URL + creds. One place changes.
+2. **"What can this customer do"** — module list → tool filter → doctype allow-list →
+   prompt trim → pre-execution reject. **Identical logic for single-site and multi-site.**
+If P4 mixes these, the multi-site migration is painful; if clean, it's a small change.
+
+### Other decisions
+
+- **Realtime/WebRTC voice** — not a product goal for now. Browser Web Speech (free, current)
+  is enough. The WebRTC path was removed in P2; can return later if needed.
+- **Multi-agent workflow** — settled: single streaming agent + code-enforced write gate
+  (both shipped in P1). Manufacturing multi-step planner = backlog.
 
 ---
 
@@ -192,17 +213,43 @@ Goal: *AI operates across the whole ERP while respecting tenant / product / RBAC
 - [ ] Test: different Frappe users → permissions actually enforced
 - [ ] Frontend branch `feature/identity-wiring` cut from `main` (not `dev/local` — that only holds the local `API_BASE_URL` tweak)
 
-**P4 — Tenancy + capability gating** *(~2–3 wk, after P3 + decision #1)*
-- [ ] Per-tenant ERP routing
-- [ ] Filter tools + doctypes by the customer's purchased modules (`get_user_allowed_modules`)
-- [ ] Pre-execution permission check in `_execute_tool`
-- [ ] Trim the system prompt per tenant
+**P4 — Capability gating (single-site now, multi-site-ready)** *(~2–3 wk, after P3)*
+Tenancy is decided (see §4): **single ERPNext site now**, customers = `Company` records;
+**one site + DB per customer** is the SaaS target. Build so the switch is a small change.
+
+*Tenant resolution + capability model:*
+- [ ] `tenant_of(user)` — resolve the request's tenant (the user's ERPNext `Company`
+      now; a customer id later). One function, one source of truth.
+- [ ] Tenant registry: `tenant → [purchased modules]` (a table in the audit DB or a
+      config file; hot-reloadable, no redeploy to onboard a customer).
+- [ ] `modules_for(tenant)` → `allowed_doctypes(tenant)` via a static
+      `module → [doctypes]` map (HR → Employee, Leave Application, Attendance…;
+      Manufacturing → Work Order, BOM, Job Card…). Built once, not per customer.
+
+*Enforcement (all keyed off `allowed_doctypes`):*
+- [ ] Pre-execution check in `_execute_tool` — reject `erp_data_tool` / `erp_send_email`
+      calls whose `doctype` isn't in the tenant's allowed set, with a plain message
+      ("Manufacturing isn't in your plan"). Runs before the gate/execution.
+- [ ] Tool filter — don't bind tools a tenant can't use (mostly relevant for the
+      dashboard/web tools; `erp_data_tool` is generic so the doctype check is the real gate).
+- [ ] System-prompt trim — strip the module sections (manufacturing pipeline, etc.)
+      the tenant didn't buy, so the agent doesn't offer things it can't do.
+- [ ] Scope reads — every `erp_data_tool` list/get filtered to the user's `Company`
+      (single-site); no-op once each customer has their own site.
+
+*Kept isolated for the multi-site switch:*
+- [ ] `get_erp_client(tenant)` — the ONLY place that decides which ERP URL + creds to
+      use. Today: always the single site. Later: look up `tenant.site_url`. Nothing
+      else in P4 knows about sites.
+
+*Reuse:* `custom_ui/api/auth.py: get_user_allowed_modules()` and
+`custom_ui/api/metadata.py` (field-level permission projection) already exist for this.
 
 **P5 — Split `server.py`** *(~3 days, low priority, after P1+P2)*
 - [ ] Carve 2,100-line `server.py` into `agent.py` / `routes_*.py` / `llm_client.py` — pure refactor
 
 ### Rough timeline
-P0 mostly done (backups + `smoke.py` + team brief remain) · Weeks 1–2: P1 + P3 (parallel), P2 follows P1's first commit · Weeks 3–6: P4 · P5 low priority after P1+P2
+P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · P2 ~60% (MCP / unused tools / dead deps merged; audit→SQLite in progress) · P3 identity wiring in review · P4 starts after P3 · P5 low priority after P2
 
 ---
 
