@@ -191,6 +191,21 @@ skipped `bench use`; `403` = wrong key/secret or the user lacks `Customer` permi
 - If the prod EC2 is back up, `ai.tjdem.online` works and you may not need the
   local backend at all for frontend-only changes.
 
+### CORS — prod deploy note
+
+The server allows all origins (`*`, no credentials) unless `ALLOWED_ORIGINS`
+is set. That's fine for local dev and keeps existing deploys working. Before
+P3 (identity/RBAC) ships to `beta`, prod `.env` on EC2 must set:
+
+```
+ALLOWED_ORIGINS=https://magnaerp.tjdem.online,https://ai.tjdem.online
+```
+
+(the real frontend + backend origins — confirm the exact list). Setting it
+also enables credentialed CORS, which the browser session-cookie flow needs.
+Until it's set, prod stays on `*` and the `sid` flow falls back to the shared
+service account.
+
 ---
 
 ## 7. What NOT to do
