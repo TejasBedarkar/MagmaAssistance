@@ -47,7 +47,16 @@ BEGIN
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'tool_status') THEN
-        CREATE TYPE tool_status AS ENUM ('success', 'error', 'not_found');
+        CREATE TYPE tool_status AS ENUM (
+            'success', 'error', 'not_found',
+            'permission_denied', 'awaiting_approval', 'approved_executed', 'rejected'
+        );
+    ELSE
+        -- Type already exists (older DB): add any values it's missing.
+        ALTER TYPE tool_status ADD VALUE IF NOT EXISTS 'permission_denied';
+        ALTER TYPE tool_status ADD VALUE IF NOT EXISTS 'awaiting_approval';
+        ALTER TYPE tool_status ADD VALUE IF NOT EXISTS 'approved_executed';
+        ALTER TYPE tool_status ADD VALUE IF NOT EXISTS 'rejected';
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'upload_kind') THEN
