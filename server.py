@@ -976,25 +976,40 @@ def _describe_pending_action(tool_name: str, args: dict) -> str:
     return f"Run {tool_name} with {args}"
 
 
+# An affirmative opener. The message must START with one of these.
 _YES_RE = re.compile(
-    r"^\s*(yes|yep|yeah|yup|confirm(?:ed)?|approve[d]?|go ahead|do it|"
-    r"proceed|sounds good|ok(?:ay)?(?:,)?\s*(do it|go ahead|proceed)?|"
-    r"send it|create it|submit it)\s*[.!]?\s*$",
+    r"^\s*(y|yes|yep|yeah|yup|ya|sure|ok|okay|confirm(?:ed)?|approved?|"
+    r"go ahead|do it|go for it|proceed|send it|create it|submit it|"
+    r"please do|sounds good|looks good|correct|affirmative)\b",
     re.IGNORECASE,
 )
 _NO_RE = re.compile(
     r"^\s*(no|nope|nah|cancel|don'?t|stop|abort|never ?mind)\b",
     re.IGNORECASE,
 )
+# Words that turn an apparent "yes" into a correction / conditional, so
+# it must NOT count as consent even though it opens with an affirmative.
+_CORRECTION_RE = re.compile(
+    r"\b(but|however|wait|hold on|actually|instead|except|change|"
+    r"different|rather|update|remove|use|make it|first|before|"
+    r"only if|unless|not )\b|\?",
+    re.IGNORECASE,
+)
 
 
 def _is_write_approval(message: str) -> bool:
-    """Unambiguous 'yes' only. A correction that happens to start with
-    an affirmative word ("yes but change the amount to 500") must NOT
-    match — the regex is anchored end-to-end (`$`) so any trailing
-    content beyond a short stock phrase falls through to `else` in the
-    caller instead of being treated as consent."""
-    return bool(_YES_RE.match((message or "").strip()))
+    """True only for an unambiguous go-ahead. Accepts natural phrasings
+    ("yes", "yes create it", "sure go ahead", "ok do it") but rejects
+    anything carrying a correction or condition ("yes but change the
+    amount", "yes, use a different email") — those fall through to normal
+    handling so the stale proposal is dropped, never replayed against a
+    payload the user did not fully approve."""
+    text = (message or "").strip()
+    if not text or len(text.split()) > 10:
+        return False
+    if _CORRECTION_RE.search(text):
+        return False
+    return bool(_YES_RE.match(text))
 
 
 def _is_write_rejection(message: str) -> bool:
