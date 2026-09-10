@@ -280,14 +280,19 @@ class ERPClient:
 
         roles = []
         try:
-            user_url = f"{self.base_url}/api/resource/User/{user}"
-            user_response = requests.get(
-                user_url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS,
-                params={"fields": json.dumps(["roles"])},
-            )
-            if user_response.ok:
-                role_rows = user_response.json().get("data", {}).get("roles", []) or []
-                roles = [r.get("role") for r in role_rows if r.get("role")]
+            me_url = f"{self.base_url}/api/method/custom_ui.api.auth.me"
+            me_resp = requests.get(me_url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS)
+            if me_resp.ok:
+                roles = me_resp.json().get("message", {}).get("user", {}).get("roles", []) or []
+            else:
+                user_url = f"{self.base_url}/api/resource/User/{user}"
+                user_response = requests.get(
+                    user_url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS,
+                    params={"fields": json.dumps(["roles"])},
+                )
+                if user_response.ok:
+                    role_rows = user_response.json().get("data", {}).get("roles", []) or []
+                    roles = [r.get("role") for r in role_rows if r.get("role")]
         except Exception:
             logging.exception("Could not fetch roles for Frappe session user '%s'", user)
 
