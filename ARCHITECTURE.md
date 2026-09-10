@@ -245,11 +245,35 @@ Tenancy is decided (see §4): **single ERPNext site now**, customers = `Company`
 *Reuse:* `custom_ui/api/auth.py: get_user_allowed_modules()` and
 `custom_ui/api/metadata.py` (field-level permission projection) already exist for this.
 
-**P5 — Split `server.py`** *(~3 days, low priority, after P1+P2)*
-- [ ] Carve 2,100-line `server.py` into `agent.py` / `routes_*.py` / `llm_client.py` — pure refactor
+**P5 — Split oversized files** *(~3–4 days, after P2-audit + P3 merge, before P4)*
+Pure refactor, no behaviour change. Run the full smoke suite after **each** module
+extracted, not just at the end. First add smoke checks for the write-approval flow
+(propose → "yes" → executes) and an audit-row assertion — those are what a refactor
+could silently break.
+
+- [ ] **`server.py` (~1,650 lines)** — the one that must be done. Carve into e.g.
+      `agent.py` (`stream_agent_turn`, the loop, the write-gate), `routes_chat.py`,
+      `routes_voice.py`, `routes_upload.py`, `llm_client.py` (`OpenAIChatModel`),
+      `state.py` (module-level `assistant` / `tool_map` / `_PENDING_APPROVALS` /
+      `session_identities` / `document_store` / `_checkpoint_conn`), `history.py`
+      (`load/save_stream_history`). Watch for circular imports and import-time init order.
+- [ ] **`LLM/LLM.py` (~670 lines)** — clean 3-way split: `LLM/prompts.py` (the prompt
+      constants), `LLM/client.py` (the `LLM` class), `LLM/vision.py` (all the OCR /
+      PO-extraction methods — ~300 lines, fully independent). Drop `run_cli()` or move
+      it to `scripts/`.
+
+*Optional, only if the person has spare time — each is one cohesive domain, not urgent:*
+- [ ] `web/web_tool.py` (~680) — split the HTML-scraping helpers from the `@tool` defs.
+- [ ] `ERP_Unified/tools.py` (~640) — extract `_prepare_write_data` / `_resolve_link_value` /
+      `_normalize_filters` into `ERP_Unified/validation.py`. **Core code — touch carefully.**
+- [ ] `ERP/tools/project_onboarding_tools.py` (~660) — extract the helpers from the
+      `onboard_new_lead` workflow.
+
+*Leave alone:* `ERP/erp_client.py` (~580) — one cohesive class, long is fine.
+`db/postgres_audit_log.py` — handled in P2 (audit → SQLite). `MagnaCLI.py` — dev tool.
 
 ### Rough timeline
-P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · P2 ~60% (MCP / unused tools / dead deps merged; audit→SQLite in progress) · P3 identity wiring in review · P4 starts after P3 · P5 low priority after P2
+P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · P2 ~60% (MCP / unused tools / dead deps merged; audit→SQLite in progress) · P3 identity wiring in review · **order: P2-audit → P3 → P5 → P4** (P5 splits `server.py` etc. so P4's tenant/gating code lands in clean modules; P5 has no P4 dependency)
 
 ---
 
