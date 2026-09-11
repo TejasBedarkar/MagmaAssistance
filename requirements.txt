@@ -57,5 +57,4 @@ playsound==1.2.2
 ddgs
 beautifulsoup4
 lxml
-psycopg2-binary
 boto3
