@@ -264,11 +264,10 @@ could silently break.
       `scripts/run_llm_cli.py`. Re-exports preserved on `LLM/LLM.py` and `LLM/__init__.py`.
 
 *Optional, only if the person has spare time — each is one cohesive domain, not urgent:*
-- [ ] `web/web_tool.py` (~680) — split the HTML-scraping helpers from the `@tool` defs.
-- [ ] `ERP_Unified/tools.py` (~640) — extract `_prepare_write_data` / `_resolve_link_value` /
-      `_normalize_filters` into `ERP_Unified/validation.py`. **Core code — touch carefully.**
-- [ ] `ERP/tools/project_onboarding_tools.py` (~660) — extract the helpers from the
-      onboard_new_lead workflow.
+- [x] `web/web_tool.py` (~680 → ~390) — split HTML-scraping helpers into `web/scraper.py`. Re-exports preserved on `web/web_tool.py`.
+- [x] `ERP_Unified/tools.py` (~640 → ~420) — extracted `_prepare_write_data` / `_resolve_link_value` /
+      `_normalize_filters` / `_is_valid_email` / `_with_warnings` into `ERP_Unified/validation.py`. Smoke-tested with LLM. Re-exports preserved.
+- [x] `ERP/tools/project_onboarding_tools.py` (~660 → ~470) — extracted helpers into `ERP/tools/project_onboarding_helpers.py`. Re-exports preserved.
 
 *Leave alone:* `ERP/erp_client.py` (~580) — one cohesive class, long is fine.
 `db/postgres_audit_log.py` — handled in P2 (audit → SQLite). `MagnaCLI.py` — dev tool.
