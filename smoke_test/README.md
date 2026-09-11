@@ -61,11 +61,10 @@ run's output against a run from before your change.
   confirmed by grepping for `pandas`/`openpyxl`/`python-docx` (no hits).
   `test_file_reading.py` includes a `rejects_csv` check specifically so
   you'll know if that ever silently changes.
-- **Audit endpoints require Postgres.** `server.py` imports
-  `db.postgres_audit_log`, not the SQLite-based root `audit_log.py`.
-  If Postgres isn't configured locally, `test_audit.py` will FAIL with
-  500s -- that's the known P2 gap ("Audit -> SQLite"), not a bug in
-  this suite.
+- **Audit endpoints are SQLite-backed.** `server.py` imports
+  `db.postgres_audit_log`, which is now a sqlite3 module (module name
+  kept for import compatibility) -- no Postgres, no `PG*` env vars.
+  `test_audit.py` failing here is a real bug, not a missing-database gap.
 - **Write-path ERP tools** (create/update/submit) are not smoke-tested
   here at all, on purpose -- there's no write-approval gate yet (that's
   a P1 checklist item). Add a separate, explicitly-named,

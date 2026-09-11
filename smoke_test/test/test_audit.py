@@ -6,13 +6,10 @@ it (so there's a real transcript to fetch); falls back to "default"
 otherwise, in which case a 404 on the single-session lookup is a PASS,
 not a FAIL -- it just means no turn has been logged under that id yet.
 
-NOTE: as of this writing, server.py imports
-`db.postgres_audit_log as audit_log`, which requires a live Postgres
-connection (PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE). If Postgres
-isn't configured, every check here will FAIL with 500 -- that is a
-known, documented gap (ARCHITECTURE.md P2: "Audit -> SQLite"), not a
-P1 regression. Confirm Postgres is actually up before treating a
-failure here as a real bug.
+NOTE: server.py imports `db.postgres_audit_log as audit_log`, which is
+now SQLite-backed (ARCHITECTURE.md P2 "Audit -> SQLite" is done) and
+needs no external database or PG* env vars -- a failure here is a real
+bug, not a missing-Postgres environment issue.
 """
 
 import json
