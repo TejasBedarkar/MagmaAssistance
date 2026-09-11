@@ -199,18 +199,20 @@ If P4 mixes these, the multi-site migration is painful; if clean, it's a small c
 - [ ] Re-point or retire `MagnaCLI.py`
 - [ ] Re-run smoke tests
 
-**P2 — Dead code removal** *(~4 days, after P1's first commit)*
-- [ ] Verify `ocr_po_tool.py` is kept (`/api/upload-po`)
-- [ ] Delete MCP files, remaining unregistered `ERP/tools/*`, WebRTC voice path, LiveKit, `_build_fallback_chart`, `_is_unqualified_approval`
-- [ ] **Audit → SQLite:** rewrite `db/postgres_audit_log.py` on `sqlite3` (reuse `audit_log.py` root as the base; keep the same public function names so `server.py` call sites don't change). Add the newer functions it needs: `time_tool_call`, `record_file_upload`, `tool_stats`. Delete `db/schema.sql`, `db/init_db.py`, `psycopg2-binary`, all `PG*` env vars, `long_term_memory` + `token_details`. Delete the orphan root `audit_log.py` once harvested.
-- [ ] Clean `.env` / `.env.example` / `requirements.txt`
-- [ ] Re-run smoke tests
+**P2 — Dead code removal** *(~4 days, after P1's first commit)* — **mostly done, one item left**
+- [x] `ocr_po_tool.py` kept (`/api/upload-po`)
+- [x] Deleted MCP files, remaining unregistered `ERP/tools/*`, LiveKit, `_build_fallback_chart`, `_is_unqualified_approval`
+- [x] **Audit → SQLite:** `db/postgres_audit_log.py` rewritten on `sqlite3` (module name kept so `server.py`'s import didn't need to change). Deleted `db/schema.sql`, `db/init_db.py`, `psycopg2-binary`, all `PG*` env vars, `long_term_memory` + `token_details`, and the orphan root `audit_log.py`.
+- [x] Cleaned `.env.example` / `requirements.txt`
+- [ ] **WebRTC voice path still present** — `Voice/openai_stt.py`, `openai_tts.py`, `voice_session_manager.py`, `voice_routes.py`, `/api/voice/*` routes in `server.py`. Not done yet.
+- [x] Re-run smoke tests — 14 passed / 0 failed / 1 skipped on every P2 merge
 
-**P3 — Identity wiring** — **done + merged (2026-09-10, `d24d5f9`)**
+**P3 — Identity wiring** — **done + merged (2026-09-10, `d24d5f9`; CSRF follow-up merged 2026-09-11, `f2bb60d`)**
 - [x] Backend resolves identity on `/api/chat/stream` and `/ws/voice`; `use_identity()` wraps the turn
 - [x] `/api/session/identify` accepts API key/secret **or** a Frappe session cookie (`sid`); `sid` also accepted inline on the chat request
 - [x] Roles resolved via `custom_ui.api.auth.me`, falling back to stock `User` doctype
-- [x] CORS: default stays permissive (`*`, no credentials); strict allowlist + credentialed CORS only when `ALLOWED_ORIGINS` env is set
+- [x] CORS: default stays permissive (`*`, no credentials); strict allowlist + credentialed CORS + a local/devtunnel `allow_origin_regex` only when `ALLOWED_ORIGINS` env is set
+- [x] **CSRF:** writes made under a session cookie now carry `X-Frappe-CSRF-Token` (`_auth_headers`, `call_method_post`, `create_doc`, `update_doc`); `ERPIdentity.csrf_token` resolved from `custom_ui.api.auth.me` or sent explicitly by the frontend. A stateless cookie jar on the shared `ERPClient.session` stops a resolved user's `Set-Cookie` from leaking into the next service-account call.
 - [ ] **Prod deploy gate:** set `ALLOWED_ORIGINS` in EC2 `.env` before P3 reaches `beta` (`CONTRIBUTING.md §6`)
 - [ ] **Not yet end-to-end:** browser `sid`-cookie flow needs frontend `credentials:'include'` + Frappe cookie domain `.tjdem.online`; the API key/secret path works today
 
@@ -274,7 +276,7 @@ could silently break.
 `db/postgres_audit_log.py` — handled in P2 (audit → SQLite). `MagnaCLI.py` — dev tool.
 
 ### Rough timeline
-P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · P2 ~60% (MCP / unused tools / dead deps merged; audit→SQLite + WebRTC delete + `_build_fallback_chart`/`_is_unqualified_approval` still pending) · **P3 done + merged (2026-09-10, `d24d5f9`)** · **order: P2-audit → P5 → P4** (P5 splits `server.py` etc. so P4's tenant/gating code lands in clean modules; P5 has no P4 dependency)
+P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · **P2 done except WebRTC voice deletion** (2026-09-11) — MCP/unused tools/dead deps/audit→SQLite all merged · **P3 done + merged (2026-09-10, `d24d5f9`; CSRF follow-up `f2bb60d`)** · **order: WebRTC delete → P5 → P4**
 
 ---
 
