@@ -199,12 +199,12 @@ If P4 mixes these, the multi-site migration is painful; if clean, it's a small c
 - [ ] Re-point or retire `MagnaCLI.py`
 - [ ] Re-run smoke tests
 
-**P2 — Dead code removal** *(~4 days, after P1's first commit)* — **mostly done, one item left**
+**P2 — Dead code removal** — **done (2026-09-11)**
 - [x] `ocr_po_tool.py` kept (`/api/upload-po`)
 - [x] Deleted MCP files, remaining unregistered `ERP/tools/*`, LiveKit, `_build_fallback_chart`, `_is_unqualified_approval`
 - [x] **Audit → SQLite:** `db/postgres_audit_log.py` rewritten on `sqlite3` (module name kept so `server.py`'s import didn't need to change). Deleted `db/schema.sql`, `db/init_db.py`, `psycopg2-binary`, all `PG*` env vars, `long_term_memory` + `token_details`, and the orphan root `audit_log.py`.
 - [x] Cleaned `.env.example` / `requirements.txt`
-- [ ] **WebRTC voice path still present** — `Voice/openai_stt.py`, `openai_tts.py`, `voice_session_manager.py`, `voice_routes.py`, `/api/voice/*` routes in `server.py`. Not done yet.
+- [x] **WebRTC voice path deleted (2026-09-11, `d2852e9`)** — `Voice/openai_stt.py`, `openai_tts.py`, `voice_session_manager.py`, `voice_routes.py`, the `/api/voice/*` route mount in `server.py`. It had no caller: the frontend hook that would call it (`useVoiceSession.js`) was imported in `AssistantPortal.jsx` but never invoked — deleted on the `erp_theme` side too (`chore/delete-unused-voice-session-hook`, along with the similarly-unused `AudioCapture.js`), not yet merged since `main` is frozen. Live voice stays on `Voice/ws_voice.py`'s `/ws/voice` websocket, untouched.
 - [x] Re-run smoke tests — 14 passed / 0 failed / 1 skipped on every P2 merge
 
 **P3 — Identity wiring** — **done + merged (2026-09-10, `d24d5f9`; CSRF follow-up merged 2026-09-11, `f2bb60d`)**
@@ -276,7 +276,7 @@ could silently break.
 `db/postgres_audit_log.py` — handled in P2 (audit → SQLite). `MagnaCLI.py` — dev tool.
 
 ### Rough timeline
-P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · **P2 done except WebRTC voice deletion** (2026-09-11) — MCP/unused tools/dead deps/audit→SQLite all merged · **P3 done + merged (2026-09-10, `d24d5f9`; CSRF follow-up `f2bb60d`)** · **order: WebRTC delete → P5 → P4**
+P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · **P2 done (2026-09-11, `d2852e9`)** — MCP/unused tools/dead deps/audit→SQLite/WebRTC voice all merged · **P3 done + merged (2026-09-10, `d24d5f9`; CSRF follow-up `f2bb60d`)** · **order: P5 → P4**
 
 ---
 
