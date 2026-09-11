@@ -35,6 +35,12 @@ def _second_turn_remembers(client: Client, session_id: str) -> TestResult:
 
 
 def run(client: Client, ctx: dict) -> list[TestResult]:
+    if ctx.get("skip_llm"):
+        return [
+            TestResult("chat.first_turn", False, skipped=True, detail="skipped -- --skip-llm"),
+            TestResult("chat.memory_persists_across_turns", False, skipped=True, detail="skipped -- --skip-llm"),
+        ]
+
     session_id = f"smoke-chat-{uuid.uuid4().hex[:8]}"
     ctx["chat_session_id"] = session_id
 
