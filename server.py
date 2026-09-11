@@ -432,22 +432,32 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
 
 # Allow CORS requests from frontend.
-# Default stays permissive ("*", no credentials) so existing deployments
-# keep working untouched -- the current per-user identity flow passes `sid`
-# in the request body, not as a cookie, so credentialed CORS isn't needed
-# yet. Set ALLOWED_ORIGINS (comma-separated) to lock this down and enable
-# credentialed requests once the browser starts sending the session cookie.
+# If ALLOWED_ORIGINS is explicitly configured, use it. Otherwise, provide sensible
+# dev defaults (localhost, 127.0.0.1, magna.local, and configured ERP_URL) with
+# allow_origin_regex and allow_credentials=True so browsers sending credentials: 'include'
+# or custom session headers from Frappe Desk are never blocked by CORS.
 _cors_origins_env = os.environ.get("ALLOWED_ORIGINS")
 if _cors_origins_env:
     ALLOWED_ORIGINS = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
     ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
 else:
-    ALLOWED_ORIGINS = ["*"]
-    ALLOW_CREDENTIALS = False
+    erp_origin = os.environ.get("ERP_URL", "").rstrip("/")
+    ALLOWED_ORIGINS = [
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8001",
+        "http://127.0.0.1:8001",
+        "http://magna.local:8000",
+        "http://magna.local:8001",
+    ]
+    if erp_origin and erp_origin not in ALLOWED_ORIGINS:
+        ALLOWED_ORIGINS.append(erp_origin)
+    ALLOW_CREDENTIALS = True
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|.*\.local)(:\d+)?|https://.*\.devtunnels\.ms",
     allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
