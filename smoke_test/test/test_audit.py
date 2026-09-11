@@ -25,16 +25,22 @@ def _list_sessions(client: Client) -> TestResult:
     return TestResult("audit.list_sessions", ok, str(body)[:200])
 
 
-def _get_transcript(client: Client, session_id: str) -> TestResult:
+def _get_transcript(client: Client, session_id: str, expect_logged: bool = False) -> TestResult:
     try:
         resp = client.get(f"/api/audit/sessions/{session_id}")
         body = json.loads(resp.read())
+        transcript = body.get("transcript", [])
         ok = resp.status == 200 and "transcript" in body
-        return TestResult("audit.get_transcript", ok, str(body)[:200])
+        if ok and expect_logged:
+            ok = len(transcript) > 0
+            detail = f"found {len(transcript)} logged audit entries for {session_id}"
+        else:
+            detail = str(body)[:200]
+        return TestResult("audit.get_transcript", ok, detail)
     except ClientError as exc:
         # a 404 is expected/acceptable if no turn has been logged for
         # this session_id yet -- only non-404 is a real failure
-        ok = "404" in str(exc)
+        ok = not expect_logged and ("404" in str(exc))
         return TestResult("audit.get_transcript", ok, f"{exc} (404 acceptable if session has no logged turns)")
 
 
@@ -45,9 +51,10 @@ def _export(client: Client, session_id: str) -> TestResult:
 
 
 def run(client: Client, ctx: dict) -> list[TestResult]:
+    has_chat_session = bool(ctx.get("chat_session_id"))
     session_id = ctx.get("chat_session_id", "default")
     return [
         timed("audit.list_sessions", _list_sessions, client),
-        timed("audit.get_transcript", _get_transcript, client, session_id),
+        timed("audit.get_transcript", _get_transcript, client, session_id, has_chat_session),
         timed("audit.export", _export, client, session_id),
     ]
