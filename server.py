@@ -107,6 +107,11 @@ else:
     ALLOWED_ORIGINS = ["*"]
     ALLOW_CREDENTIALS = False
     ALLOW_ORIGIN_REGEX = None
+    logger.warning(
+        "ALLOWED_ORIGINS is not set -- CORS is wide open (any website can call "
+        "this API from its own JS). Fine for local dev; before real users touch "
+        "this, set ALLOWED_ORIGINS in .env to the real frontend/backend origins."
+    )
 
 app.add_middleware(
     CORSMiddleware,
