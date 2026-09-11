@@ -293,14 +293,34 @@ _OPERATOR_MAP = {
 }
 
 
-def _normalize_filters(filters: Optional[list]) -> Optional[list]:
+def _normalize_filters(filters: Optional[list | dict]) -> Optional[list]:
     """Convert natural language comparison operators ('greater than', 'greaterthan', 'less than')
-    to standard SQL/Frappe comparison operators ('>', '<', '>=', etc.)."""
+    to standard SQL/Frappe comparison operators ('>', '<', '>=', etc.). Also handles
+    lists of single-key filter dicts or a top-level dict produced by LLMs."""
     if not filters:
         return filters
     normalized = []
-    for f in filters:
-        if isinstance(f, (list, tuple)) and len(f) >= 3:
+    items = filters.items() if isinstance(filters, dict) else filters
+    for f in items:
+        if isinstance(f, tuple) and len(f) == 2 and isinstance(f[0], str):
+            k, v = f
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                key = str(v[0]).lower().replace(" ", "").replace("_", "").replace("-", "")
+                normalized.append([k, _OPERATOR_MAP.get(key, str(v[0])), v[1]])
+            elif isinstance(v, (list, tuple)) and len(v) >= 3:
+                normalized.append(list(v))
+            else:
+                normalized.append([k, "=", v])
+        elif isinstance(f, dict):
+            for k, v in f.items():
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    key = str(v[0]).lower().replace(" ", "").replace("_", "").replace("-", "")
+                    normalized.append([k, _OPERATOR_MAP.get(key, str(v[0])), v[1]])
+                elif isinstance(v, (list, tuple)) and len(v) >= 3:
+                    normalized.append(list(v))
+                else:
+                    normalized.append([k, "=", v])
+        elif isinstance(f, (list, tuple)) and len(f) >= 3:
             field, raw_op, val = f[0], str(f[1]), f[2]
             key = raw_op.lower().replace(" ", "").replace("_", "").replace("-", "")
             clean_op = _OPERATOR_MAP.get(key, raw_op)

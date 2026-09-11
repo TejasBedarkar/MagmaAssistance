@@ -710,6 +710,7 @@ class SessionIdentifyRequest(BaseModel):
     erp_api_secret: Optional[str] = None
     sid: Optional[str] = None
     user_id: Optional[str] = None
+    csrf_token: Optional[str] = None
 
 
 @app.post("/api/session/identify")
@@ -720,7 +721,9 @@ async def identify_session(req: SessionIdentifyRequest):
         if req.erp_api_key and req.erp_api_secret:
             identity = erp_client.resolve_identity(req.erp_api_key, req.erp_api_secret)
         elif req.sid:
-            identity = erp_client.resolve_session_identity(req.sid, user_id=req.user_id)
+            identity = erp_client.resolve_session_identity(
+                req.sid, user_id=req.user_id, csrf_token=req.csrf_token
+            )
         else:
             raise HTTPException(status_code=400, detail="Either erp_api_key/secret or sid must be provided.")
     except PermissionError as e:
@@ -750,6 +753,8 @@ async def upload_general_document(
     file: UploadFile = File(...),
     session_id: str = Form("default"),
     user_id: str = Form("anonymous"),
+    sid: Optional[str] = Form(None),
+    csrf_token: Optional[str] = Form(None),
 ):
     """Reads ANY PDF or image (not just Purchase Orders), extracts its
     full text, and stores it against session_id so the user can ask
@@ -757,6 +762,14 @@ async def upload_general_document(
     behavior as /api/upload-po -- storing the original file is skipped
     when S3 isn't configured, so this works for local testing with no
     AWS credentials set."""
+    if sid and session_id not in session_identities:
+        try:
+            session_identities[session_id] = erp_client.resolve_session_identity(
+                sid, user_id=user_id, csrf_token=csrf_token
+            )
+        except Exception as exc:
+            logger.warning("Could not resolve session identity on upload for %s: %s", session_id, exc)
+
     allowed_types = ["image/jpeg", "image/png", "application/pdf", "image/jpg"]
 
     if file.content_type.lower() not in allowed_types:
@@ -1517,6 +1530,7 @@ class ChatRequest(BaseModel):
     session_id: str = "default"
     user_id: Optional[str] = None  # who's asking -- pass from auth/frontend once available
     sid: Optional[str] = None      # Frappe session cookie (sid) for per-user RBAC
+    csrf_token: Optional[str] = None  # Frappe CSRF token for per-user session writes
 
 import copy
 from datetime import datetime, timezone
@@ -1578,10 +1592,14 @@ async def chat_stream(req: ChatRequest):
     identity = session_identities.get(req.session_id)
     if not identity and req.sid:
         try:
-            identity = erp_client.resolve_session_identity(req.sid, user_id=req.user_id)
+            identity = erp_client.resolve_session_identity(
+                req.sid, user_id=req.user_id, csrf_token=req.csrf_token
+            )
             session_identities[req.session_id] = identity
         except Exception as exc:
             logger.warning("Could not resolve session identity for %s: %s", req.session_id, exc)
+    elif identity and req.csrf_token and not getattr(identity, "csrf_token", None):
+        identity.csrf_token = req.csrf_token
 
     history = await load_stream_history(req.session_id)
     start_len = len(history)  # snapshot before the turn mutates history
@@ -1606,7 +1624,10 @@ async def chat_stream(req: ChatRequest):
             # Save ONLY the new messages from this turn (delta), not the full history
             delta = history[start_len:]
             if delta:
-                safe_create_task(save_stream_history(req.session_id, delta))
+                try:
+                    await save_stream_history(req.session_id, delta)
+                except Exception as save_err:
+                    logger.warning("Could not save stream history for %s: %s", req.session_id, save_err)
             
         yield "data: [DONE]\n\n"
 
