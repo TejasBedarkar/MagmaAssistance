@@ -447,12 +447,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount the WebRTC voice router
-from Voice.voice_routes import voice_router
-app.include_router(voice_router)
-
-
-
 # ---------------------------------------------------------------------
 # Memory: per-session message history, trimmed to a token budget
 # ---------------------------------------------------------------------
@@ -1532,12 +1526,9 @@ def export_audit_json(session_id: str = None):
 from Voice.ws_voice import register_voice_ws
 register_voice_ws(app, stream_agent_turn, assistant.tts, logger, load_stream_history, save_stream_history)
 
-# Expose shared state on app.state so voice_routes.py can access it
-# without circular imports. Attached after everything is defined.
+# Shared with Voice/ws_voice.py so it can look up an identity bound via
+# /api/session/identify without a circular import.
 app.state.session_identities = session_identities
-app.state.all_tools_list = ALL_TOOLS
-app.state.execute_tool_fn = _execute_tool
-app.state.load_stream_history_fn = load_stream_history
 
 
 @app.get("/api/health")
