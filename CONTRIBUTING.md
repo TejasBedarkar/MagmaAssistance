@@ -109,8 +109,11 @@ fixes
 ## 5. Before you push — checklist
 
 - [ ] `python server.py` boots cleanly (P1/P2 — no Frappe needed; see §6)
-- [ ] Smoke check (§6) passes: `tool_call` → `tool_result` → `done`, no traceback.
-      Compare the event shape before vs after your change. (`smoke.py` once it exists.)
+- [ ] `smoke_test/smoke_test.py --port 8050` passes. **While iterating, use
+      `--skip-llm`** (structural checks only, no OpenAI calls, runs in under a
+      second) so all hitting the same shared rate limit on every
+      save. Run it **without** `--skip-llm` once, right before you push — that
+      full run is what actually has to pass.
 - [ ] `git status` clean except your intended changes
 - [ ] No secrets, no `.env`, no `*.sqlite`, no `venv/`, no `ERP/models/` in the diff
 - [ ] Commit messages follow §3
