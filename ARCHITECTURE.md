@@ -213,8 +213,8 @@ If P4 mixes these, the multi-site migration is painful; if clean, it's a small c
 - [x] Roles resolved via `custom_ui.api.auth.me`, falling back to stock `User` doctype
 - [x] CORS: default stays permissive (`*`, no credentials); strict allowlist + credentialed CORS + a local/devtunnel `allow_origin_regex` only when `ALLOWED_ORIGINS` env is set
 - [x] **CSRF:** writes made under a session cookie now carry `X-Frappe-CSRF-Token` (`_auth_headers`, `call_method_post`, `create_doc`, `update_doc`); `ERPIdentity.csrf_token` resolved from `custom_ui.api.auth.me` or sent explicitly by the frontend. A stateless cookie jar on the shared `ERPClient.session` stops a resolved user's `Set-Cookie` from leaking into the next service-account call.
-- [ ] **Prod deploy gate:** set `ALLOWED_ORIGINS` in EC2 `.env` before P3 reaches `beta` (`CONTRIBUTING.md §6`)
-- [ ] **Not yet end-to-end:** browser `sid`-cookie flow needs frontend `credentials:'include'` + Frappe cookie domain `.tjdem.online`; the API key/secret path works today
+- [ ] **`erp_theme` frontend branch (`feature/identity-wiring`) not merged to `main` yet** — `main` is frozen during cleanup, so the real frontend still isn't sending `sid`/identity to the backend. It resolves `sid` + CSRF token via `custom_ui.api.auth.me` (same-origin Desk call) and sends both as plain body fields to the AI backend, not as a cross-origin cookie — so no `credentials:'include'` or cross-subdomain cookie config is needed, contrary to an earlier note here. Until this branch merges, identity falls back to the shared service account in prod.
+- [ ] **Prod deploy gate:** set `ALLOWED_ORIGINS` in EC2 `.env` before/when the frontend branch above ships (`CONTRIBUTING.md §6`)
 
 **P4 — Capability gating (single-site now, multi-site-ready)** *(~2–3 wk, after P3)*
 Tenancy is decided (see §4): **single ERPNext site now**, customers = `Company` records;
