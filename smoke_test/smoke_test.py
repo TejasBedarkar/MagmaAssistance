@@ -70,6 +70,10 @@ def main():
     client = Client(f"http://localhost:{args.port}")
     ctx = {"expect_deleted": args.expect_deleted, "skip_llm": args.skip_llm}
 
+    if not args.skip_llm:
+        print("Running the full suite, including LLM calls that share the team's OpenAI "
+              "rate limit. Iterating on a change? Add --skip-llm.\n")
+
     module_names = discover_modules(args.only)
     if "test_ocr" in module_names and not args.include_ocr:
         module_names.remove("test_ocr")
