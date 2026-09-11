@@ -61,8 +61,14 @@ def _rejects_unsupported_type(client: Client) -> TestResult:
 
 
 def run(client: Client, ctx: dict) -> list[TestResult]:
-    return [
-        timed("file_reading.sample.pdf", _upload, client, "sample.pdf"),
-        timed("file_reading.sample_po.png", _upload, client, "sample_po.png"),
-        timed("file_reading.rejects_csv", _rejects_unsupported_type, client),
+    results = [
+        timed("file_reading.sample.pdf", _upload, client, "sample.pdf"),  # native extraction, no LLM
     ]
+    if ctx.get("skip_llm"):
+        # sample_po.png has no native text layer -- the server falls back to
+        # OpenAI Vision for it, so this one case does hit the LLM.
+        results.append(TestResult("file_reading.sample_po.png", False, skipped=True, detail="skipped -- --skip-llm"))
+    else:
+        results.append(timed("file_reading.sample_po.png", _upload, client, "sample_po.png"))
+    results.append(timed("file_reading.rejects_csv", _rejects_unsupported_type, client))
+    return results

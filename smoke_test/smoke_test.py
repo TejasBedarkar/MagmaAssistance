@@ -18,7 +18,13 @@ records to ERPNext -- see test/test_ocr.py):
 Verify a P1/P2 deletion actually removed the dead routes:
     python smoke_test.py --port 8050 --only test_dead_code --expect-deleted
 
-See CONTRIBUTING.md for when this must be run (before every push).
+Skip everything that calls the LLM (chat/tool-call turns, vision OCR) --
+use this for quick local iteration so the team doesn't all burn the same
+shared OpenAI rate limit on every save. Run the full suite (no flag)
+once before you actually push:
+    python smoke_test.py --port 8050 --skip-llm
+
+See CONTRIBUTING.md for when each of these must be run.
 """
 
 import argparse
@@ -56,10 +62,13 @@ def main():
                          help="run test_ocr.py -- WARNING: writes real Supplier/Item/PO records to ERPNext")
     parser.add_argument("--expect-deleted", action="store_true",
                          help="in test_dead_code.py, assert dead routes are gone (run after P1's deletion commit)")
+    parser.add_argument("--skip-llm", action="store_true",
+                         help="skip individual checks that call the LLM (chat/tool-call turns, vision OCR) -- "
+                              "for fast local iteration without hitting the shared OpenAI rate limit")
     args = parser.parse_args()
 
     client = Client(f"http://localhost:{args.port}")
-    ctx = {"expect_deleted": args.expect_deleted}
+    ctx = {"expect_deleted": args.expect_deleted, "skip_llm": args.skip_llm}
 
     module_names = discover_modules(args.only)
     if "test_ocr" in module_names and not args.include_ocr:

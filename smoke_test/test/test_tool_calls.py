@@ -32,4 +32,7 @@ def _check_prompt(client: Client, name: str, prompt: str) -> TestResult:
 
 
 def run(client: Client, ctx: dict) -> list[TestResult]:
+    if ctx.get("skip_llm"):
+        return [TestResult(f"tool_calls.{name}", False, skipped=True, detail="skipped -- --skip-llm")
+                for name, _ in PROMPTS]
     return [timed(f"tool_calls.{name}", _check_prompt, client, name, prompt) for name, prompt in PROMPTS]
