@@ -30,9 +30,15 @@ def safe_create_task(coro):
 def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, save_stream_history):
 
     @app.websocket("/ws/voice")
-    async def ws_voice(ws: WebSocket, session_id: str = "voice-default", user_id: str = None, sid: str = None):
+    async def ws_voice(
+        ws: WebSocket,
+        session_id: str = "voice-default",
+        user_id: str = None,
+        sid: str = None,
+        csrf_token: str = None,
+    ):
         await ws.accept()
-        logger.info("[WS/voice] OPEN  session=%s user=%s sid=%s", session_id, user_id, bool(sid))
+        logger.info("[WS/voice] OPEN  session=%s user=%s sid=%s csrf=%s", session_id, user_id, bool(sid), bool(csrf_token))
 
         class ConnectionClosed(Exception):
             """Raised when a background task tries to use a closed websocket."""
@@ -113,11 +119,15 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
             identity = getattr(app.state, "session_identities", {}).get(session_id)
             if not identity and sid:
                 try:
-                    identity = erp_client.resolve_session_identity(sid, user_id=user_id)
+                    identity = erp_client.resolve_session_identity(
+                        sid, user_id=user_id, csrf_token=csrf_token
+                    )
                     if hasattr(app.state, "session_identities"):
                         app.state.session_identities[session_id] = identity
                 except Exception as exc:
                     logger.warning("[WS/voice] Could not resolve session identity: %s", exc)
+            elif identity and csrf_token and not getattr(identity, "csrf_token", None):
+                identity.csrf_token = csrf_token
 
             try:
                 effective_user = identity.user if identity else user_id
@@ -192,7 +202,10 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
                 # uses add_messages which appends, so saving full history would duplicate.
                 delta = history[start_len:]
                 if delta:
-                    safe_create_task(save_stream_history(session_id, delta))
+                    try:
+                        await save_stream_history(session_id, delta)
+                    except Exception as save_err:
+                        logger.warning("[WS/voice] Could not save stream history for %s: %s", session_id, save_err)
 
         # ------------------------------------------------------------------ #
         # Main receive loop                                                   #

@@ -83,7 +83,7 @@ class ERPIdentity:
     duration of one agent turn. Distinct from the module-level shared
     service account."""
 
-    __slots__ = ("api_key", "api_secret", "sid", "user", "roles")
+    __slots__ = ("api_key", "api_secret", "sid", "user", "roles", "csrf_token")
 
     def __init__(
         self,
@@ -92,15 +92,20 @@ class ERPIdentity:
         sid: Optional[str] = None,
         user: Optional[str] = None,
         roles: Optional[list] = None,
+        csrf_token: Optional[str] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.sid = sid
         self.user = user
         self.roles = roles or []
+        self.csrf_token = csrf_token
 
     def __repr__(self):
-        return f"ERPIdentity(user={self.user!r}, sid={bool(self.sid)}, roles={self.roles!r})"
+        return (
+            f"ERPIdentity(user={self.user!r}, sid={bool(self.sid)}, "
+            f"csrf={bool(self.csrf_token)}, roles={self.roles!r})"
+        )
 
 
 # Per-async-task identity binding. contextvars propagate correctly through
@@ -128,6 +133,19 @@ def use_identity(identity: Optional[ERPIdentity]):
 def current_identity() -> Optional[ERPIdentity]:
     """The ERPIdentity bound for the current call, if any."""
     return _active_identity.get()
+
+
+class _StatelessCookieJar(requests.cookies.RequestsCookieJar):
+    """A cookie jar that refuses to store incoming Set-Cookie headers.
+
+    Since ERPClient manages user and service identity explicitly per request
+    via _auth_headers() (attaching explicit Cookie: sid=... or Authorization: token ...),
+    storing response cookies in the shared HTTP session would cross-pollinate
+    sessions and cause service account calls (like get_meta) to inherit
+    a prior user's session cookie and fail with 403.
+    """
+    def set_cookie(self, *args, **kwargs):
+        pass
 
 
 class ERPClient:
@@ -158,6 +176,7 @@ class ERPClient:
             logging.warning("ERP_URL is not set — ERP tools will fail until it's configured in .env")
 
         self.session = requests.Session()
+        self.session.cookies = _StatelessCookieJar()
         if not (self.api_key and self.api_secret):
             logging.warning(
                 "ERP_API_KEY / ERP_API_SECRET not set — ERP requests will be "
@@ -171,7 +190,7 @@ class ERPClient:
     # Per-user identity
     # ---------------------------------------------------------------
 
-    def _auth_headers(self) -> dict:
+    def _auth_headers(self, is_write: bool = False) -> dict:
         """Authorization and/or Cookie header for the current call: the bound
         ERPIdentity's own key/secret or session cookie if active (see use_identity
         in this module), otherwise this client's shared service-account
@@ -194,6 +213,8 @@ class ERPClient:
                 return headers
             if identity.sid:
                 headers["Cookie"] = f"sid={identity.sid}"
+                if identity.csrf_token:
+                    headers["X-Frappe-CSRF-Token"] = identity.csrf_token
                 return headers
 
         if self.api_key and self.api_secret:
@@ -250,7 +271,12 @@ class ERPClient:
 
         return ERPIdentity(api_key=api_key, api_secret=api_secret, user=user, roles=roles)
 
-    def resolve_session_identity(self, sid: str, user_id: Optional[str] = None) -> "ERPIdentity":
+    def resolve_session_identity(
+        self,
+        sid: str,
+        user_id: Optional[str] = None,
+        csrf_token: Optional[str] = None,
+    ) -> "ERPIdentity":
         """Validate a person's Frappe session cookie (sid) and fetch their
         roles using Frappe's stock endpoints:
           1. GET /api/method/frappe.auth.get_logged_user with Cookie: sid=<sid>
@@ -283,7 +309,13 @@ class ERPClient:
             me_url = f"{self.base_url}/api/method/custom_ui.api.auth.me"
             me_resp = requests.get(me_url, headers=headers, timeout=DEFAULT_TIMEOUT_SECONDS)
             if me_resp.ok:
-                roles = me_resp.json().get("message", {}).get("user", {}).get("roles", []) or []
+                resp_payload = me_resp.json().get("message", {})
+                roles = resp_payload.get("user", {}).get("roles", []) or []
+                if not csrf_token:
+                    csrf_token = (
+                        resp_payload.get("csrf_token")
+                        or resp_payload.get("user", {}).get("csrf_token")
+                    )
             else:
                 user_url = f"{self.base_url}/api/resource/User/{user}"
                 user_response = requests.get(
@@ -296,7 +328,7 @@ class ERPClient:
         except Exception:
             logging.exception("Could not fetch roles for Frappe session user '%s'", user)
 
-        return ERPIdentity(sid=sid, user=user, roles=roles)
+        return ERPIdentity(sid=sid, user=user, roles=roles, csrf_token=csrf_token)
 
     def _identity_tag(self):
         """A short, cache-key-safe tag for whoever is currently bound
@@ -431,7 +463,13 @@ class ERPClient:
                     return data
 
         url = f"{self.base_url}/api/resource/DocType/{doctype}"
-        response = self.session.get(url, timeout=DEFAULT_TIMEOUT_SECONDS, headers=self._auth_headers())
+        # Reading a DocType schema definition is an internal metadata discovery
+        # action (the 'DocType' doctype in Frappe is restricted to System Manager).
+        # We fetch schema definitions using the shared service account so field validation
+        # succeeds for all authenticated users, while all data operations (get_list,
+        # get_doc, create_doc, update_doc) remain strictly bound to the user's identity.
+        with use_identity(None):
+            response = self.session.get(url, timeout=DEFAULT_TIMEOUT_SECONDS, headers=self._auth_headers())
         self._raise_for_permission(response, doctype, "read the schema of")
         response.raise_for_status()
         data = response.json().get("data", {})
@@ -506,30 +544,25 @@ class ERPClient:
         side effects, so unlike call_method() this is never cached, and it
         clears the read cache afterwards so a get_list()/get_doc() called
         right after a create/update doesn't hand back stale data.
-
-        Note on CSRF: the docs mention an X-Frappe-CSRF-Token header for
-        POSTs, but that's only required for cookie/session-based logins.
-        This client authenticates with an API key/secret (Authorization:
-        token ...), which Frappe exempts from CSRF checks, so no CSRF
-        token handling is needed here.
         """
         if not self.base_url:
             raise RuntimeError("ERP_URL is not configured.")
 
         url = f"{self.base_url}/api/method/{method}"
-        # requests/http.client can send an "Expect: 100-continue" header on
-        # POST bodies of certain sizes. Werkzeug's development server (what
-        # a local `bench start` / dev site runs on) doesn't implement that
-        # handshake and rejects the request outright with
-        # "417 Expectation Failed" before your ERP code ever sees it — even
-        # though the same request works fine from curl (which doesn't send
-        # Expect for small bodies) or against a production server behind
-        # gunicorn/nginx. Explicitly blanking the header here disables it.
+        # Note on CSRF: when authenticating via session cookie (Cookie: sid=...),
+        # Frappe strictly enforces CSRF checks on POST/PUT/DELETE requests and requires
+        # the X-Frappe-CSRF-Token header. When authenticating with API key/secret,
+        # Frappe exempts requests from CSRF.
+        headers = {**self._auth_headers(is_write=True), "Expect": ""}
+        identity = _active_identity.get()
+        if identity and identity.sid and identity.csrf_token:
+            headers["X-Frappe-CSRF-Token"] = identity.csrf_token
+
         response = self.session.post(
             url,
             json=(data or {}),
             timeout=DEFAULT_TIMEOUT_SECONDS,
-            headers={**self._auth_headers(), "Expect": ""},
+            headers=headers,
         )
         self._raise_for_permission(response, method, "call")
         response.raise_for_status()
@@ -552,9 +585,14 @@ class ERPClient:
             raise RuntimeError("ERP_URL is not configured.")
 
         url = f"{self.base_url}/api/resource/{doctype}"
+        headers = {**self._auth_headers(is_write=True), "Expect": ""}
+        identity = _active_identity.get()
+        if identity and identity.sid and identity.csrf_token:
+            headers["X-Frappe-CSRF-Token"] = identity.csrf_token
+
         response = self.session.post(
             url, json=data, timeout=DEFAULT_TIMEOUT_SECONDS,
-            headers={**self._auth_headers(), "Expect": ""},
+            headers=headers,
         )
         self._raise_for_permission(response, doctype, "create")
 
@@ -599,9 +637,14 @@ class ERPClient:
         url = f"{self.base_url}/api/resource/{doctype}/{name}"
         # Same "Expect: 100-continue" workaround as call_method_post/
         # create_doc — see the comment on call_method_post for why.
+        headers = {**self._auth_headers(is_write=True), "Expect": ""}
+        identity = _active_identity.get()
+        if identity and identity.sid and identity.csrf_token:
+            headers["X-Frappe-CSRF-Token"] = identity.csrf_token
+
         response = self.session.put(
             url, json=data, timeout=DEFAULT_TIMEOUT_SECONDS,
-            headers={**self._auth_headers(), "Expect": ""},
+            headers=headers,
         )
         self._raise_for_permission(response, doctype, "update")
 
