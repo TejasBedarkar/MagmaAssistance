@@ -417,32 +417,31 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MagmaAssistance Backend", lifespan=lifespan)
 
 # Allow CORS requests from frontend.
-# If ALLOWED_ORIGINS is explicitly configured, use it. Otherwise, provide sensible
-# dev defaults (localhost, 127.0.0.1, magna.local, and configured ERP_URL) with
-# allow_origin_regex and allow_credentials=True so browsers sending credentials: 'include'
-# or custom session headers from Frappe Desk are never blocked by CORS.
+# Default stays permissive ("*", no credentials) so existing deployments
+# keep working untouched -- this must never default to blocking prod just
+# because ALLOWED_ORIGINS wasn't set on that particular deploy. Set
+# ALLOWED_ORIGINS (comma-separated) to lock this down and enable
+# credentialed requests, e.g. for local dev:
+#   ALLOWED_ORIGINS=http://localhost:8000,http://magna.local:8000
+# allow_origin_regex covers local/dev hosts and devtunnels without having
+# to enumerate every port -- it only applies once ALLOWED_ORIGINS is set,
+# since allow_origin_regex plus allow_origins=["*"] is rejected by Starlette.
 _cors_origins_env = os.environ.get("ALLOWED_ORIGINS")
 if _cors_origins_env:
     ALLOWED_ORIGINS = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
     ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
+    ALLOW_ORIGIN_REGEX = (
+        r"https?://(localhost|127\.0\.0\.1|.*\.local)(:\d+)?|https://.*\.devtunnels\.ms"
+    )
 else:
-    erp_origin = os.environ.get("ERP_URL", "").rstrip("/")
-    ALLOWED_ORIGINS = [
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:8001",
-        "http://127.0.0.1:8001",
-        "http://magna.local:8000",
-        "http://magna.local:8001",
-    ]
-    if erp_origin and erp_origin not in ALLOWED_ORIGINS:
-        ALLOWED_ORIGINS.append(erp_origin)
-    ALLOW_CREDENTIALS = True
+    ALLOWED_ORIGINS = ["*"]
+    ALLOW_CREDENTIALS = False
+    ALLOW_ORIGIN_REGEX = None
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|.*\.local)(:\d+)?|https://.*\.devtunnels\.ms",
+    allow_origin_regex=ALLOW_ORIGIN_REGEX,
     allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
