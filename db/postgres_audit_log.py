@@ -95,6 +95,48 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_file_uploads_session ON file_uploads(session_id)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_approvals (
+                session_id TEXT PRIMARY KEY,
+                tool_name TEXT NOT NULL,
+                args TEXT NOT NULL,          -- JSON
+                created_at TEXT NOT NULL     -- ISO 8601 UTC
+            )
+            """
+        )
+
+
+def save_pending_approval(session_id: str, tool_name: str, args: dict) -> None:
+    """Stash a proposed write so it survives a backend restart -- without
+    this, a restart between "shall I proceed?" and the user's "yes" drops
+    the pending action silently, and the agent has nothing left to confirm
+    against."""
+    with _lock, _connect() as conn:
+        conn.execute(
+            "INSERT INTO pending_approvals (session_id, tool_name, args, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET tool_name=excluded.tool_name, "
+            "args=excluded.args, created_at=excluded.created_at",
+            (session_id, tool_name, json.dumps(args), datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def get_pending_approval(session_id: str) -> Optional[dict]:
+    with _lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT tool_name, args FROM pending_approvals WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {"tool_name": row["tool_name"], "args": json.loads(row["args"])}
+
+
+def clear_pending_approval(session_id: Optional[str]) -> None:
+    if not session_id:
+        return
+    with _lock, _connect() as conn:
+        conn.execute("DELETE FROM pending_approvals WHERE session_id = ?", (session_id,))
 
 
 def log_turn(

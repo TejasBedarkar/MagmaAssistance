@@ -127,7 +127,7 @@ async def _execute_tool(
         effective_args = state._sanitize_tool_args(tool_name, args) or {}
         if tool_name == "erp_data_tool":
             effective_args = {**effective_args, "session_id": session_id}
-        state._PENDING_APPROVALS[session_id] = {"tool_name": tool_name, "args": effective_args}
+        audit_log.save_pending_approval(session_id, tool_name, effective_args)
         proposal = (
             f"PROPOSED ACTION (not yet executed): {_describe_pending_action(tool_name, effective_args)}\n"
             "Nothing has been written to the ERP yet. Ask the user to confirm "
@@ -162,7 +162,7 @@ async def _execute_tool(
                 duration_ms=elapsed(),
             )
         if bypass_gate and session_id:
-            state._PENDING_APPROVALS.pop(session_id, None)
+            audit_log.clear_pending_approval(session_id)
         return result
     except PermissionError as e:
         logger.warning("Tool '%s' denied by ERPNext permission check: %s", tool_name, e)
@@ -174,7 +174,7 @@ async def _execute_tool(
                 error_message=str(e),
             )
             if bypass_gate:
-                state._PENDING_APPROVALS.pop(session_id, None)
+                audit_log.clear_pending_approval(session_id)
         return failure
     except Exception as e:
         logger.exception("Tool '%s' failed", tool_name)
@@ -186,7 +186,7 @@ async def _execute_tool(
                 error_message=str(e),
             )
             if bypass_gate:
-                state._PENDING_APPROVALS.pop(session_id, None)
+                audit_log.clear_pending_approval(session_id)
         return failure
 
 
@@ -302,7 +302,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     history = history if history is not None else []
     start_len = len(history)
 
-    pending = state._PENDING_APPROVALS.get(session_id) if session_id else None
+    pending = audit_log.get_pending_approval(session_id) if session_id else None
     if pending and _is_write_approval(text):
         history.append(HumanMessage(content=text))
         yield {"type": "tool_call", "name": pending["tool_name"], "args": pending["args"]}
@@ -333,7 +333,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
         return
 
     if pending and _is_write_rejection(text):
-        state._PENDING_APPROVALS.pop(session_id, None)
+        audit_log.clear_pending_approval(session_id)
         history.append(HumanMessage(content=text))
         cancel_text = "Okay, I've cancelled that — nothing was changed."
         history.append(AIMessage(content=cancel_text))
@@ -344,7 +344,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
         return
 
     if pending:
-        state._PENDING_APPROVALS.pop(session_id, None)
+        audit_log.clear_pending_approval(session_id)
 
     history.append(HumanMessage(content=text))
     trimmed = trim_messages(
