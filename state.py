@@ -77,8 +77,12 @@ document_store: Dict[str, Dict[str, Any]] = {}
 # session_id -> ERPIdentity (resolved user identity for RBAC)
 session_identities: Dict[str, ERPIdentity] = {}
 
-# session_id -> {"tool_name": str, "args": dict} (stashed write proposals awaiting human approval)
-_PENDING_APPROVALS: Dict[str, dict] = {}
+# Write-approval proposals are persisted in db/audit_log.db (pending_approvals
+# table) rather than kept in memory here -- an in-memory dict didn't survive
+# a backend restart between "shall I proceed?" and the user's "yes", which
+# silently dropped the pending write and let the agent improvise a false
+# success. See db.postgres_audit_log.save_pending_approval / get_pending_approval
+# / clear_pending_approval.
 
 
 # ---------------------------------------------------------------------

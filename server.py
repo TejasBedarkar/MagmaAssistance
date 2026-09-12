@@ -158,7 +158,6 @@ def health():
 # ---------------------------------------------------------------------
 session_identities = state.session_identities
 document_store = state.document_store
-_PENDING_APPROVALS = state._PENDING_APPROVALS
 tool_map = state.tool_map
 ALL_TOOLS = state.ALL_TOOLS
 assistant = state.assistant
@@ -173,7 +172,6 @@ __all__ = [
     "OpenAIChatModel",
     "session_identities",
     "document_store",
-    "_PENDING_APPROVALS",
     "tool_map",
     "ALL_TOOLS",
     "assistant",
