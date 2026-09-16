@@ -323,38 +323,59 @@ async def _stream_chat_completion(messages, tools=None):
     }
     if tools:
         data["tools"] = tools
+
     tool_acc = {}
     content = ""
     finish_reason = None
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=60.0)) as client:
-        async with client.stream("POST", url, json=data, headers=headers) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line or not line.startswith("data: "):
-                    continue
-                payload = line[6:].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(payload)
-                except Exception:
-                    continue
-                choice = (chunk.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                finish_reason = choice.get("finish_reason") or finish_reason
-                if delta.get("content"):
-                    content += delta["content"]
-                    yield {"type": "token", "text": delta["content"]}
-                for tc in delta.get("tool_calls") or []:
-                    idx = tc.get("index", 0)
-                    entry = tool_acc.setdefault(idx, {"id": None, "name": None, "arguments": ""})
-                    if tc.get("id"):
-                        entry["id"] = tc["id"]
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        entry["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        entry["arguments"] += fn["arguments"]
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            tool_acc = {}
+            content = ""
+            finish_reason = None
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as client:
+                async with client.stream("POST", url, json=data, headers=headers) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        payload = line[6:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload)
+                        except Exception:
+                            continue
+                        choice = (chunk.get("choices") or [{}])[0]
+                        delta = choice.get("delta") or {}
+                        finish_reason = choice.get("finish_reason") or finish_reason
+                        if delta.get("content"):
+                            content += delta["content"]
+                            yield {"type": "token", "text": delta["content"]}
+                        for tc in delta.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            entry = tool_acc.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+                            if tc.get("id"):
+                                entry["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                entry["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                entry["arguments"] += fn["arguments"]
+            # Successfully finished stream
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout) as net_err:
+            if not content and not tool_acc and attempt < max_retries - 1:
+                logger.warning(
+                    "LLM connection attempt %d/%d failed (%s) — retrying in 1.5s...",
+                    attempt + 1, max_retries, net_err,
+                )
+                await asyncio.sleep(1.5)
+                continue
+            logger.error("LLM connection failed after %d attempt(s): %s", attempt + 1, net_err)
+            raise
+
     tool_calls = []
     for idx in sorted(tool_acc):
         entry = tool_acc[idx]
