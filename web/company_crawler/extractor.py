@@ -72,6 +72,22 @@ COMMON_COUNTRIES = [
     "Germany", "France", "Singapore", "United Arab Emirates", "UAE", "Japan", "China",
 ]
 
+_ISO_COUNTRY_MAP = {
+    "in": "India", "ind": "India", "us": "United States", "usa": "United States",
+    "uk": "United Kingdom", "gb": "United Kingdom", "gbr": "United Kingdom",
+    "ae": "United Arab Emirates", "uae": "United Arab Emirates",
+    "ca": "Canada", "can": "Canada", "au": "Australia", "aus": "Australia",
+    "de": "Germany", "deu": "Germany", "fr": "France", "fra": "France",
+    "sg": "Singapore", "sgp": "Singapore",
+}
+
+def normalize_country_name(country_str: str) -> str:
+    if not country_str:
+        return ""
+    clean = country_str.strip()
+    return _ISO_COUNTRY_MAP.get(clean.lower(), clean)
+
+
 COMMON_INDIAN_CITIES = [
     "Mumbai", "Delhi", "Bengaluru", "Bangalore", "Hyderabad", "Ahmedabad",
     "Chennai", "Kolkata", "Surat", "Pune", "Jaipur", "Lucknow", "Kanpur",
@@ -179,10 +195,18 @@ def parse_address_fields(raw_address: str) -> ParsedAddress:
     # 2. Extract country
     for c in COMMON_COUNTRIES:
         if re.search(rf"\b{re.escape(c)}\b", clean_addr, re.IGNORECASE):
-            country = c
+            country = normalize_country_name(c)
             break
     if not country:
+        # Check trailing ISO code (e.g. ', IN')
+        trailing_match = re.search(r"\b([A-Za-z]{2,3})\b\s*$", clean_addr)
+        if trailing_match:
+            candidate = trailing_match.group(1).lower()
+            if candidate in _ISO_COUNTRY_MAP:
+                country = _ISO_COUNTRY_MAP[candidate]
+    if not country:
         country = "India" if re.search(r"\b\d{6}\b", clean_addr) else ""
+    country = normalize_country_name(country)
 
     # 3. Extract state
     for s in COMMON_INDIAN_STATES:
@@ -500,7 +524,7 @@ def _extract_from_schema_org(soup: BeautifulSoup, target_person: Optional[str] =
                     locality = str(addr.get("addressLocality") or "").strip()
                     region = str(addr.get("addressRegion") or "").strip()
                     postal = str(addr.get("postalCode") or "").strip()
-                    country = str(addr.get("addressCountry") or "").strip()
+                    country = normalize_country_name(str(addr.get("addressCountry") or "").strip())
                     parts = [street, locality, region, postal, country]
                     joined = ", ".join(p for p in parts if p)
                     if joined:
@@ -570,7 +594,7 @@ def _extract_from_microdata(soup: BeautifulSoup, target_person: Optional[str] = 
         street = street_el.get_text(" ", strip=True) if street_el else ""
         city = city_el.get_text(" ", strip=True) if city_el else (region_el.get_text(" ", strip=True) if region_el else "")
         pincode = pin_el.get_text(" ", strip=True) if pin_el else ""
-        country = country_el.get_text(" ", strip=True) if country_el else ""
+        country = normalize_country_name(country_el.get_text(" ", strip=True) if country_el else "")
 
         full = html_lib.unescape(tag.get_text(" ", strip=True))
         if 15 < len(full) < 400:

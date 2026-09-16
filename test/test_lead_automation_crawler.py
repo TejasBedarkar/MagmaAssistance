@@ -659,6 +659,70 @@ def test_lead_city_preserves_full_street_address():
         assert lead_created_doc["country"] == "India"
 
 
+def test_lead_country_iso_code_resolution():
+    """Verify that ISO country codes ('IN', 'IND') are cleanly resolved to official
+    ERPNext country names ('India') in both Lead and linked Address documents."""
+    import asyncio
+    from ERP_Unified.tools import _resolve_link_value, erp_data_tool
+
+    with patch("ERP_Unified.tools.erp_client.get_list") as mock_list:
+        # Mock ERPNext country list response for 'code = in'
+        def get_list_side_effect(doctype, *args, **kwargs):
+            if doctype == "Country":
+                filters = kwargs.get("filters") or []
+                if any(f[0] == "name" and f[2] == "India" for f in filters):
+                    return [{"name": "India"}]
+                if any(f[0] == "code" and f[2] == "in" for f in filters):
+                    return [{"name": "India"}]
+            return []
+        mock_list.side_effect = get_list_side_effect
+
+        assert _resolve_link_value("Country", "IN") == "India"
+        assert _resolve_link_value("Country", "ind") == "India"
+
+    with patch("ERP_Unified.tools.erp_client.get_meta") as mock_meta, \
+         patch("ERP_Unified.tools.erp_client.create_doc") as mock_create, \
+         patch("ERP_Unified.tools.erp_client.get_list") as mock_list:
+
+        mock_meta.side_effect = lambda dt: {
+            "fields": [
+                {"fieldname": "lead_name", "reqd": 1, "fieldtype": "Data"},
+                {"fieldname": "company_name", "reqd": 0, "fieldtype": "Data"},
+                {"fieldname": "email_id", "reqd": 0, "fieldtype": "Data"},
+                {"fieldname": "city", "reqd": 0, "fieldtype": "Data"},
+                {"fieldname": "country", "reqd": 0, "fieldtype": "Link", "options": "Country"},
+            ]
+        }
+        mock_create.side_effect = lambda dt, doc: {"name": "CRM-LEAD-2026-00099"} if dt == "Lead" else {"name": "ADDR-00099"}
+        mock_list.side_effect = lambda dt, *a, **kw: [{"name": "India"}] if dt == "Country" else []
+
+        lead_data = {
+            "lead_name": "Sarabhai",
+            "company_name": "Zerodha",
+            "email_id": "dp@zerodha.com",
+            "address_line1": "153/154 4th Cross Rd",
+            "city": "Bengaluru",
+            "country": "IN",
+        }
+
+        res = asyncio.run(erp_data_tool.ainvoke({
+            "operation": "create",
+            "doctype": "Lead",
+            "data": lead_data,
+            "session_id": "test_country_iso_session",
+            "approved": True,
+        }))
+
+        assert "CRM-LEAD-2026-00099" in str(res)
+        first_call = mock_create.call_args_list[0]
+        assert first_call[0][0] == "Lead"
+        assert first_call[0][1]["country"] == "India"
+        second_call = mock_create.call_args_list[1]
+        assert second_call[0][0] == "Address"
+        assert second_call[0][1]["country"] == "India"
+
+
+
 
 
 

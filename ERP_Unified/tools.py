@@ -142,6 +142,32 @@ def _resolve_link_value(target_doctype: str, value) -> str | None:
     if matches:
         return matches[0]["name"]
         
+    # Special handling for Country DocType: check ISO 2-letter or 3-letter codes and 'code' field
+    if target_doctype.strip().lower() == "country":
+        iso_map = {
+            "in": "India", "ind": "India", "us": "United States", "usa": "United States",
+            "uk": "United Kingdom", "gb": "United Kingdom", "gbr": "United Kingdom",
+            "ae": "United Arab Emirates", "uae": "United Arab Emirates",
+            "ca": "Canada", "can": "Canada", "au": "Australia", "aus": "Australia",
+            "de": "Germany", "deu": "Germany", "fr": "France", "fra": "France",
+            "sg": "Singapore", "sgp": "Singapore",
+        }
+        val_clean = value_str.strip().lower()
+        if val_clean in iso_map:
+            mapped_name = iso_map[val_clean]
+            try:
+                matches = erp_client.get_list("Country", fields=["name"], filters=[["name", "=", mapped_name]], limit=1, use_cache=False)
+                if matches:
+                    return matches[0]["name"]
+            except Exception:
+                pass
+        try:
+            matches = erp_client.get_list("Country", fields=["name"], filters=[["code", "=", val_clean]], limit=1, use_cache=False)
+            if matches:
+                return matches[0]["name"]
+        except Exception:
+            pass
+
     # 2. Try fuzzy lookup using common search fields
     try:
         meta = erp_client.get_meta(target_doctype)
@@ -707,7 +733,7 @@ def _run_create(
             addr_line1 = address_info.get("address_line1") or address_info.get("address") or "Headquarters"
             city_for_addr = address_info.get("city") or "Not Specified"
             pincode = address_info.get("pincode") or ""
-            country = address_info.get("country") or "India"
+            country = _resolve_link_value("Country", address_info.get("country") or "India") or "India"
             state_for_addr = address_info.get("state") or ""
             base_title = merged.get("company_name") or merged.get("lead_name") or created_lead_id
             address_doc = {
