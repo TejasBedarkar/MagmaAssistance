@@ -602,8 +602,9 @@ def web_company_extract(url: str, company_name: Optional[str] = None) -> str:
 
         # Fallback: If no email found on the official site, execute a broad web search automatically
         fallback_emails = []
+        target_domain = urlparse(url).netloc.replace("www.", "").lower()
         if not contacts["emails"]:
-            search_query = f"{company_name or urlparse(url).netloc.replace('www.', '')} contact email address"
+            search_query = f"{company_name or target_domain} contact email address"
             try:
                 # Use Tavily if available
                 if _tavily_client:
@@ -612,7 +613,7 @@ def web_company_extract(url: str, company_name: Optional[str] = None) -> str:
                 else:
                     resp = requests.get(f"{_SEARXNG_URL}/search", params={"q": search_query, "format": "json"}, timeout=_REQUEST_TIMEOUT)
                     results = resp.json().get("results", [])
-                    
+
                 # Scan search snippets for emails
                 combined_text = " ".join([r.get("content", "") + " " + r.get("title", "") for r in results])
                 for match in _EMAIL_RE.finditer(combined_text):
@@ -620,6 +621,11 @@ def web_company_extract(url: str, company_name: Optional[str] = None) -> str:
                     local = addr.split("@")[0]
                     if local not in _GENERIC_EMAIL_PREFIXES and addr not in fallback_emails:
                         fallback_emails.append(addr)
+                # a broad search mixes in emails from unrelated companies -- an
+                # email on the same domain as the URL we're actually extracting
+                # is far more likely correct than whatever the search happened
+                # to return first, so it goes first regardless of search order
+                fallback_emails.sort(key=lambda addr: addr.split("@")[-1] != target_domain)
             except Exception as e:
                 logger.warning(f"Fallback email search failed: {e}")
 
