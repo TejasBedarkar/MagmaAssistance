@@ -27,6 +27,7 @@ from config import (
     TOOL_RAG_BYPASS_THRESHOLD,
 )
 import db.postgres_audit_log as audit_log
+from ERP_Unified.tools import get_pending_create_field
 from llm_client import _clean_schema_for_openai, convert_message_to_dict
 import state
 
@@ -42,6 +43,14 @@ _GATED_WRITE_OPERATIONS = {
 }
 _ALWAYS_GATED_TOOLS = {"erp_send_email"}
 
+# These composite tools (onboard_new_lead, batch_manage_project_tasks,
+# reassign_tasks) do their own real write on dry_run=False, but that was
+# never actually enforced by this gate -- only by their own docstring
+# telling the model to wait for a "yes" first, with zero code backstop.
+# Treat an explicit dry_run=False the same as erp_data_tool's
+# create/update: intercept it, stash it, require a real confirmation.
+_DRY_RUN_GATED_TOOLS = {"onboard_new_lead", "batch_manage_project_tasks", "reassign_tasks"}
+
 
 def _is_write_call(tool_name: str, args: dict) -> bool:
     if tool_name in _ALWAYS_GATED_TOOLS:
@@ -49,6 +58,8 @@ def _is_write_call(tool_name: str, args: dict) -> bool:
     if tool_name == "erp_data_tool":
         operation = str((args or {}).get("operation") or "").strip().lower()
         return operation in _GATED_WRITE_OPERATIONS
+    if tool_name in _DRY_RUN_GATED_TOOLS:
+        return (args or {}).get("dry_run") is False
     return False
 
 
@@ -77,6 +88,22 @@ def _describe_pending_action(tool_name: str, args: dict) -> str:
         suffix = " and submit it" if args.get("submit") else ""
         return f"Create a new {doctype}{suffix} — {fields}"
 
+    if tool_name == "reassign_tasks":
+        tasks = args.get("tasks") or []
+        lines = ", ".join(f"{t.get('task_name')} -> {t.get('assigned_to')}" for t in tasks)
+        return f"Assign {len(tasks)} task(s): {lines}"
+
+    if tool_name == "batch_manage_project_tasks":
+        tasks = args.get("tasks") or []
+        project = args.get("project_name", "(unknown project)")
+        subjects = ", ".join(t.get("subject", "?") for t in tasks)
+        return f"Create {len(tasks)} task(s) on Project '{project}': {subjects}"
+
+    if tool_name == "onboard_new_lead":
+        lead = args.get("lead_name", "(unknown lead)")
+        tasks = args.get("tasks") or []
+        return f"Onboard Lead '{lead}' — create a Project, {len(tasks)} task(s), and email the client"
+
     return f"Run {tool_name} with {args}"
 
 
@@ -96,6 +123,12 @@ _CORRECTION_RE = re.compile(
     r"only if|unless|not )\b|\?",
     re.IGNORECASE,
 )
+_PROSE_PROPOSAL_RE = re.compile(
+    r"\b(shall i (proceed|go ahead)|would you like me to (proceed|create|go ahead)|"
+    r"please confirm|confirm (this|with a plain)|ready to (create|proceed)|"
+    r"want me to proceed)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_write_approval(message: str) -> bool:
@@ -109,7 +142,16 @@ def _is_write_approval(message: str) -> bool:
 
 
 def _is_write_rejection(message: str) -> bool:
-    return bool(_NO_RE.match((message or "").strip()))
+    """True only for an unambiguous, flat cancellation -- not a correction
+    that happens to start with 'no' (e.g. 'No, don't use that email, leave
+    it blank, confirm without it' is a correction, not a cancel, and should
+    reach the LLM to re-propose with the fix applied)."""
+    text = (message or "").strip()
+    if not text or len(text.split()) > 10:
+        return False
+    if _CORRECTION_RE.search(text):
+        return False
+    return bool(_NO_RE.match(text))
 
 
 # ---------------------------------------------------------------------
@@ -295,6 +337,30 @@ async def _stream_full_reply(call_messages, tools=None):
     yield {"type": "done", "content": content, "tool_calls": tool_calls}
 
 
+def _carry_forward_dropped_facts(history: list, trimmed: list) -> list:
+    """trim_messages (strategy='last') silently drops the OLDEST messages
+    once a long conversation exceeds MAX_HISTORY_TOKENS -- including
+    wherever a customer/contact name was first mentioned (see Flagged
+    Issues #7). Prepend a short note of what the user said in the dropped
+    messages so a named entity from early in a long conversation doesn't
+    just vanish from the model's context."""
+    dropped_count = len(history) - len(trimmed)
+    if dropped_count <= 0:
+        return trimmed
+    dropped_human_text = [
+        m.content for m in history[:dropped_count]
+        if isinstance(m, HumanMessage) and isinstance(m.content, str) and m.content.strip()
+    ]
+    if not dropped_human_text:
+        return trimmed
+    note = (
+        "EARLIER IN THIS CONVERSATION (trimmed from the active window for length, "
+        "but still relevant -- do not drop names or facts mentioned here):\n"
+        + "\n".join(f"- {t}" for t in dropped_human_text[:20])
+    )
+    return [SystemMessage(content=note), *trimmed]
+
+
 # ---------------------------------------------------------------------
 # Live streaming agent turn
 # ---------------------------------------------------------------------
@@ -316,9 +382,12 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             SystemMessage(content=state.assistant.llm.system_prompt),
             HumanMessage(
                 content=(
-                    f"The user approved the pending action and it has now been executed. "
-                    f"Tool result: {result}\nReply with a brief confirmation of what was done "
-                    f"(or, if the result shows a failure, say so plainly). Do not call any tools."
+                    f"The user approved the pending action, and the system just attempted it. "
+                    f"Tool result: {result}\nLook at the result: if it succeeded, confirm what "
+                    f"was done; if it failed or is asking for more information (e.g. a missing "
+                    f"required field), say so plainly -- do NOT say it 'has been executed' or "
+                    f"'succeeded' unless the result actually shows a created/updated record. "
+                    f"Do not call any tools."
                 )
             ),
         ]
@@ -346,6 +415,32 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     if pending:
         audit_log.clear_pending_approval(session_id)
 
+    # nudge: "yes" with no pending approval usually means the prior proposal was prose-only
+    if not pending and _is_write_approval(text):
+        last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
+        if last_ai and isinstance(last_ai.content, str) and _PROSE_PROPOSAL_RE.search(last_ai.content):
+            history.append(SystemMessage(content=(
+                "The user just approved the proposal in your previous message. Call the "
+                "matching erp_data_tool operation NOW with that exact data -- do not "
+                "restate the proposal in prose or ask for confirmation again."
+            )))
+
+    # nudge: route a reply straight to the exact field we last asked about --
+    # the model doesn't reliably reconstruct the right fieldname on its own
+    # once a create flow has asked about several fields in a row
+    pending_field = session_id and get_pending_create_field(session_id)
+    if pending_field:
+        pending_doctype, pending_fieldname = pending_field
+        history.append(SystemMessage(content=(
+            f"Your last message asked the user for the '{pending_fieldname}' field "
+            f"to create this {pending_doctype}. If their reply below is answering "
+            f"that, call erp_data_tool with data={{'{pending_fieldname}': <their "
+            f"answer>}} specifically -- do NOT put it in a different field (e.g. "
+            f"'customer' when you asked about 'company'). If their reply is "
+            f"something else entirely (a question, a correction, a new request), "
+            f"respond to that instead."
+        )))
+
     history.append(HumanMessage(content=text))
     trimmed = trim_messages(
         history,
@@ -354,6 +449,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
         strategy="last",
         include_system=False,
     )
+    trimmed = _carry_forward_dropped_facts(history, trimmed)
 
     candidate_tools = []
     if state.ALL_TOOLS:
@@ -374,6 +470,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     call_messages = [SystemMessage(content="\n".join(system_parts)), *trimmed]
 
     max_rounds = 4
+    nudged_prose_proposal = False
     try:
         for round_number in range(max_rounds + 1):
             content = ""
@@ -386,6 +483,20 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                     tool_calls = event["tool_calls"]
 
             if not tool_calls:
+                # model proposed a write in prose without calling the tool -- nudge it
+                # to call the tool now, in the same turn, instead of waiting for "yes"
+                if not nudged_prose_proposal and _PROSE_PROPOSAL_RE.search(content or ""):
+                    nudged_prose_proposal = True
+                    ai_msg = AIMessage(content=content)
+                    call_messages.append(ai_msg)
+                    history.append(ai_msg)
+                    call_messages.append(SystemMessage(content=(
+                        "You just proposed a write action in prose without calling the "
+                        "tool. Call the matching erp_data_tool operation NOW with that "
+                        "exact data -- the system shows the user a confirmation prompt "
+                        "automatically once you do."
+                    )))
+                    continue
                 ai_msg = AIMessage(content=content)
                 history.append(ai_msg)
                 yield {"type": "done", "text": content, "_delta": history[start_len:]}
@@ -397,6 +508,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             ai_msg = AIMessage(content=content, tool_calls=tool_calls)
             call_messages.append(ai_msg)
             history.append(ai_msg)
+            gate_intercepted = False
             for tc in tool_calls:
                 yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
                 result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
@@ -404,6 +516,14 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                 t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
                 call_messages.append(t_msg)
                 history.append(t_msg)
+                if isinstance(result, str) and "PROPOSED ACTION (not yet executed)" in result:
+                    gate_intercepted = True
+
+            # a create/update just got gated -- stop and summarize the proposal
+            # instead of looping back, where the model sometimes re-calls the
+            # same tool again thinking the first attempt didn't go through
+            if gate_intercepted:
+                break
 
         content = ""
         async for event in _stream_full_reply(call_messages, tools=None):
