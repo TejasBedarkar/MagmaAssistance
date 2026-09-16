@@ -42,6 +42,7 @@ from ERP.dynamic_fields import (
 )
 from ERP.tools.project_onboarding_tools import PROJECT_ONBOARDING_TOOLS
 from ERP.tools.task_assignment_tools import TASK_ASSIGNMENT_TOOLS
+from ERP.tools.crm_conversion_tools import CRM_CONVERSION_TOOLS
 
 BLOCKED_OPERATIONS = {"delete", "remove", "trash", "destroy", "cancel", "purge", "drop"}
 LIST_OPERATIONS = {"list", "get_list", "search", "find", "query"}
@@ -72,6 +73,16 @@ def get_pending_create_field(session_id: str) -> Optional[tuple[str, str]]:
     """Returns (doctype, fieldname) if `session_id` is mid-way through a
     create flow and was just asked for one specific field, else None."""
     return _PENDING_CREATE_FIELD.get(session_id)
+
+
+def get_pending_create_data(session_id: str, doctype: str) -> dict:
+    """Returns whatever has already been accumulated for this session's
+    in-progress create flow on `doctype` (empty dict if none) -- used to
+    build an accurate write-approval preview. The actual create call
+    already merges this internally regardless; this is purely so the gate
+    can DISPLAY the full picture instead of just the one field the model
+    happened to pass on this specific turn."""
+    return dict(_PENDING_CREATES.get((session_id, doctype), {}))
 
 # Web-derived values are useful suggestions, not authority to write to the
 # ERP. Keep the review requirement alongside the pending create payload so a
@@ -159,6 +170,33 @@ def _resolve_link_value(target_doctype: str, value) -> str | None:
         pass # Ignore meta/fuzzy fetch errors and fall back to None
         
     return None
+
+
+def _fallback_to_name_filter(doctype: str, filters: Optional[list], fields, order_by, limit: int):
+    """If a `list` query on a non-`name` field returns nothing, some
+    doctypes (Item, Customer, Supplier, ...) use `name` itself as the
+    business code (e.g. Item.name IS the item_code, not item_name) -- a
+    query on item_name/customer_name for a value that's actually the code
+    silently returns empty. Retry once against `name` directly before
+    reporting that nothing was found."""
+    if not filters:
+        return None, []
+    candidate = None
+    for f in filters:
+        if isinstance(f, (list, tuple)) and len(f) == 3 and f[0] != "name" and isinstance(f[2], str):
+            candidate = f[2].strip("%").strip()
+            break
+    if not candidate:
+        return None, []
+    try:
+        retry = erp_client.get_list(
+            doctype, fields=fields, filters=[["name", "=", candidate]], order_by=order_by, limit=limit
+        )
+    except Exception:  # noqa: BLE001
+        return None, []
+    if retry:
+        return retry, [f"No match on the requested field, but found by name='{candidate}' instead."]
+    return None, []
 
 
 def _resolve_link_filters(doctype: str, filters: Optional[list]) -> tuple[Optional[list], list[str]]:
@@ -496,18 +534,17 @@ def erp_data_tool(
                 elif dt_lower == "employee":
                     req_fields = ["name", "employee_name", "department", "designation", "status"]
 
-            return _with_warnings(
-                str(
-                    erp_client.get_list(
-                        doctype,
-                        fields=req_fields,
-                        filters=clean_filters,
-                        order_by=order_by,
-                        limit=limit,
-                    )
-                ),
-                link_warnings,
+            results = erp_client.get_list(
+                doctype, fields=req_fields, filters=clean_filters, order_by=order_by, limit=limit,
             )
+            if not results and clean_filters:
+                fallback, fallback_warnings = _fallback_to_name_filter(
+                    doctype, clean_filters, req_fields, order_by, limit
+                )
+                if fallback:
+                    results = fallback
+                    link_warnings = link_warnings + fallback_warnings
+            return _with_warnings(str(results), link_warnings)
 
         if op in GET_OPERATIONS:
             if not name:
@@ -554,6 +591,44 @@ def _review_text(doctype: str, data: dict) -> str:
     """Render a concise, non-ambiguous review payload for user approval."""
     visible = [f"- {field}: {value}" for field, value in data.items() if value not in (None, "", [], {})]
     return "\n".join(visible) if visible else "- No fields were supplied"
+
+
+_MISSING_FIELD_ERROR_PATTERNS = [
+    re.compile(r"please enter ([A-Za-z0-9 /&()-]+?)(?:\.|$)", re.IGNORECASE),
+    re.compile(r"^([A-Za-z0-9 /&()-]+?) is mandatory", re.IGNORECASE),
+]
+
+
+def _guess_missing_field(doctype: str, error_text: str) -> Optional[dict]:
+    """ERPNext's own custom validate() methods (not just schema reqd=1)
+    often reject a create with a 'Please enter X' / 'X is mandatory'
+    message -- these fields never show up in missing_required_fields()
+    (which only reads schema-level reqd), so nothing here previously knew
+    which real fieldname X was. Best-effort match the label back to a
+    real field so the same field-routing nudge that handles a schema-
+    required field can pick this up too, instead of the model losing
+    track of the whole in-progress record once this kind of error hits."""
+    label_guess = None
+    for pattern in _MISSING_FIELD_ERROR_PATTERNS:
+        m = pattern.search(error_text)
+        if m:
+            label_guess = m.group(1).strip()
+            break
+    if not label_guess:
+        return None
+    try:
+        meta = erp_client.get_meta(doctype)
+    except Exception:  # noqa: BLE001
+        return None
+    for f in meta.get("fields", []) or []:
+        if (f.get("label") or "").strip().lower() == label_guess.lower():
+            return {
+                "fieldname": f.get("fieldname"),
+                "label": f.get("label"),
+                "fieldtype": f.get("fieldtype"),
+                "options": f.get("options"),
+            }
+    return None
 
 
 def _run_create(
@@ -645,8 +720,22 @@ def _run_create(
         _PENDING_WEB_REVIEWS.discard(key)
         return str(result)
 
-    outcome = _with_warnings(_safe_call(f"create {doctype}", run), warnings)
-    return outcome
+    outcome = _safe_call(f"create {doctype}", run)
+    if isinstance(outcome, str) and outcome.startswith("Couldn't"):
+        guessed = _guess_missing_field(doctype, outcome)
+        if guessed:
+            # ERPNext's server-side check rejected this even though the
+            # schema-level missing_required_fields() pass above found
+            # nothing wrong -- persist what we already had so the next
+            # turn's merge (line 649) doesn't start from empty.
+            _PENDING_CREATES[key] = merged
+            _PENDING_CREATE_FIELD[session_id] = (doctype, guessed["fieldname"])
+            outcome += (
+                f"\n{field_question(guessed)} Once you have the answer, call "
+                f"erp_data_tool again with operation='create', doctype='{doctype}', "
+                f"session_id='{session_id}', and data={{'{guessed['fieldname']}': <answer>}}."
+            )
+    return _with_warnings(outcome, warnings)
 
 
 @tool
@@ -741,4 +830,7 @@ def erp_send_email(
     return _safe_call(f"send email to {recipients}", run)
 
 
-ERP_UNIFIED_TOOLS = [erp_data_tool, erp_describe_fields, erp_send_email, *PROJECT_ONBOARDING_TOOLS, *TASK_ASSIGNMENT_TOOLS]
+ERP_UNIFIED_TOOLS = [
+    erp_data_tool, erp_describe_fields, erp_send_email,
+    *PROJECT_ONBOARDING_TOOLS, *TASK_ASSIGNMENT_TOOLS, *CRM_CONVERSION_TOOLS,
+]

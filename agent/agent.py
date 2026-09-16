@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from typing import Optional
 
 import httpx
@@ -27,7 +28,7 @@ from config import (
     TOOL_RAG_BYPASS_THRESHOLD,
 )
 import db.postgres_audit_log as audit_log
-from ERP_Unified.tools import get_pending_create_field
+from ERP_Unified.tools import get_pending_create_field, get_pending_create_data, CREATE_OPERATIONS
 from llm_client import _clean_schema_for_openai, convert_message_to_dict
 import state
 
@@ -49,7 +50,9 @@ _ALWAYS_GATED_TOOLS = {"erp_send_email"}
 # telling the model to wait for a "yes" first, with zero code backstop.
 # Treat an explicit dry_run=False the same as erp_data_tool's
 # create/update: intercept it, stash it, require a real confirmation.
-_DRY_RUN_GATED_TOOLS = {"onboard_new_lead", "batch_manage_project_tasks", "reassign_tasks"}
+_DRY_RUN_GATED_TOOLS = {
+    "onboard_new_lead", "batch_manage_project_tasks", "reassign_tasks", "convert_crm_record",
+}
 
 
 def _is_write_call(tool_name: str, args: dict) -> bool:
@@ -104,6 +107,12 @@ def _describe_pending_action(tool_name: str, args: dict) -> str:
         tasks = args.get("tasks") or []
         return f"Onboard Lead '{lead}' — create a Project, {len(tasks)} task(s), and email the client"
 
+    if tool_name == "convert_crm_record":
+        src = args.get("source_doctype", "?")
+        name = args.get("source_name", "?")
+        tgt = args.get("target_doctype", "?")
+        return f"Convert {src} '{name}' to a new {tgt} (using ERPNext's own field mapping)"
+
     return f"Run {tool_name} with {args}"
 
 
@@ -125,7 +134,7 @@ _CORRECTION_RE = re.compile(
 )
 _PROSE_PROPOSAL_RE = re.compile(
     r"\b(shall i (proceed|go ahead)|would you like me to (proceed|create|go ahead)|"
-    r"please confirm|confirm (this|with a plain)|ready to (create|proceed)|"
+    r"confirm (this|with a plain)|ready to (create|proceed)|"
     r"want me to proceed)\b",
     re.IGNORECASE,
 )
@@ -169,9 +178,26 @@ async def _execute_tool(
         effective_args = state._sanitize_tool_args(tool_name, args) or {}
         if tool_name == "erp_data_tool":
             effective_args = {**effective_args, "session_id": session_id}
+
+        # for the PREVIEW only -- merge in whatever this create flow already
+        # accumulated across earlier turns, so a proposal built from just
+        # this turn's one new field ("company=X") doesn't read as if it
+        # replaced everything asked before it. The real execution already
+        # does this merge internally regardless of what's shown here.
+        preview_args = effective_args
+        if tool_name == "erp_data_tool" and str(args.get("operation") or "").lower() in CREATE_OPERATIONS:
+            doctype = args.get("doctype")
+            if doctype:
+                accumulated = get_pending_create_data(session_id, doctype)
+                if accumulated:
+                    preview_args = {
+                        **effective_args,
+                        "data": {**accumulated, **(effective_args.get("data") or {})},
+                    }
+
         audit_log.save_pending_approval(session_id, tool_name, effective_args)
         proposal = (
-            f"PROPOSED ACTION (not yet executed): {_describe_pending_action(tool_name, effective_args)}\n"
+            f"PROPOSED ACTION (not yet executed): {_describe_pending_action(tool_name, preview_args)}\n"
             "Nothing has been written to the ERP yet. Ask the user to confirm "
             "with a plain \"yes\" (or tell you what to change) before anything happens."
         )
@@ -420,9 +446,17 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
         last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
         if last_ai and isinstance(last_ai.content, str) and _PROSE_PROPOSAL_RE.search(last_ai.content):
             history.append(SystemMessage(content=(
-                "The user just approved the proposal in your previous message. Call the "
-                "matching erp_data_tool operation NOW with that exact data -- do not "
-                "restate the proposal in prose or ask for confirmation again."
+                "The user just approved the proposal below -- the EXACT text of your "
+                "own previous message -- with a plain \"yes\". Call whichever tool "
+                "that specific proposal was about (erp_data_tool, or a dry_run-based "
+                "tool like onboard_new_lead/batch_manage_project_tasks/reassign_tasks/"
+                "convert_crm_record with dry_run=False) NOW, with that exact data. Do "
+                "NOT act on any other, earlier action from earlier in this "
+                "conversation, even one that looks similar -- only this one. If your "
+                "own proposal below was actually missing information needed to call "
+                "the tool (e.g. no assignee given for a task), do not guess or invent "
+                "a value -- ask the user for it instead of calling the tool.\n\n"
+                f"YOUR PREVIOUS MESSAGE (the one just approved):\n\"\"\"\n{last_ai.content}\n\"\"\""
             )))
 
     # nudge: route a reply straight to the exact field we last asked about --
@@ -434,11 +468,13 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
         history.append(SystemMessage(content=(
             f"Your last message asked the user for the '{pending_fieldname}' field "
             f"to create this {pending_doctype}. If their reply below is answering "
-            f"that, call erp_data_tool with data={{'{pending_fieldname}': <their "
-            f"answer>}} specifically -- do NOT put it in a different field (e.g. "
-            f"'customer' when you asked about 'company'). If their reply is "
-            f"something else entirely (a question, a correction, a new request), "
-            f"respond to that instead."
+            f"that, call erp_data_tool with operation='create', doctype='{pending_doctype}', "
+            f"data={{'{pending_fieldname}': <their answer>}} specifically -- do NOT put "
+            f"it in a different field (e.g. 'customer' when you asked about 'company'), "
+            f"and do NOT switch to creating a different kind of record instead (e.g. a "
+            f"Lead) -- you are continuing the {pending_doctype} you already started, not "
+            f"starting over. If their reply is something else entirely (a question, a "
+            f"correction, a new request), respond to that instead."
         )))
 
     history.append(HumanMessage(content=text))
@@ -465,14 +501,25 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             openai_tools.append(formatted)
 
     system_parts = [state.assistant.llm.system_prompt]
+    system_parts.append(
+        f"\nToday's real date is {datetime.now().strftime('%Y-%m-%d')} ({datetime.now().strftime('%A')}). "
+        f"Never guess or assume a date -- always compute 'this month'/'today'/'last week' etc. from this."
+    )
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
     call_messages = [SystemMessage(content="\n".join(system_parts)), *trimmed]
 
     max_rounds = 4
     nudged_prose_proposal = False
+    prev_round_content = ""
     try:
         for round_number in range(max_rounds + 1):
+            if prev_round_content and not prev_round_content[-1].isspace():
+                # a fresh round is its own completion, unaware it follows
+                # another -- without this, two rounds' text runs together
+                # as one word ("moment.The BOM...") in the streamed output
+                yield {"type": "token", "text": " "}
+
             content = ""
             tool_calls = []
             async for event in _stream_full_reply(call_messages, tools=openai_tools):
@@ -481,6 +528,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                 else:
                     content = event["content"]
                     tool_calls = event["tool_calls"]
+            prev_round_content = content
 
             if not tool_calls:
                 # model proposed a write in prose without calling the tool -- nudge it
@@ -491,10 +539,13 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                     call_messages.append(ai_msg)
                     history.append(ai_msg)
                     call_messages.append(SystemMessage(content=(
-                        "You just proposed a write action in prose without calling the "
-                        "tool. Call the matching erp_data_tool operation NOW with that "
-                        "exact data -- the system shows the user a confirmation prompt "
-                        "automatically once you do."
+                        "You just proposed a write action in prose without calling a "
+                        "tool. Call whichever tool that proposal was actually about "
+                        "(erp_data_tool, or a dry_run-based tool like onboard_new_lead/"
+                        "batch_manage_project_tasks/reassign_tasks/convert_crm_record) "
+                        "NOW with that exact data -- do not invent a fake operation name "
+                        "on a different tool. The system shows the user a confirmation "
+                        "prompt automatically once you do."
                     )))
                     continue
                 ai_msg = AIMessage(content=content)

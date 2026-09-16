@@ -92,13 +92,29 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
         _ACTION_TAG_RE = re.compile(r'\[Action:[^\]]*\]')
         _CODE_BLOCK_RE = re.compile(r'```[\s\S]*?```')
         _TABLE_LINE_RE = re.compile(r'^\s*\|.*\|\s*$')
+        _MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
+        _BARE_URL_RE = re.compile(r'https?://\S+')
+        _EMPTY_BULLET_RE = re.compile(r'^\s*[-*]\s*$')
 
         def clean_for_speech(text: str) -> str:
             """Strip markdown formatting that sounds awful when spoken."""
             text = _ACTION_TAG_RE.sub('', text)
             text = _CODE_BLOCK_RE.sub('', text)
-            lines = [l for l in text.split('\n') if not _TABLE_LINE_RE.match(l)]
+            # an action-pill line ("- [Action: X]") becomes a bare "- " once
+            # the tag above is stripped -- drop what's left too, or it reads
+            # out loud as a run of stray dashes
+            lines = [
+                l for l in text.split('\n')
+                if not _TABLE_LINE_RE.match(l) and not _EMPTY_BULLET_RE.match(l)
+            ]
             text = '\n'.join(lines)
+            # a markdown link reads out its own display text twice (once as
+            # the link, once as the raw URL) if left alone -- keep only the
+            # human-readable label
+            text = _MD_LINK_RE.sub(r'\1', text)
+            # any URL that wasn't part of a markdown link (a bare paste) is
+            # still unpronounceable -- drop it rather than read it letter by letter
+            text = _BARE_URL_RE.sub('', text)
             text = text.replace('**', '').replace('*', '').replace('#', '')
             text = re.sub(r'\s+', ' ', text).strip()
             return text
@@ -145,7 +161,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
                             # Emit a voice_sentence whenever a sentence boundary
                             # is detected so speechSynthesis can start speaking
                             # before the full reply is done — low latency.
-                            parts = re.split(r'(?<=[.!?\u0964])\s+', token_buf)
+                            parts = re.split(r'(?<!\d\.)(?<!\d\d\.)(?<=[.!?\u0964])\s+', token_buf)
                             if len(parts) > 1:
                                 for sentence in parts[:-1]:
                                     cleaned = clean_for_speech(sentence)

@@ -36,6 +36,12 @@ def reassign_tasks(
 
     `tasks` is a list of dicts, one per Task to (re)assign, each with:
       - "task_name" (required): the exact Task ID (e.g. 'TASK-2026-00008').
+        NEVER invent or guess a Task ID -- only use one you already know is
+        real, because it was just returned by a create/list/get call in
+        this conversation, or the user gave it to you directly. If you
+        don't have a real Task ID, look it up first (e.g. via
+        erp_data_tool's list/get) or ask the user, instead of calling this
+        tool with a made-up ID.
       - "assigned_to" (required): the team member's exact ERPNext email, OR
         a plain name this tool will try to resolve to exactly one matching
         ERPNext user. NEVER invent or guess a person's name here -- if you
