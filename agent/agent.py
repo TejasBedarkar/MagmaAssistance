@@ -112,6 +112,42 @@ def _is_write_rejection(message: str) -> bool:
     return bool(_NO_RE.match((message or "").strip()))
 
 
+_RESEARCH_FIELD_RE = {
+    "email_id": re.compile(r"-\s*Email:\s*(\S+@\S+)", re.IGNORECASE),
+    "phone": re.compile(r"-\s*Phone:\s*([+\d\t \-()]{7,})", re.IGNORECASE),
+    "address": re.compile(r"-\s*Address:\s*(.+)", re.IGNORECASE),
+    "address_line1": re.compile(r"-\s*Address Line 1:\s*(.+)", re.IGNORECASE),
+    "city": re.compile(r"-\s*City:\s*(.+)", re.IGNORECASE),
+    "state": re.compile(r"-\s*State:\s*(.+)", re.IGNORECASE),
+    "pincode": re.compile(r"-\s*Pincode:\s*(\d{6})", re.IGNORECASE),
+    "country": re.compile(r"-\s*Country:\s*(.+)", re.IGNORECASE),
+    "website": re.compile(r"Extracted details from (\S+)", re.IGNORECASE),
+    "description": re.compile(r"-\s*Description:\s*(.+)", re.IGNORECASE),
+    "is_fallback": re.compile(r"-\s*Is Fallback:\s*(Yes|True)", re.IGNORECASE),
+    "fallback_fields": re.compile(r"-\s*Fallback Fields:\s*(.+)", re.IGNORECASE),
+    "fallback_notice": re.compile(r"-\s*Fallback Notice:\s*(.+)", re.IGNORECASE),
+}
+_NOT_FOUND_RE = re.compile(r"^\s*not found\s*$", re.IGNORECASE)
+
+
+def _fields_from_research(research: str) -> dict:
+    found = {}
+    for field, pattern in _RESEARCH_FIELD_RE.items():
+        m = pattern.search(research or "")
+        if m:
+            value = m.group(1).strip()
+            # Clean off provenance annotations like (Source: ZaubaCorp / MCA Record)
+            value = re.sub(r"\s*\(Source:[^)]*\)", "", value, flags=re.IGNORECASE).strip()
+            if value and not _NOT_FOUND_RE.match(value):
+                if field == "is_fallback":
+                    found[field] = True
+                elif field == "fallback_fields":
+                    found[field] = [f.strip() for f in value.split(",") if f.strip()]
+                else:
+                    found[field] = value
+    return found
+
+
 # ---------------------------------------------------------------------
 # Tool execution dispatcher with gate enforcement and audit logging
 # ---------------------------------------------------------------------
@@ -123,10 +159,37 @@ async def _execute_tool(
     prompt_text: Optional[str] = None,
     bypass_gate: bool = False,
 ):
-    if not bypass_gate and session_id and _is_write_call(tool_name, args):
-        effective_args = state._sanitize_tool_args(tool_name, args) or {}
-        if tool_name == "erp_data_tool":
-            effective_args = {**effective_args, "session_id": session_id}
+    if tool_name in ("web_company_extract", "web_company_search", "web_crawl", "web_search", "web_fetch_page") and session_id:
+        from ERP_Unified.tools import record_web_research_activity
+        record_web_research_activity(session_id)
+
+    effective_args = state._sanitize_tool_args(tool_name, args) or {}
+    if tool_name == "erp_data_tool" and session_id:
+        effective_args = {**effective_args, "session_id": session_id}
+        doctype_str = str(effective_args.get("doctype", "")).strip()
+        if effective_args.get("operation") in ("create", "update"):
+            from ERP_Unified.tools import is_web_review_pending
+            had_web_tool = is_web_review_pending(session_id, doctype_str)
+
+            try:
+                transcript = audit_log.get_transcript(session_id)
+                for t in reversed(transcript):
+                    if t.get("tool_name") in ("web_company_extract", "web_crawl", "web_search", "web_company_search", "web_fetch_page"):
+                        had_web_tool = True
+                    if t.get("tool_name") == "web_company_extract" and t.get("content") and doctype_str.lower() == "lead":
+                        research_fields = _fields_from_research(t["content"])
+                        data_dict = dict(effective_args.get("data") or {})
+                        for k, v in research_fields.items():
+                            if k not in ("is_fallback", "fallback_fields"):
+                                data_dict.setdefault(k, v)
+                        effective_args["data"] = data_dict
+            except Exception as enrich_exc:
+                logger.debug("Could not auto-enrich Lead data from transcript: %s", enrich_exc)
+
+            if had_web_tool:
+                effective_args["web_enriched"] = True
+
+    if not bypass_gate and session_id and _is_write_call(tool_name, effective_args):
         audit_log.save_pending_approval(session_id, tool_name, effective_args)
         proposal = (
             f"PROPOSED ACTION (not yet executed): {_describe_pending_action(tool_name, effective_args)}\n"
@@ -149,9 +212,6 @@ async def _execute_tool(
             )
         return result
     try:
-        effective_args = state._sanitize_tool_args(tool_name, args) or {}
-        if tool_name == "erp_data_tool" and session_id:
-            effective_args = {**effective_args, "session_id": session_id}
         with audit_log.time_tool_call() as elapsed:
             result = await tool.ainvoke(effective_args)
         if session_id:
@@ -306,11 +366,18 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     if pending and _is_write_approval(text):
         history.append(HumanMessage(content=text))
         yield {"type": "tool_call", "name": pending["tool_name"], "args": pending["args"]}
-        result = await _execute_tool(
-            pending["tool_name"], pending["args"],
-            session_id=session_id, user_id=user_id, prompt_text=text,
-            bypass_gate=True,
+        tool_task = asyncio.create_task(
+            _execute_tool(
+                pending["tool_name"], pending["args"],
+                session_id=session_id, user_id=user_id, prompt_text=text,
+                bypass_gate=True,
+            )
         )
+        while not tool_task.done():
+            done, _ = await asyncio.wait([tool_task], timeout=1.5)
+            if not done:
+                yield {"type": "ping"}
+        result = await tool_task
         yield {"type": "tool_result", "name": pending["tool_name"], "result": result}
         summary_messages = [
             SystemMessage(content=state.assistant.llm.system_prompt),
@@ -398,8 +465,14 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             call_messages.append(ai_msg)
             history.append(ai_msg)
             for tc in tool_calls:
-                yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
-                result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
+                tool_task = asyncio.create_task(
+                    _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
+                )
+                while not tool_task.done():
+                    done, _ = await asyncio.wait([tool_task], timeout=1.5)
+                    if not done:
+                        yield {"type": "ping"}
+                result = await tool_task
                 yield {"type": "tool_result", "name": tc["name"], "result": result}
                 t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
                 call_messages.append(t_msg)

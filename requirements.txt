@@ -57,4 +57,7 @@ playsound==1.2.2
 ddgs
 beautifulsoup4
 lxml
+rapidfuzz
+tldextract
+phonenumbers
 boto3

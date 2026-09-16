@@ -62,6 +62,9 @@ async def chat_stream(req: ChatRequest):
                     user_id=effective_user_id,
                     history=history,
                 ):
+                    if event.get("type") == "ping":
+                        yield ": ping\n\n"
+                        continue
                     browser_event = {k: v for k, v in event.items() if k != "_delta"}
                     yield f"data: {json.dumps(browser_event)}\n\n"
         except Exception as exc:  # noqa: BLE001
