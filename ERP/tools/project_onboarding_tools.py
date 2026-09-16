@@ -508,6 +508,8 @@ def onboard_new_lead(
         else:
             summary.append(f"- Client email sent to {', '.join(recipients)}.")
 
+    return "\n".join(summary)
+
 
 @tool
 def batch_manage_project_tasks(

@@ -41,6 +41,7 @@ from ERP.dynamic_fields import (
     safe_call as _safe_call,
 )
 from ERP.tools.project_onboarding_tools import PROJECT_ONBOARDING_TOOLS
+from ERP.tools.task_assignment_tools import TASK_ASSIGNMENT_TOOLS
 
 BLOCKED_OPERATIONS = {"delete", "remove", "trash", "destroy", "cancel", "purge", "drop"}
 LIST_OPERATIONS = {"list", "get_list", "search", "find", "query"}
@@ -59,6 +60,18 @@ SUBMIT_OPERATIONS = {"submit"}
 # A restart of the process clears it, same tradeoff as server.py's
 # in-memory MemorySaver checkpointer.
 _PENDING_CREATES: dict[tuple, dict] = {}
+
+# Which single field a session is currently being asked about, so a direct
+# answer can be routed to that exact field server-side instead of trusting
+# the model to reconstruct the right fieldname -- it doesn't reliably do
+# that once several fields have been asked about in one create flow.
+_PENDING_CREATE_FIELD: dict[str, tuple[str, str]] = {}
+
+
+def get_pending_create_field(session_id: str) -> Optional[tuple[str, str]]:
+    """Returns (doctype, fieldname) if `session_id` is mid-way through a
+    create flow and was just asked for one specific field, else None."""
+    return _PENDING_CREATE_FIELD.get(session_id)
 
 # Web-derived values are useful suggestions, not authority to write to the
 # ERP. Keep the review requirement alongside the pending create payload so a
@@ -167,6 +180,44 @@ def _resolve_link_value(target_doctype: str, value) -> str | None:
     return None
 
 
+def _resolve_link_filters(doctype: str, filters: Optional[list]) -> tuple[Optional[list], list[str]]:
+    """Same fix as _prepare_write_data, but for `list` filters: if a Link
+    field is filtered by a human-readable name instead of its real ID (e.g.
+    BOM.item like '%HB Pencil%' instead of '=FG-001'), that silently matches
+    nothing. Resolve it to the real ID first via _resolve_link_value."""
+    if not filters:
+        return filters, []
+    try:
+        meta = erp_client.get_meta(doctype)
+    except Exception:
+        return filters, []
+    fields = {f.get("fieldname"): f for f in meta.get("fields", []) or [] if f.get("fieldname")}
+
+    resolved_filters = []
+    warnings: list[str] = []
+    for f in filters:
+        if not (isinstance(f, (list, tuple)) and len(f) == 3):
+            resolved_filters.append(f)
+            continue
+        fieldname, op, value = f
+        field = fields.get(fieldname)
+        target_doctype = field.get("options") if field else None
+        if field is None or field.get("fieldtype") != "Link" or not target_doctype or not isinstance(value, str):
+            resolved_filters.append(f)
+            continue
+        bare_value = value.strip("%").strip()
+        if not bare_value:
+            resolved_filters.append(f)
+            continue
+        resolved_id = _resolve_link_value(target_doctype, bare_value)
+        if resolved_id and resolved_id != bare_value:
+            resolved_filters.append([fieldname, "=", resolved_id])
+            warnings.append(f"Resolved {fieldname}='{value}' to {target_doctype} '{resolved_id}'.")
+        else:
+            resolved_filters.append(f)
+    return resolved_filters, warnings
+
+
 def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[str]]:
     """Validate model-produced values against the live ERPNext schema.
 
@@ -184,6 +235,18 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
         for field in meta.get("fields", []) or []
         if field.get("fieldname")
     }
+
+    if doctype.strip().lower() == "task" and cleaned.get("assigned_to"):
+        # a common, wrong instinct -- Task has no such field, assignment is
+        # a separate Frappe mechanism (frappe.desk.form.assign_to.add),
+        # exposed here via the reassign_tasks tool. Silently dropping this
+        # like any other unknown field would leave the model no way to
+        # self-correct -- name it explicitly instead.
+        warnings.append(
+            f"Ignored assigned_to='{cleaned['assigned_to']}' -- Task has no such field. "
+            "To assign or reassign a Task, use the reassign_tasks tool instead."
+        )
+        cleaned.pop("assigned_to", None)
 
     if doctype.strip().lower() == "lead" and cleaned.get("company"):
         internal_company = cleaned["company"]
@@ -277,6 +340,14 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
                 warnings.append(
                     f"Omitted {fieldname} because it requires a list of table rows, but a {type(value).__name__} was provided."
                 )
+            continue
+
+        # catches e.g. Notes getting a list instead of a string
+        if fieldtype not in ("Table", "Table MultiSelect", "Link", "Dynamic Link", "Select") and isinstance(value, (list, dict)):
+            cleaned.pop(fieldname, None)
+            warnings.append(
+                f"Omitted {fieldname} because it expects a single value, but a {type(value).__name__} was provided."
+            )
 
     return cleaned, warnings
 
@@ -424,6 +495,7 @@ def erp_data_tool(
         if op in LIST_OPERATIONS:
             req_fields = fields
             clean_filters = _normalize_filters(filters)
+            clean_filters, link_warnings = _resolve_link_filters(doctype, clean_filters)
             if not req_fields:
                 dt_lower = (doctype or "").strip().lower()
                 if dt_lower == "sales order":
@@ -443,14 +515,17 @@ def erp_data_tool(
                 elif dt_lower == "employee":
                     req_fields = ["name", "employee_name", "department", "designation", "status"]
 
-            return str(
-                erp_client.get_list(
-                    doctype,
-                    fields=req_fields,
-                    filters=clean_filters,
-                    order_by=order_by,
-                    limit=limit,
-                )
+            return _with_warnings(
+                str(
+                    erp_client.get_list(
+                        doctype,
+                        fields=req_fields,
+                        filters=clean_filters,
+                        order_by=order_by,
+                        limit=limit,
+                    )
+                ),
+                link_warnings,
             )
 
         if op in GET_OPERATIONS:
@@ -555,8 +630,22 @@ def _run_create(
             merged["country"] = country_val.strip()
 
     try:
+        # defaults first, then sanitize -- otherwise a bad schema default
+        # (e.g. a raw "Today" token) slips past _prepare_write_data's
+        # validation and reaches ERPNext as a literal, invalid value
+        merged = apply_default_values(doctype, merged)
         merged, warnings = _prepare_write_data(doctype, merged)
         if doctype.strip().lower() == "lead":
+            if (
+                merged.get("first_name")
+                and merged.get("company_name")
+                and str(merged["first_name"]).strip().casefold()
+                == str(merged["company_name"]).strip().casefold()
+            ):
+                return (
+                    "I cannot create this Lead because the person's first name was mapped "
+                    "to the organization name. Please provide or research the person's name again."
+                )
             # Ensure lead_name is populated from contact person or organization name
             if not merged.get("lead_name"):
                 merged["lead_name"] = merged.get("first_name") or merged.get("company_name")
@@ -568,6 +657,7 @@ def _run_create(
     if missing:
         _PENDING_CREATES[key] = merged
         next_field = missing[0]
+        _PENDING_CREATE_FIELD[session_id] = (doctype, next_field["fieldname"])
         message = (
             f"I need a bit more information to create this {doctype}. "
             f"{field_question(next_field)} "
@@ -578,6 +668,9 @@ def _run_create(
             f"and data={{'{next_field['fieldname']}': <answer>}}."
         )
         return _with_warnings(message, warnings)
+
+    # Nothing left to ask about -- clear the field-tracking state.
+    _PENDING_CREATE_FIELD.pop(session_id, None)
 
     if (web_enriched or key in _PENDING_WEB_REVIEWS or (session_id, "*") in _PENDING_WEB_REVIEWS) and approved is not True:
         _PENDING_CREATES[key] = merged
@@ -755,4 +848,4 @@ def erp_send_email(
     return _safe_call(f"send email to {recipients}", run)
 
 
-ERP_UNIFIED_TOOLS = [erp_data_tool, erp_describe_fields, erp_send_email, *PROJECT_ONBOARDING_TOOLS]
+ERP_UNIFIED_TOOLS = [erp_data_tool, erp_describe_fields, erp_send_email, *PROJECT_ONBOARDING_TOOLS, *TASK_ASSIGNMENT_TOOLS]

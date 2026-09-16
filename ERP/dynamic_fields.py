@@ -127,6 +127,22 @@ def missing_required_fields(doctype: str, data: dict | None) -> list[dict]:
     return get_required_fields(doctype, exclude=present)
 
 
+def _link_options_hint(target_doctype: str, limit: int = 5) -> str:
+    """A short ' -- e.g. X, Y.' suffix listing a few real records of
+    `target_doctype`, so a Link-field question has concrete, unambiguous
+    values to answer with instead of a bare doctype name. Directly guards
+    against a real observed bug: with nothing anchoring the question to
+    the right doctype, the model validated an answer against the WRONG
+    one (e.g. checking Customer when the question was about Company),
+    looping the same question forever even though the answer was valid."""
+    try:
+        records = erp_client.get_list(target_doctype, fields=["name"], limit=limit, use_cache=False)
+    except Exception:  # noqa: BLE001
+        return ""
+    names = [r["name"] for r in records if r.get("name")]
+    return f" -- e.g. {', '.join(names)}" if names else ""
+
+
 def field_question(field: dict) -> str:
     """Turns one field-meta dict (from get_required_fields) into a single
     natural-language question to ask the user — this is what powers the
@@ -138,7 +154,8 @@ def field_question(field: dict) -> str:
     options = field.get("options")
 
     if fieldtype == "Link" and options:
-        return f"What is the {label}? (this should be an existing {options} in ERPNext)"
+        hint = _link_options_hint(options)
+        return f"What is the {label}? (this should be an existing {options} in ERPNext{hint})"
     if fieldtype == "Select" and options:
         choices = [c.strip() for c in str(options).split("\n") if c.strip()]
         if choices:
@@ -202,7 +219,20 @@ def apply_default_values(doctype: str, data: dict | None) -> dict:
 
         default = f.get("default")
         if default not in (None, ""):
-            data[fieldname] = default
+            fieldtype = f.get("fieldtype")
+            if fieldtype in ("Date", "Datetime") and str(default).strip().lower() in ("today", "now"):
+                # ERPNext's schema default for a date/datetime field is often a
+                # special token meant to be evaluated at write time, not used
+                # literally -- passing "Today" straight through as a string
+                # makes ERPNext reject the write with a raw MySQL date error.
+                from datetime import datetime
+                data[fieldname] = (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if fieldtype == "Datetime"
+                    else datetime.now().strftime("%Y-%m-%d")
+                )
+            else:
+                data[fieldname] = default
             continue
 
         if f.get("fieldtype") == "Select" and f.get("options"):
