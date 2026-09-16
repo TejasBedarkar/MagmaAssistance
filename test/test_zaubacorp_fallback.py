@@ -125,7 +125,8 @@ def test_fallback_when_website_missing_both_email_and_address():
         assert "U72200MH2020PTC123456" in result
         assert "ANIL KUMAR SHARMA" in result
         assert "zaubacorp fallback" in result
-        assert "Source: ZaubaCorp / MCA Record" in result
+        # New format: "(MCA registry)" per-field tag instead of "(Source: ZaubaCorp / MCA Record)"
+        assert "(MCA registry)" in result
 
 
 def test_fallback_when_website_missing_only_address():
@@ -233,8 +234,8 @@ def test_graceful_fallback_failure():
         result = web_company_extract.invoke({"url": "https://globalcorp.com"})
 
         assert "415-555-0199" in result or "+1 415 555 0199" in result
-        assert "Email: not found" in result
-        assert "Address: not found" in result
+        # New table format uses "Not found" (capital N) instead of "not found"
+        assert "Not found" in result  # email and address both missing
 
 
 def test_parse_zaubacorp_magna_data_accordion_layout():

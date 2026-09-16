@@ -290,8 +290,9 @@ def test_web_company_extract_with_fallback():
         assert "Bombay House" in res
         assert "Mumbai" in res
         assert "400001" in res
-        assert "Is Fallback: Yes" in res
-        assert "Fallback Fields:" in res
+        # New format: person fallback shown as emoji block, not "Is Fallback: Yes"
+        assert "John Doe" in res
+        assert "Not found" in res or "using company contact" in res  # person not found → company fallback shown
 
 
 def test_transparency_notification_in_execute_pending():
@@ -532,25 +533,22 @@ def test_web_company_extract_condition_1_vs_condition_2():
         # Condition 1 - Person Found
         res1 = web_company_extract.invoke({"url": "https://magnadata.com", "person_name": "Rajat Sharma"})
         assert "rajat.sharma@magnadata.com" in res1
-        assert "Person Name: Rajat Sharma" in res1
-        assert "Direct Person Found: Yes" in res1
-        assert "Is Fallback: No" in res1
+        # New format: person status shown in emoji block
+        assert "Rajat Sharma" in res1
+        assert "Found directly" in res1  # ✓ Found directly
 
         # Condition 1 - Person Not Found
         res1_fallback = web_company_extract.invoke({"url": "https://magnadata.com", "person_name": "Amit Patel"})
         assert "info@magnadata.com" in res1_fallback
-        assert "Person Name: Amit Patel" in res1_fallback
-        assert "Direct Person Found: No" in res1_fallback
-        assert "Is Fallback: Yes" in res1_fallback
-        assert "Fallback Notice:" in res1_fallback
+        # New format: person shown as "not found → using company contact"
         assert "Amit Patel" in res1_fallback
+        assert "using company contact" in res1_fallback or "Not found" in res1_fallback
 
-        # Condition 2 - Company Only
+        # Condition 2 - Company Only (no person_name → no person block)
         res2 = web_company_extract.invoke({"url": "https://magnadata.com", "person_name": None})
         assert "info@magnadata.com" in res2
-        assert "Person Name" not in res2
-        assert "Is Fallback" not in res2
-        assert "Fallback Notice" not in res2
+        assert "Found directly" not in res2  # No person block present
+        assert "using company contact" not in res2  # No person block present
 
 
 def test_web_company_extract_accepts_and_propagates_person_name():
@@ -565,8 +563,9 @@ def test_web_company_extract_accepts_and_propagates_person_name():
         )
         res = web_company_extract.invoke({"url": "https://magnadata.com", "person_name": "Rajat Sharma"})
         assert "rajat.sharma@magnadata.com" in res
-        assert "Person Name: Rajat Sharma" in res
-        assert "Direct Person Found: Yes" in res
+        # New format: person shown in emoji block
+        assert "Rajat Sharma" in res
+        assert "Found directly" in res  # ✓ Found directly
 
 
 def test_describe_pending_action_condition_1_vs_condition_2():

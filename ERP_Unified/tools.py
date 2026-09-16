@@ -619,10 +619,12 @@ def _run_create(
     merged = {**pending, **(data or {})}
     warnings: list[str] = []
     if web_enriched:
+        # Mark this specific doctype+session as web-enriched for the review gate
         _PENDING_WEB_REVIEWS.add(key)
-    elif (session_id, "*") in _PENDING_WEB_REVIEWS or (session_id, doctype) in _PENDING_WEB_REVIEWS:
+    elif (session_id, doctype) in _PENDING_WEB_REVIEWS:
+        # Re-use web_enriched status only if the same doctype in this session was already web-enriched
+        # (e.g., partial create re-entry). Does NOT bleed across unrelated doctypes.
         web_enriched = True
-        _PENDING_WEB_REVIEWS.add(key)
 
     # Preserve address details before schema filtering for DocTypes that use separate Address records (e.g. Lead)
     address_info = {}

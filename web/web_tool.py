@@ -551,7 +551,16 @@ def _legacy_web_company_search(name: str, hint: str) -> str:
     if not found_any:
         return ""
 
-    lines.append("\nAsk the user to confirm which URL is correct. Once confirmed, use `web_company_extract` on that URL.")
+    lines.append(
+        "\n--- WAITING FOR USER SELECTION ---\n"
+        "Present the above candidates to the user exactly as shown. Then STOP and wait.\n"
+        "Ask the user:\n"
+        "  'Please choose a website to extract contact details from:\n"
+        "   - Reply with 1, 2, or 3 to select a candidate above.\n"
+        "   - Or type a URL directly if you know the correct website.\n"
+        "   - Or say \"none\" to skip web enrichment and create the lead manually.'\n"
+        "Once the user replies with a choice or URL, call `web_company_extract` with that confirmed URL."
+    )
     return "\n".join(lines)
 
 
@@ -589,7 +598,16 @@ def web_company_search(company_name: str, search_hint: Optional[str] = None) -> 
                 f"   title: {c.title or '(none)'}\n"
                 f"   why: {'; '.join(c.reasons)}"
             )
-        lines.append("\nAsk the user to confirm which URL is correct. Once confirmed, use `web_company_extract` on that URL.")
+        lines.append(
+            "\n--- WAITING FOR USER SELECTION ---\n"
+            "Present the above candidates to the user exactly as shown. Then STOP and wait.\n"
+            "Ask the user:\n"
+            "  'Please choose a website to extract contact details from:\n"
+            "   - Reply with 1, 2, or 3 to select a candidate above.\n"
+            "   - Or type a URL directly if you know the correct website.\n"
+            "   - Or say \"none\" to skip web enrichment and create the lead manually.'\n"
+            "Once the user replies with a choice or URL, call `web_company_extract` with that confirmed URL."
+        )
         return "\n".join(lines)
 
     # Resolver found nothing (or errored) — try the legacy search path.
@@ -599,47 +617,6 @@ def web_company_search(company_name: str, search_hint: Optional[str] = None) -> 
 
     return f"No websites found for '{name}'."
 
-
-def _legacy_web_company_extract(url: str) -> str:
-    """Original mailto:/tel:-only extraction. Kept as a fallback for when
-    the richer extractor (company_crawler.extractor) finds nothing at all
-    -- e.g. a site structure it doesn't recognize."""
-    try:
-        resp = requests.get(url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
-        resp.raise_for_status()
-    except Exception as e:
-        return f"Could not reach {url}: {e}"
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    emails, phones = _extract_contacts(soup)
-
-    description = ""
-    meta = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
-    if meta and meta.get("content"):
-        description = meta["content"].strip()[:300]
-
-    if not emails and not phones:
-        contact_url = _find_contact_page_link(soup, url)
-        if contact_url:
-            try:
-                c_resp = requests.get(contact_url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT)
-                c_resp.raise_for_status()
-                c_soup = BeautifulSoup(c_resp.text, "html.parser")
-                emails, phones = _extract_contacts(c_soup)
-            except Exception:
-                pass
-
-    if not emails and not phones and not description:
-        return ""
-
-    lines = [f"Extracted details from {url} (fallback extractor):"]
-    lines.append(f"- Email: {emails[0] if emails else 'not found'}")
-    lines.append(f"- Phone: {phones[0] if phones else 'not found'}")
-    if description:
-        lines.append(f"- Description: {description}")
-
-    lines.append("\nIMPORTANT: Do NOT create any record in ERPNext yet. Propose these extracted details to the user and ask for their explicit permission/confirmation to proceed with record creation.")
-    return "\n".join(lines)
 
 
 @tool
@@ -865,50 +842,80 @@ def web_company_extract(url: str, person_name: Optional[str] = None, company_nam
             fallback_notice = None
 
         if primary_email or primary_phone or primary_address or description:
-            lines = [f"Extracted details from {url} (source: {source}):"]
-            
-            email_suffix = " (Source: ZaubaCorp / MCA Record)" if zauba_email_used else ""
-            address_suffix = " (Source: ZaubaCorp / MCA Record)" if zauba_address_used else ""
+            zauba_notice = ""
+            if zauba_data and (zauba_email_used or zauba_address_used):
+                zauba_notice = (
+                    "\n⚠  Email or address was not found on the official website.\n"
+                    "   Falling back to ZaubaCorp (MCA public registry) for missing fields.\n"
+                )
 
-            lines.append(f"- Email: {primary_email or 'not found'}{email_suffix}")
-            lines.append(f"- Phone: {primary_phone or 'not found'}")
-            lines.append(f"- Address: {primary_address or 'not found'}{address_suffix}")
-            if parsed_addr:
-                if parsed_addr.get("address_line1"):
-                    lines.append(f"- Address Line 1: {parsed_addr['address_line1']}")
-                if parsed_addr.get("city"):
-                    lines.append(f"- City: {parsed_addr['city']}")
-                if parsed_addr.get("state"):
-                    lines.append(f"- State: {parsed_addr['state']}")
-                if parsed_addr.get("pincode"):
-                    lines.append(f"- Pincode: {parsed_addr['pincode']}")
-                if parsed_addr.get("country"):
-                    lines.append(f"- Country: {parsed_addr['country']}")
+            # Build formatted review table
+            def _field(label: str, value: str, source_tag: str = "") -> str:
+                val = value if value else "Not found"
+                tag = f"  {source_tag}" if source_tag else ""
+                return f"| {label:<18} | {val}{tag} |"
+
+            email_tag = "(MCA registry)" if zauba_email_used else ""
+            address_tag = "(MCA registry)" if zauba_address_used else ""
+
+            addr_line1 = parsed_addr.get("address_line1", "") if parsed_addr else ""
+            city_val = parsed_addr.get("city", "") if parsed_addr else ""
+            state_val = parsed_addr.get("state", "") if parsed_addr else ""
+            pincode_val = parsed_addr.get("pincode", "") if parsed_addr else ""
+            country_val = parsed_addr.get("country", "") if parsed_addr else ""
+
+            table_rows = [
+                "| Field              | Value                           |",
+                "|--------------------|----------------------------------|",
+                _field("Email", primary_email or "", email_tag),
+                _field("Phone", primary_phone or ""),
+                _field("Address", primary_address or "", address_tag),
+            ]
+            if addr_line1:
+                table_rows.append(_field("Address Line 1", addr_line1))
+            if city_val:
+                table_rows.append(_field("City", city_val))
+            if state_val:
+                table_rows.append(_field("State", state_val))
+            if pincode_val:
+                table_rows.append(_field("Pincode", pincode_val))
+            if country_val:
+                table_rows.append(_field("Country", country_val))
             if description:
-                lines.append(f"- Description: {description}")
-            if zauba_data:
-                if zauba_data.cin:
-                    lines.append(f"- CIN: {zauba_data.cin}")
-                if zauba_data.directors:
-                    lines.append(f"- Directors (MCA): {', '.join(zauba_data.directors)}")
-            if target_person:
-                lines.append(f"- Person Name: {target_person}")
-                lines.append(f"- Direct Person Found: {'Yes' if direct_person_found else 'No'}")
-                lines.append(f"- Is Fallback: {'Yes' if is_fallback else 'No'}")
-                if is_fallback and fallback_fields:
-                    lines.append(f"- Fallback Fields: {', '.join(fallback_fields)}")
-                if is_fallback and fallback_notice:
-                    lines.append(f"- Fallback Notice: {fallback_notice}")
-            lines.append("\nIMPORTANT: Do NOT create any record in ERPNext yet. Propose these extracted details to the user and ask for their explicit permission/confirmation to proceed with record creation.")
-            return "\n".join(lines)
-    except Exception as exc:
-        logger.warning("company_crawler extractor failed for '%s' (%s) — falling back to legacy extractor.", url, exc)
+                table_rows.append(_field("Description", description[:120] + ("..." if len(description) > 120 else "")))
+            if zauba_data and zauba_data.cin:
+                table_rows.append(_field("CIN", zauba_data.cin, "(MCA registry)"))
+            if zauba_data and zauba_data.directors:
+                table_rows.append(_field("Directors", ", ".join(zauba_data.directors[:3]), "(MCA registry)"))
 
-    fallback = _legacy_web_company_extract(url)
-    if fallback:
-        return fallback
+            person_block = ""
+            if target_person:
+                person_status = "✓ Found directly" if direct_person_found else "✗ Not found — using company contact"
+                person_block = (
+                    f"\n👤 Person: **{target_person}** — {person_status}\n"
+                )
+                if is_fallback and fallback_notice:
+                    person_block += f"   ⚠  {fallback_notice}\n"
+
+            lines = [
+                f"--- EXTRACTION COMPLETE ---",
+                f"Source: {url} (via {source}){zauba_notice}",
+                "",
+                *table_rows,
+                person_block,
+                "\n--- ACTION REQUIRED ---",
+                "Present the above details to the user in a clear table. Then STOP and wait.",
+                "Ask: 'Do all these details look correct? Tell me if you want to change any field, or say \"proceed\" to create the lead.'",
+                "Wait for user confirmation or corrections before calling erp_data_tool.",
+                "If the user approves, call erp_data_tool(operation='create', web_enriched=True, approved=True) with ALL available fields.",
+            ]
+            return "\n".join(lines)
+
+    except Exception as exc:
+        logger.warning("company_crawler extractor failed for '%s' (%s) — no contact details found.", url, exc)
 
     return f"Could not extract any contact details from {url}."
+
 
 
 WEB_TOOLS = [web_search, web_fetch_page, web_crawl, web_company_search, web_company_extract]
