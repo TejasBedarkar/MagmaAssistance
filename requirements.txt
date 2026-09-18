@@ -60,4 +60,5 @@ lxml
 rapidfuzz
 tldextract
 phonenumbers
+playwright
 boto3
