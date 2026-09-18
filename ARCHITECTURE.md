@@ -271,11 +271,17 @@ could silently break.
       `scripts/run_llm_cli.py`. Re-exports preserved on `LLM/LLM.py` and `LLM/__init__.py`.
 
 *Optional, only if the person has spare time — each is one cohesive domain, not urgent:*
-- [ ] `web/web_tool.py` (~680) — split the HTML-scraping helpers from the `@tool` defs.
-- [ ] `ERP_Unified/tools.py` (~640) — extract `_prepare_write_data` / `_resolve_link_value` /
-      `_normalize_filters` into `ERP_Unified/validation.py`. **Core code — touch carefully.**
-- [ ] `ERP/tools/project_onboarding_tools.py` (~660) — extract the helpers from the
-      onboard_new_lead workflow.
+- [x] `web/web_tool.py` — superseded, not split: the crawler PR replaced its scraping
+      internals outright with the `web/company_crawler/` package (resolver/crawler/
+      extractor/zaubacorp/blocklist), which already solves the same "file too big"
+      problem with a better design. Splitting the old code into `web/scraper.py` would
+      have resurrected logic that no longer exists.
+- [x] `ERP_Unified/tools.py` (~1070 → ~706, after the crawler PR's own additions here too) —
+      extracted `_prepare_write_data` / `_resolve_link_value` / `_normalize_filters` /
+      `_is_valid_email` / `_with_warnings` into `ERP_Unified/validation.py`, along with the
+      filter-parsing and Lead/Opportunity-ID-reuse guards added alongside them. Re-exports preserved.
+- [x] `ERP/tools/project_onboarding_tools.py` (~660 → ~469) — extracted helpers into
+      `ERP/tools/project_onboarding_helpers.py`. Re-exports preserved.
 
 *Leave alone:* `ERP/erp_client.py` (~580) — one cohesive class, long is fine.
 `db/postgres_audit_log.py` — handled in P2 (audit → SQLite). `MagnaCLI.py` — dev tool.
