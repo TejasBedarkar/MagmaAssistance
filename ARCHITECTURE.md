@@ -23,12 +23,13 @@
 
 ```
 Browser (React app, loaded from Frappe)
-  │  fetch POST https://ai.tjdem.online/api/chat/stream   (SSE)   — NO auth header
+  │  fetch POST https://ai.tjdem.online/api/chat/stream   (SSE)
   │  or  WebSocket  wss://ai.tjdem.online/ws/voice
+  │       mic PCM → Realtime STT → same stream_agent_turn → OpenAI TTS PCM
   ▼
 MagmaAssistance  (EC2, systemd magmaassistance.service, port 8050; LLM_MODEL=gpt-4o)
-  server.py : stream_agent_turn()          ← hand-rolled ReAct loop, ≤4 tool rounds
-  server.py : _execute_tool()              ← single tool dispatch + audit (SQLite in P2, Postgres today)
+  agent/ : stream_agent_turn()          ← hand-rolled ReAct loop, ≤4 tool rounds
+  agent/ : _execute_tool()              ← single tool dispatch + audit (SQLite)
   ▼
 ERP_Unified/tools.py : erp_data_tool()     ← one generic tool for ANY doctype
   ▼
@@ -80,7 +81,10 @@ Manufacturing multi-step planner = backlog, not now.
 - `ERP/dynamic_fields.py`, `ERP/doctype_knowledge.py`
 - `LLM/LLM.py` — `LLM` class, `GENERAL_ERP_PROMPT`, `extract_po_data_from_document`, `extract_document_text`
 - **audit logging** — the *concept* is kept, but move it to SQLite (see Storage note below + P2)
-- `Voice/ws_voice.py`, `TTS/TTS.py`, `TTS/STT.py`, `storage/s3_storage.py`
+- `Voice/ws_voice.py` (`/ws/voice`), `Voice/realtime_stt.py` (OpenAI Realtime transcription),
+  `TTS/TTS.py`, `TTS/STT.py` (one-shot file STT), `routes/voice.py` (HTTP `/api/tts*`),
+  `storage/s3_storage.py`
+- `config.py` — shared env defaults (LLM, TTS, live-voice STT VAD knobs)
 - `custom_ui/public/js/magna_ai_assistant/` (the React app)
 - `custom_ui/api/{metadata,auth,access_control,crud}.py` — **unused today, needed for RBAC. Keep.**
 
@@ -158,8 +162,11 @@ If P4 mixes these, the multi-site migration is painful; if clean, it's a small c
 
 ### Other decisions
 
-- **Realtime/WebRTC voice** — not a product goal for now. Browser Web Speech (free, current)
-  is enough. The WebRTC path is slated for deletion in P2 (not done yet); can return later if needed.
+- **Live voice** — `/ws/voice` over OpenAI Realtime STT (`Voice/realtime_stt.py`,
+  transcription-only + server_vad) and OpenAI TTS PCM out (`TTS/TTS.py`). Same
+  `stream_agent_turn` as chat. Browser Web Speech was retired 16–17 Sep 2026.
+  The old WebRTC/Realtime conversation path was deleted in P2; do not revive it
+  without a product decision.
 - **Multi-agent workflow** — settled: single streaming agent + code-enforced write gate
   (both shipped in P1). Manufacturing multi-step planner = backlog.
 
@@ -280,10 +287,11 @@ P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approv
 
 ## 6. Reading order for anyone new
 
-1. `server.py` → `stream_agent_turn` (L1047), `_execute_tool` (L879)
+1. `agent/` → `stream_agent_turn`, `_execute_tool`, write-approval gate
 2. `ERP_Unified/tools.py` → `erp_data_tool`, `_run_create`
 3. `ERP/erp_client.py` → `use_identity`, `_auth_headers`, `resolve_identity`
-4. `LLM/LLM.py` → `GENERAL_ERP_PROMPT`
-5. `custom_ui/.../AssistantPortal.jsx` → `streamAssistantTurn` + the `/ws/voice` block
-6. `custom_ui/api/metadata.py` + `auth.py` — the RBAC building block
-7. `db/postgres_audit_log.py` + `audit_log.py` (root) — the audit story (being merged into one SQLite module in P2)
+4. `LLM/prompts.py` + `LLM/client.py` → system prompt + LLM wrapper
+5. `Voice/ws_voice.py` + `Voice/realtime_stt.py` → live voice transport (same agent as chat)
+6. `custom_ui/.../AssistantPortal.jsx` → `streamAssistantTurn` + `/ws/voice` block
+7. `custom_ui/api/metadata.py` + `auth.py` — the RBAC building block
+8. `db/postgres_audit_log.py` — audit (SQLite-backed despite the module name; see P2)

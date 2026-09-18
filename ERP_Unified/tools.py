@@ -42,6 +42,7 @@ from ERP.dynamic_fields import (
 )
 from ERP.tools.project_onboarding_tools import PROJECT_ONBOARDING_TOOLS
 from ERP.tools.task_assignment_tools import TASK_ASSIGNMENT_TOOLS
+from ERP.tools.crm_conversion_tools import CRM_CONVERSION_TOOLS
 
 BLOCKED_OPERATIONS = {"delete", "remove", "trash", "destroy", "cancel", "purge", "drop"}
 LIST_OPERATIONS = {"list", "get_list", "search", "find", "query"}
@@ -72,6 +73,16 @@ def get_pending_create_field(session_id: str) -> Optional[tuple[str, str]]:
     """Returns (doctype, fieldname) if `session_id` is mid-way through a
     create flow and was just asked for one specific field, else None."""
     return _PENDING_CREATE_FIELD.get(session_id)
+
+
+def get_pending_create_data(session_id: str, doctype: str) -> dict:
+    """Returns whatever has already been accumulated for this session's
+    in-progress create flow on `doctype` (empty dict if none) -- used to
+    build an accurate write-approval preview. The actual create call
+    already merges this internally regardless; this is purely so the gate
+    can DISPLAY the full picture instead of just the one field the model
+    happened to pass on this specific turn."""
+    return dict(_PENDING_CREATES.get((session_id, doctype), {}))
 
 # Web-derived values are useful suggestions, not authority to write to the
 # ERP. Keep the review requirement alongside the pending create payload so a
@@ -206,6 +217,33 @@ def _resolve_link_value(target_doctype: str, value) -> str | None:
     return None
 
 
+def _fallback_to_name_filter(doctype: str, filters: Optional[list], fields, order_by, limit: int):
+    """If a `list` query on a non-`name` field returns nothing, some
+    doctypes (Item, Customer, Supplier, ...) use `name` itself as the
+    business code (e.g. Item.name IS the item_code, not item_name) -- a
+    query on item_name/customer_name for a value that's actually the code
+    silently returns empty. Retry once against `name` directly before
+    reporting that nothing was found."""
+    if not filters:
+        return None, []
+    candidate = None
+    for f in filters:
+        if isinstance(f, (list, tuple)) and len(f) == 3 and f[0] != "name" and isinstance(f[2], str):
+            candidate = f[2].strip("%").strip()
+            break
+    if not candidate:
+        return None, []
+    try:
+        retry = erp_client.get_list(
+            doctype, fields=fields, filters=[["name", "=", candidate]], order_by=order_by, limit=limit
+        )
+    except Exception:  # noqa: BLE001
+        return None, []
+    if retry:
+        return retry, [f"No match on the requested field, but found by name='{candidate}' instead."]
+    return None, []
+
+
 def _resolve_link_filters(doctype: str, filters: Optional[list]) -> tuple[Optional[list], list[str]]:
     """Same fix as _prepare_write_data, but for `list` filters: if a Link
     field is filtered by a human-readable name instead of its real ID (e.g.
@@ -242,6 +280,36 @@ def _resolve_link_filters(doctype: str, filters: Optional[list]) -> tuple[Option
         else:
             resolved_filters.append(f)
     return resolved_filters, warnings
+
+
+_NAMING_TEMPLATE_RE = re.compile(r'\.(YYYY|YY|MM|DD|#+)\b')
+
+
+def _looks_like_naming_template(value) -> bool:
+    """True for a raw Frappe naming-series pattern like 'CUST-.YYYY.-', which is a template, not a record ID."""
+    return isinstance(value, str) and bool(_NAMING_TEMPLATE_RE.search(value))
+
+
+# Doctypes convert_crm_record can move a record on from -- if a value that
+# failed to resolve turns out to actually be one of these, the model almost
+# certainly reused that record's own ID instead of converting it first.
+_PIPELINE_SOURCE_DOCTYPES = ("Lead", "Opportunity", "Quotation")
+
+
+def _find_pipeline_source(target_doctype: str, value) -> Optional[str]:
+    """If `value` is really the ID of a Lead/Opportunity/Quotation instead of a {target_doctype}, return which."""
+    if not isinstance(value, str) or not value:
+        return None
+    for src in _PIPELINE_SOURCE_DOCTYPES:
+        if src == target_doctype:
+            continue
+        try:
+            matches = erp_client.get_list(src, fields=["name"], filters=[["name", "=", value]], limit=1, use_cache=False)
+        except Exception:
+            continue
+        if matches:
+            return src
+    return None
 
 
 def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[str]]:
@@ -340,10 +408,27 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
                     raise
                 if not resolved_id:
                     cleaned.pop(fieldname, None)
-                    warnings.append(
-                        f"Omitted {fieldname}='{value}' because no matching "
-                        f"{target_doctype} exists in ERPNext."
-                    )
+                    if _looks_like_naming_template(value):
+                        warnings.append(
+                            f"Omitted {fieldname}='{value}' -- that's a naming "
+                            f"series template, not a real record ID. Use the exact "
+                            f"`name` value an earlier tool result actually returned "
+                            f"for that {target_doctype}, not one guessed from its pattern."
+                        )
+                    else:
+                        source_doctype = _find_pipeline_source(target_doctype, value)
+                        if source_doctype:
+                            warnings.append(
+                                f"Omitted {fieldname}='{value}' -- that's the ID of an "
+                                f"existing {source_doctype}, not a {target_doctype}. "
+                                f"Convert it with convert_crm_record first, then use the "
+                                f"{target_doctype} ID that returns."
+                            )
+                        else:
+                            warnings.append(
+                                f"Omitted {fieldname}='{value}' because no matching "
+                                f"{target_doctype} exists in MagnaERP."
+                            )
                 else:
                     cleaned[fieldname] = resolved_id
             elif fieldtype == "Dynamic Link":
@@ -409,6 +494,24 @@ _OPERATOR_MAP = {
 }
 
 
+_KNOWN_OPS = {"like", "notlike", "=", "!=", ">", ">=", "<", "<="} | set(_OPERATOR_MAP)
+
+
+def _looks_like_operator(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.lower().replace(" ", "").replace("_", "").replace("-", "") in _KNOWN_OPS
+
+
+def _filter_triple(field: str, op: str, value):
+    """Builds one [field, op, value] filter, adding % wildcards to a bare 'like' value."""
+    op_key = str(op).lower().replace(" ", "").replace("_", "").replace("-", "")
+    clean_op = _OPERATOR_MAP.get(op_key, str(op))
+    if op_key in ("like", "notlike") and isinstance(value, str) and "%" not in value:
+        value = f"%{value}%"
+    return [field, clean_op, value]
+
+
 def _normalize_filters(filters: Optional[list | dict]) -> Optional[list]:
     """Convert natural language comparison operators ('greater than', 'greaterthan', 'less than')
     to standard SQL/Frappe comparison operators ('>', '<', '>=', etc.). Also handles
@@ -421,26 +524,36 @@ def _normalize_filters(filters: Optional[list | dict]) -> Optional[list]:
         if isinstance(f, tuple) and len(f) == 2 and isinstance(f[0], str):
             k, v = f
             if isinstance(v, (list, tuple)) and len(v) == 2:
-                key = str(v[0]).lower().replace(" ", "").replace("_", "").replace("-", "")
-                normalized.append([k, _OPERATOR_MAP.get(key, str(v[0])), v[1]])
+                normalized.append(_filter_triple(k, v[0], v[1]))
             elif isinstance(v, (list, tuple)) and len(v) >= 3:
                 normalized.append(list(v))
             else:
                 normalized.append([k, "=", v])
         elif isinstance(f, dict):
+            # A model sometimes spells one filter as two dict keys instead of
+            # the documented {field: [op, val]} -- e.g. {field: "like", "value":
+            # x} or even {field: "like", x: ""} with the value used as a key.
+            # Whichever key's value reads as an operator is the field/op pair;
+            # the other pair supplies the actual value (its value if present,
+            # else its own key, since that's where the model put the value).
+            if len(f) == 2:
+                pairs = list(f.items())
+                op_pair = next((p for p in pairs if _looks_like_operator(p[1])), None)
+                if op_pair:
+                    field, op = op_pair
+                    other_key, other_val = next(p for p in pairs if p is not op_pair)
+                    value = other_val if other_val not in (None, "") else other_key
+                    normalized.append(_filter_triple(field, op, value))
+                    continue
             for k, v in f.items():
                 if isinstance(v, (list, tuple)) and len(v) == 2:
-                    key = str(v[0]).lower().replace(" ", "").replace("_", "").replace("-", "")
-                    normalized.append([k, _OPERATOR_MAP.get(key, str(v[0])), v[1]])
+                    normalized.append(_filter_triple(k, v[0], v[1]))
                 elif isinstance(v, (list, tuple)) and len(v) >= 3:
                     normalized.append(list(v))
                 else:
                     normalized.append([k, "=", v])
         elif isinstance(f, (list, tuple)) and len(f) >= 3:
-            field, raw_op, val = f[0], str(f[1]), f[2]
-            key = raw_op.lower().replace(" ", "").replace("_", "").replace("-", "")
-            clean_op = _OPERATOR_MAP.get(key, raw_op)
-            normalized.append([field, clean_op, val])
+            normalized.append(_filter_triple(f[0], f[1], f[2]))
         else:
             normalized.append(f)
     return normalized
@@ -454,7 +567,7 @@ def erp_data_tool(
     fields: Optional[list] = None,
     filters: Optional[list] = None,
     order_by: Optional[str] = None,
-    limit: int = 20,
+    limit: Optional[int] = None,
     data: Optional[dict] = None,
     submit: bool = False,
     session_id: str = "default",
@@ -511,7 +624,7 @@ def erp_data_tool(
     if op in BLOCKED_OPERATIONS:
         return (
             f"The '{operation}' operation is not permitted through this tool. "
-            "Only read, create, and update operations are allowed on ERPNext data."
+            "Only read, create, and update operations are allowed on MagnaERP data."
         )
 
     if op in CREATE_OPERATIONS:
@@ -522,8 +635,8 @@ def erp_data_tool(
             req_fields = fields
             clean_filters = _normalize_filters(filters)
             clean_filters, link_warnings = _resolve_link_filters(doctype, clean_filters)
+            dt_lower = (doctype or "").strip().lower()
             if not req_fields:
-                dt_lower = (doctype or "").strip().lower()
                 if dt_lower == "sales order":
                     req_fields = ["name", "customer", "transaction_date", "grand_total", "status"]
                 elif dt_lower == "work order":
@@ -541,18 +654,44 @@ def erp_data_tool(
                 elif dt_lower == "employee":
                     req_fields = ["name", "employee_name", "department", "designation", "status"]
 
-            return _with_warnings(
-                str(
-                    erp_client.get_list(
-                        doctype,
-                        fields=req_fields,
-                        filters=clean_filters,
-                        order_by=order_by,
-                        limit=limit,
-                    )
-                ),
-                link_warnings,
+            effective_order_by = order_by
+            # Deterministic, code-level cap for Leads instead of relying on
+            # the model to slice/count a returned list itself -- it doesn't
+            # do that reliably. Treat an explicit limit=10 the same as no
+            # limit at all: the model is told not to pass it, but sometimes
+            # redundantly does anyway, and 10 rows + a remaining-count line
+            # is the right result either way. Any other explicit limit
+            # (e.g. "show me 20 leads") is respected as a genuine ask.
+            auto_cap_leads = dt_lower == "lead" and (limit is None or limit == 10)
+            if dt_lower == "lead":
+                if not effective_order_by:
+                    effective_order_by = "creation desc"
+                fetch_limit = 200 if auto_cap_leads else limit
+            else:
+                fetch_limit = limit if limit is not None else 20
+
+            results = erp_client.get_list(
+                doctype, fields=req_fields, filters=clean_filters, order_by=effective_order_by, limit=fetch_limit,
             )
+            if not results and clean_filters:
+                fallback, fallback_warnings = _fallback_to_name_filter(
+                    doctype, clean_filters, req_fields, effective_order_by, fetch_limit
+                )
+                if fallback:
+                    results = fallback
+                    link_warnings = link_warnings + fallback_warnings
+
+            summary_prefix = ""
+            if auto_cap_leads and len(results) > 10:
+                total = len(results)
+                remaining = total - 10
+                results = results[:10]
+                summary_prefix = (
+                    f"Showing the 10 most recent Leads out of {total} total "
+                    f"({remaining} more not shown).\n"
+                )
+
+            return _with_warnings(summary_prefix + str(results), link_warnings)
 
         if op in GET_OPERATIONS:
             if not name:
@@ -599,6 +738,44 @@ def _review_text(doctype: str, data: dict) -> str:
     """Render a concise, non-ambiguous review payload for user approval."""
     visible = [f"- {field}: {value}" for field, value in data.items() if value not in (None, "", [], {})]
     return "\n".join(visible) if visible else "- No fields were supplied"
+
+
+_MISSING_FIELD_ERROR_PATTERNS = [
+    re.compile(r"please enter ([A-Za-z0-9 /&()-]+?)(?:\.|$)", re.IGNORECASE),
+    re.compile(r"^([A-Za-z0-9 /&()-]+?) is mandatory", re.IGNORECASE),
+]
+
+
+def _guess_missing_field(doctype: str, error_text: str) -> Optional[dict]:
+    """ERPNext's own custom validate() methods (not just schema reqd=1)
+    often reject a create with a 'Please enter X' / 'X is mandatory'
+    message -- these fields never show up in missing_required_fields()
+    (which only reads schema-level reqd), so nothing here previously knew
+    which real fieldname X was. Best-effort match the label back to a
+    real field so the same field-routing nudge that handles a schema-
+    required field can pick this up too, instead of the model losing
+    track of the whole in-progress record once this kind of error hits."""
+    label_guess = None
+    for pattern in _MISSING_FIELD_ERROR_PATTERNS:
+        m = pattern.search(error_text)
+        if m:
+            label_guess = m.group(1).strip()
+            break
+    if not label_guess:
+        return None
+    try:
+        meta = erp_client.get_meta(doctype)
+    except Exception:  # noqa: BLE001
+        return None
+    for f in meta.get("fields", []) or []:
+        if (f.get("label") or "").strip().lower() == label_guess.lower():
+            return {
+                "fieldname": f.get("fieldname"),
+                "label": f.get("label"),
+                "fieldtype": f.get("fieldtype"),
+                "options": f.get("options"),
+            }
+    return None
 
 
 def _run_create(
@@ -780,8 +957,22 @@ def _run_create(
         _PENDING_WEB_REVIEWS.discard((session_id, "*"))
         return str(result)
 
-    outcome = _with_warnings(_safe_call(f"create {doctype}", run), warnings)
-    return outcome
+    outcome = _safe_call(f"create {doctype}", run)
+    if isinstance(outcome, str) and outcome.startswith("Couldn't"):
+        guessed = _guess_missing_field(doctype, outcome)
+        if guessed:
+            # ERPNext's server-side check rejected this even though the
+            # schema-level missing_required_fields() pass above found
+            # nothing wrong -- persist what we already had so the next
+            # turn's merge (line 649) doesn't start from empty.
+            _PENDING_CREATES[key] = merged
+            _PENDING_CREATE_FIELD[session_id] = (doctype, guessed["fieldname"])
+            outcome += (
+                f"\n{field_question(guessed)} Once you have the answer, call "
+                f"erp_data_tool again with operation='create', doctype='{doctype}', "
+                f"session_id='{session_id}', and data={{'{guessed['fieldname']}': <answer>}}."
+            )
+    return _with_warnings(outcome, warnings)
 
 
 @tool
@@ -810,7 +1001,7 @@ def erp_describe_fields(doctype: str) -> str:
                 lines.append(f"- {f['label']}: {f['fieldname']} [{f['fieldtype']}]")
         lines.append("")
         if not req:
-            lines.append("ERPNext does not mark any user-supplied field as required for creation.")
+            lines.append("MagnaERP does not mark any user-supplied field as required for creation.")
         else:
             lines.append("Required fields for creation:")
             for f in req:
@@ -876,4 +1067,7 @@ def erp_send_email(
     return _safe_call(f"send email to {recipients}", run)
 
 
-ERP_UNIFIED_TOOLS = [erp_data_tool, erp_describe_fields, erp_send_email, *PROJECT_ONBOARDING_TOOLS, *TASK_ASSIGNMENT_TOOLS]
+ERP_UNIFIED_TOOLS = [
+    erp_data_tool, erp_describe_fields, erp_send_email,
+    *PROJECT_ONBOARDING_TOOLS, *TASK_ASSIGNMENT_TOOLS, *CRM_CONVERSION_TOOLS,
+]

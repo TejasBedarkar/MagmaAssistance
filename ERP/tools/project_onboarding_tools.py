@@ -219,12 +219,12 @@ def _resolve_assignee(identifier: str) -> Dict[str, Any]:
             use_cache=False,
         )
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"could not look up ERPNext user '{identifier}': {exc}"}
+        return {"error": f"could not look up MagnaERP user '{identifier}': {exc}"}
 
     if matches:
         if len(matches) > 1:
             names = ", ".join(f"{m.get('full_name')} <{m.get('name')}>" for m in matches)
-            return {"error": f"'{identifier}' matches more than one ERPNext user ({names}) -- use exact email"}
+            return {"error": f"'{identifier}' matches more than one MagnaERP user ({names}) -- use exact email"}
         return {"user": matches[0]["name"]}
 
     # 3. If no User matches, try searching Employee by employee_name
@@ -240,7 +240,7 @@ def _resolve_assignee(identifier: str) -> Dict[str, Any]:
         return {"error": f"no User found, and Employee lookup failed: {exc}"}
 
     if not emp_matches:
-        return {"error": f"no ERPNext User or active Employee found matching '{identifier}'"}
+        return {"error": f"no MagnaERP User or active Employee found matching '{identifier}'"}
     if len(emp_matches) > 1:
         names = ", ".join(f"{m.get('employee_name')} <{m.get('name')}>" for m in emp_matches)
         return {"error": f"'{identifier}' matches more than one Employee ({names})"}

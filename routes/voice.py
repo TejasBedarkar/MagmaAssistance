@@ -1,5 +1,7 @@
 """
-Text-to-speech (TTS) synthesis and streaming routes.
+HTTP text-to-speech routes (/api/tts, /api/tts/stream).
+
+Live duplex voice (/ws/voice) is registered separately via Voice/ws_voice.py.
 """
 
 import base64
