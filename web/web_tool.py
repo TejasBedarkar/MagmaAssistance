@@ -22,10 +22,11 @@ web_company_extract improvements v2:
   ✅ Person / lead name extraction from schema.org Person objects
 """
 
+import concurrent.futures
+import json
 import logging
 import os
 import re
-import json
 import time
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -35,6 +36,14 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from langchain_core.tools import tool
+
+from .company_crawler.resolver import resolve_company_website
+from .company_crawler.crawler import find_contact_pages, get_page_html
+from .company_crawler.extractor import (
+    extract_contact_info, filter_emails_to_domain,
+    pick_primary_email, pick_primary_phone, pick_primary_address,
+)
+from .company_crawler.zaubacorp import lookup_zaubacorp_fallback
 
 load_dotenv()
 
@@ -494,191 +503,420 @@ def web_crawl(start_url: str, max_pages: int = 5, same_domain_only: bool = True)
             time.sleep(0.3)
         if not pages_out:
             return f"Could not gather any content from '{start_url}'."
-        return f"Crawled {len(visited)} page(s) from '{start_url}':\n\n" + "\n\n".join(pages_out)
+        return (
+            f"Crawled {len(visited)} page(s) from '{start_url}':\n\n"
+            + "\n\n".join(pages_out)
+            + "\n\nIMPORTANT: If using this crawled data to create records in ERPNext, present the proposed details to the user and obtain their explicit confirmation before creating any record."
+        )
 
     return _safe_call(f"crawl '{start_url}'", run)
 
 
-@tool
-def web_company_search(company_name: str, search_hint: Optional[str] = None) -> str:
-    """Find candidate official websites for a company by name.
-    Returns a ranked shortlist (directories/social sites filtered out).
-    ALWAYS present options to the user for confirmation before calling web_company_extract.
-    Use search_hint to disambiguate (e.g. 'Mumbai', 'software', 'textile')."""
-    name = (company_name or "").strip()
-    if not name:
-        return "Please provide a company name."
-    hint = (search_hint or "").strip()
+def _legacy_web_company_search(name: str, hint: str) -> str:
+    """Original Tavily/SearXNG-based candidate lookup. Kept as a fallback
+    for when the multi-signal resolver (company_crawler.resolver) comes
+    back empty -- e.g. DuckDuckGo rate-limited and Tavily/SearXNG still
+    work, or vice versa."""
     query = f"{name} {hint} official website".strip()
 
-    results = []
+    search_results = []
     if _tavily_client:
         try:
             resp = _tavily_client.search(query=query, max_results=7, search_depth="basic")
-            results = resp.get("results", [])
+            search_results = resp.get("results", [])
         except Exception:
             pass
-    if not results:
+
+    if not search_results:
         try:
             resp = requests.get(f"{_SEARXNG_URL}/search",
                 params={"q": query, "format": "json"}, timeout=_REQUEST_TIMEOUT)
             resp.raise_for_status()
-            results = resp.json().get("results", [])[:7]
+            search_results = resp.json().get("results", [])[:7]
         except Exception:
-            return "Web search unavailable."
-    if not results:
-        return f"No websites found for '{name}'."
+            return ""
 
-    lines = [f"Top candidate websites for '{name}':"]
-    count = 0
-    for r in results:
+    if not search_results:
+        return ""
+
+    lines = [f"Top candidate websites for '{name}' (fallback search):"]
+    found_any = False
+    for i, r in enumerate(search_results, 1):
         url = r.get("url", "")
         if _is_non_official_host(urlparse(url).netloc):
             continue
-        count += 1
-        lines.append(f"{count}. {r.get('title','')}\n   URL: {url}\n   {(r.get('content') or '').strip()[:150]}...")
-        if count >= 5:
-            break
-    if count == 0:
-        return f"Only directory/social results found for '{name}'. Add an industry or city hint."
-    lines.append("\nConfirm the correct URL with the user, then call `web_company_extract` on it.")
+        found_any = True
+        lines.append(f"{i}. {r.get('title', '')}\n   URL: {url}\n   {r.get('content', '')[:150]}...")
+
+    if not found_any:
+        return ""
+
+    lines.append(
+        "\n--- WAITING FOR USER SELECTION ---\n"
+        "Present the above candidates to the user exactly as shown. Then STOP and wait.\n"
+        "Ask the user:\n"
+        "  'Please choose a website to extract contact details from:\n"
+        "   - Reply with 1, 2, or 3 to select a candidate above.\n"
+        "   - Or type a URL directly if you know the correct website.\n"
+        "   - Or say \"none\" to skip web enrichment and create the lead manually.'\n"
+        "Once the user replies with a choice or URL, call `web_company_extract` with that confirmed URL."
+    )
     return "\n".join(lines)
 
 
 @tool
-def web_company_extract(url: str, company_name: Optional[str] = None) -> str:
-    """Deep extraction of contact details and company profile from a confirmed website.
+def web_company_search(company_name: str, search_hint: Optional[str] = None) -> str:
+    """Find candidate websites for a company, ranked by confidence.
+    Uses multi-signal scoring (name/domain similarity, known-directory
+    penalties, live title/meta verification, country-TLD match) to rank
+    candidates -- falls back to a simpler Tavily/SearXNG search if that
+    turns up nothing.
+    You MUST present the top options to the user to confirm the correct one.
+    Do NOT guess. If they all seem wrong, ask the user for an industry or region hint to refine the search.
+    """
+    name = (company_name or "").strip()
+    if not name:
+        return "Please provide a company name to look up."
 
-    Extracts:
-    - Email (mailto: links + plain-text regex scan + JSON-LD schema.org)
-    - Phone (tel: links + Indian/international phone regex + JSON-LD)
-    - WhatsApp (wa.me links)
-    - Social profiles (LinkedIn, Twitter/X, Instagram, YouTube, Facebook)
-    - Company description (2-3 sentences: meta tags → JSON-LD → first paragraph)
-    - Person/lead names (schema.org Person objects)
+    hint = (search_hint or "").strip()
+    # country_hint is meant for short region codes ("IN", "US", "UK");
+    # anything longer is treated as a free-text hint for the legacy path only.
+    country_hint = hint if hint and len(hint) <= 3 else None
 
-    Auto-crawls up to 3 subpages (Contact, About, Team) if homepage yields nothing.
-    Call ONLY after user has confirmed the correct URL from web_company_search."""
+    try:
+        candidates = resolve_company_website(name, country_hint=country_hint, max_candidates=3)
+    except Exception as exc:
+        logger.warning("company_crawler resolver failed (%s) — falling back to legacy search.", exc)
+        candidates = []
 
-    url = (url or "").strip()
-    if not url or not re.match(r"^https?://", url, re.IGNORECASE):
-        return "Please provide a valid http:// or https:// URL."
-
-    def run():
-        soup = _fetch_soup(url)
-        if not soup:
-            return f"Could not reach or parse {url}."
-
-        contacts = _extract_contacts_from_soup(soup)
-        description = _extract_description(soup)
-        person_names = _extract_person_names(soup)
-        pages_tried = [url]
-
-        # Auto-crawl subpages if contacts are incomplete
-        if not contacts["emails"] or not contacts["phones"]:
-            subpages = _find_subpage_links(soup, url, max_links=5)
-            for sub_url in subpages[:3]:
-                if sub_url in pages_tried:
-                    continue
-                pages_tried.append(sub_url)
-                sub_soup = _fetch_soup(sub_url)
-                if not sub_soup:
-                    continue
-                sub_contacts = _extract_contacts_from_soup(sub_soup)
-                for key in ("emails", "phones", "whatsapp", "addresses"):
-                    for val in sub_contacts[key]:
-                        if val not in contacts[key]:
-                            contacts[key].append(val)
-                for platform, link in sub_contacts["socials"].items():
-                    if platform not in contacts["socials"]:
-                        contacts["socials"][platform] = link
-                if not description:
-                    description = _extract_description(sub_soup)
-                if not person_names:
-                    person_names = _extract_person_names(sub_soup)
-                if contacts["emails"] and contacts["phones"]:
-                    break
-                time.sleep(0.3)
-
-        # Fallback: If no email found on the official site, execute a broad web search automatically
-        fallback_emails = []
-        target_domain = urlparse(url).netloc.replace("www.", "").lower()
-        if not contacts["emails"]:
-            search_query = f"{company_name or target_domain} contact email address"
-            try:
-                # Use Tavily if available
-                if _tavily_client:
-                    resp = _tavily_client.search(query=search_query, max_results=10)
-                    results = resp.get("results", [])
-                else:
-                    resp = requests.get(f"{_SEARXNG_URL}/search", params={"q": search_query, "format": "json"}, timeout=_REQUEST_TIMEOUT)
-                    results = resp.json().get("results", [])
-
-                # Scan search snippets for emails
-                combined_text = " ".join([r.get("content", "") + " " + r.get("title", "") for r in results])
-                for match in _EMAIL_RE.finditer(combined_text):
-                    addr = match.group().lower()
-                    local = addr.split("@")[0]
-                    if local not in _GENERIC_EMAIL_PREFIXES and addr not in fallback_emails:
-                        fallback_emails.append(addr)
-                # a broad search mixes in emails from unrelated companies -- an
-                # email on the same domain as the URL we're actually extracting
-                # is far more likely correct than whatever the search happened
-                # to return first, so it goes first regardless of search order
-                fallback_emails.sort(key=lambda addr: addr.split("@")[-1] != target_domain)
-            except Exception as e:
-                logger.warning(f"Fallback email search failed: {e}")
-
-        # Build output
-        lines = [f"Contact extraction for: {url}",
-                 f"Pages scanned: {', '.join(pages_tried)}\n"]
-
-        primary_email = "NOT FOUND"
-        if contacts["emails"]:
-            primary_email = contacts["emails"][0]
-            lines.append(f"Email:       {primary_email}")
-            if len(contacts["emails"]) > 1:
-                lines.append(f"  (also: {', '.join(contacts['emails'][1:])})")
-        elif fallback_emails:
-            primary_email = fallback_emails[0]
-            lines.append(f"Email:       {primary_email} (found via broad web search)")
-            if len(fallback_emails) > 1:
-                lines.append(f"  (also: {', '.join(fallback_emails[1:])})")
-        else:
-            lines.append(f"Email:       NOT FOUND")
-
-        primary_phone = contacts["phones"][0] if contacts["phones"] else "NOT FOUND"
-        lines.append(f"Phone:       {primary_phone}")
-        if len(contacts["phones"]) > 1:
-            lines.append(f"  (also: {', '.join(contacts['phones'][1:])})")
-
-        if contacts["whatsapp"]:
-            lines.append(f"WhatsApp:    {contacts['whatsapp'][0]}")
-
-        if contacts["addresses"]:
-            lines.append(f"\nAddress:     {contacts['addresses'][0]}")
-            if len(contacts["addresses"]) > 1:
-                lines.append(f"  (also: {', '.join(contacts['addresses'][1:])})")
-
-        if contacts["socials"]:
-            lines.append("\nSocial Profiles:")
-            for platform, link in contacts["socials"].items():
-                lines.append(f"  {platform.capitalize()}: {link}")
-
-        lines.append(f"\nDescription: {description if description else 'NOT FOUND'}")
-
-        if person_names:
-            lines.append(f"\nPerson(s) found: {', '.join(person_names)}")
-
-        if primary_email == "NOT FOUND" and primary_phone == "NOT FOUND":
+    if candidates:
+        lines = [f"Top candidate websites for '{name}':"]
+        for i, c in enumerate(candidates, 1):
             lines.append(
-                "\n⚠️  No direct contact details found. Company may use a contact form. "
-                "Try web_fetch_page on their /contact page."
+                f"{i}. {c.domain}  (confidence: {c.score:.0%})\n"
+                f"   URL: {c.url}\n"
+                f"   title: {c.title or '(none)'}\n"
+                f"   why: {'; '.join(c.reasons)}"
             )
-
+        lines.append(
+            "\n--- WAITING FOR USER SELECTION ---\n"
+            "Present the above candidates to the user exactly as shown. Then STOP and wait.\n"
+            "Ask the user:\n"
+            "  'Please choose a website to extract contact details from:\n"
+            "   - Reply with 1, 2, or 3 to select a candidate above.\n"
+            "   - Or type a URL directly if you know the correct website.\n"
+            "   - Or say \"none\" to skip web enrichment and create the lead manually.'\n"
+            "Once the user replies with a choice or URL, call `web_company_extract` with that confirmed URL."
+        )
         return "\n".join(lines)
 
-    return _safe_call(f"extract contacts from '{url}'", run)
+    # Resolver found nothing (or errored) — try the legacy search path.
+    fallback = _legacy_web_company_search(name, hint)
+    if fallback:
+        return fallback
+
+    return f"No websites found for '{name}'."
+
+
+
+@tool
+def web_company_extract(url: str, person_name: Optional[str] = None, company_name: Optional[str] = None) -> str:
+    """Scrape contact details (email, phone, address, description) from an
+    officially confirmed website URL. Uses schema.org structured data,
+    mailto:/tel: links, Cloudflare-obfuscated emails, and text-pattern
+    matching across homepage, footer links, and contact pages.
+    If email or address is not found on the official site, automatically
+    falls back to ZaubaCorp (MCA India database) in the background to retrieve
+    registered contact details.
+    Evaluates whether personal contact details exist for `person_name` or if
+    generic corporate fallback data is used.
+    Call this ONLY after the user has confirmed the correct company URL
+    from `web_company_search`.
+    """
+    url = (url or "").strip()
+    if not url:
+        return "Please provide a website URL to extract from."
+
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = f"https://{url}"
+
+    target_person = (person_name or "").strip() or None
+
+    try:
+        company_domain = urlparse(url).netloc.lower()
+        if company_domain.startswith("www."):
+            company_domain = company_domain[4:]
+
+        all_emails, all_phones, all_addresses = [], [], []
+        person_emails, person_phones = [], []
+        structured_addresses = []
+        description = ""
+        site_title = ""
+        source = "html"
+        is_fallback = False
+        fallback_fields = []
+        direct_person_found = False
+        fallback_notice = None
+
+        # 1. Fetch homepage FIRST — single network request
+        homepage_html, _method = get_page_html(url)
+        if homepage_html:
+            hp_res = extract_contact_info(
+                homepage_html,
+                target_person=target_person,
+                company_domain=company_domain,
+            )
+            all_emails += hp_res.emails
+            all_phones += hp_res.phones
+            all_addresses += hp_res.addresses
+            if hp_res.person_email and hp_res.person_email not in person_emails:
+                person_emails.append(hp_res.person_email)
+            if hp_res.person_phone and hp_res.person_phone not in person_phones:
+                person_phones.append(hp_res.person_phone)
+            if hp_res.parsed_address:
+                structured_addresses.append(hp_res.parsed_address)
+            if hp_res.direct_person_found:
+                direct_person_found = True
+            if hp_res.source != "html":
+                source = hp_res.source
+
+            soup = BeautifulSoup(homepage_html, "lxml")
+            if not site_title and soup.title and soup.title.string:
+                site_title = soup.title.string.strip()
+
+            if not description:
+                meta = (
+                    soup.find("meta", attrs={"name": "description"})
+                    or soup.find("meta", attrs={"property": "og:description"})
+                    or soup.find("meta", attrs={"name": "twitter:description"})
+                )
+                if meta and meta.get("content"):
+                    description = meta["content"].strip()[:300]
+
+        # 2. Early-exit check: if homepage already has verified contact details, skip subpages
+        hp_domain_emails = filter_emails_to_domain(all_emails, company_domain) or all_emails
+        hp_email = pick_primary_email(hp_domain_emails)
+        hp_phone = pick_primary_phone(all_phones)
+        hp_address = pick_primary_address(all_addresses) or (structured_addresses[0] if structured_addresses else None)
+        hp_person_satisfied = bool(person_emails or person_phones) if target_person else True
+
+        need_subpages = not (hp_email and hp_phone and hp_address and hp_person_satisfied)
+
+        if need_subpages:
+            # Reuses pre-fetched homepage_html with 0 extra network calls to discover candidate pages
+            contact_candidates = find_contact_pages(url, max_pages=3, homepage_html=homepage_html) or []
+            subpage_urls = []
+            seen_urls = {url.rstrip("/")}
+            for cp in contact_candidates:
+                clean_cp = cp["url"].rstrip("/")
+                if clean_cp not in seen_urls:
+                    seen_urls.add(clean_cp)
+                    subpage_urls.append(cp["url"])
+
+            if subpage_urls:
+                def _scrape_page(page_url: str):
+                    try:
+                        p_html, _m = get_page_html(page_url)
+                        if not p_html:
+                            return None
+                        res = extract_contact_info(
+                            p_html,
+                            target_person=target_person,
+                            company_domain=company_domain,
+                        )
+                        p_desc = ""
+                        p_soup = BeautifulSoup(p_html, "lxml")
+                        p_meta = (
+                            p_soup.find("meta", attrs={"name": "description"})
+                            or p_soup.find("meta", attrs={"property": "og:description"})
+                            or p_soup.find("meta", attrs={"name": "twitter:description"})
+                        )
+                        if p_meta and p_meta.get("content"):
+                            p_desc = p_meta["content"].strip()[:300]
+                        return res, p_desc
+                    except Exception:
+                        return None
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(subpage_urls))) as executor:
+                    futures = [executor.submit(_scrape_page, p_url) for p_url in subpage_urls[:3]]
+                    for f in concurrent.futures.as_completed(futures):
+                        out = f.result()
+                        if not out:
+                            continue
+                        sub_res, sub_desc = out
+                        all_emails += sub_res.emails
+                        all_phones += sub_res.phones
+                        all_addresses += sub_res.addresses
+                        if sub_res.person_email and sub_res.person_email not in person_emails:
+                            person_emails.append(sub_res.person_email)
+                        if sub_res.person_phone and sub_res.person_phone not in person_phones:
+                            person_phones.append(sub_res.person_phone)
+                        if sub_res.parsed_address:
+                            structured_addresses.append(sub_res.parsed_address)
+                        if sub_res.direct_person_found:
+                            direct_person_found = True
+                        if sub_res.source != "html":
+                            source = sub_res.source
+                        if not description and sub_desc:
+                            description = sub_desc
+
+        domain_emails = filter_emails_to_domain(all_emails, company_domain) or all_emails
+
+        company_email = pick_primary_email(domain_emails) or pick_primary_email(all_emails)
+        company_phone = pick_primary_phone(all_phones)
+        primary_address = pick_primary_address(all_addresses)
+
+        # Resolve primary structured address from website
+        parsed_addr = structured_addresses[0] if structured_addresses else {}
+        if not parsed_addr and primary_address:
+            from .company_crawler.extractor import parse_address_fields
+            parsed_addr = parse_address_fields(primary_address).as_dict()
+
+        # Autonomous ZaubaCorp Fallback if email or address is missing
+        zauba_data = None
+        zauba_email_used = False
+        zauba_address_used = False
+
+        if not company_email or not primary_address:
+            # Determine effective company name to query
+            effective_company_name = (company_name or "").strip()
+            if not effective_company_name:
+                if site_title:
+                    # Clean title: e.g. "Tata Motors - Official Website" -> "Tata Motors"
+                    effective_company_name = re.split(r"[-|:–—]", site_title)[0].strip()
+                if not effective_company_name:
+                    clean_host = company_domain.split(".")[0].replace("-", " ").replace("_", " ").title()
+                    effective_company_name = clean_host
+
+            logger.info("Email or address missing on %s — initiating ZaubaCorp fallback for '%s'...", url, effective_company_name)
+            try:
+                zauba_data = lookup_zaubacorp_fallback(effective_company_name, domain=company_domain)
+                if zauba_data:
+                    if not company_email and zauba_data.email:
+                        company_email = zauba_data.email
+                        zauba_email_used = True
+                    if not primary_address and zauba_data.address:
+                        primary_address = zauba_data.address
+                        parsed_addr = zauba_data.parsed_address or (parse_address_fields(primary_address).as_dict() if primary_address else {})
+                        zauba_address_used = True
+
+                    if zauba_email_used or zauba_address_used:
+                        source = f"{source} + zaubacorp fallback"
+            except Exception as z_err:
+                logger.warning("ZaubaCorp fallback failed for '%s': %s", effective_company_name, z_err)
+
+        if target_person:
+            # Condition 1: Person name provided
+            from .company_crawler.extractor import find_person_email
+            matched_person_email = person_emails[0] if person_emails else (find_person_email(target_person, domain_emails) or find_person_email(target_person, all_emails))
+            matched_person_phone = person_phones[0] if person_phones else None
+
+            if matched_person_email or matched_person_phone:
+                direct_person_found = True
+                primary_email = matched_person_email or company_email
+                primary_phone = matched_person_phone or company_phone
+                is_fallback = False
+            else:
+                direct_person_found = False
+                primary_email = company_email
+                primary_phone = company_phone
+                is_fallback = True
+                fallback_fields = []
+                if primary_email:
+                    fallback_fields.append("email")
+                if primary_phone:
+                    fallback_fields.append("phone")
+                if primary_address or parsed_addr:
+                    fallback_fields.append("address")
+                fallback_notice = (
+                    f"Note: I couldn't find the lead person's information ({target_person}) on {url}, "
+                    f"so using company's contact information ({primary_email or 'no email'} / {primary_phone or 'no phone'})."
+                )
+        else:
+            # Condition 2: No person name provided, directly use company info
+            primary_email = company_email
+            primary_phone = company_phone
+            direct_person_found = False
+            is_fallback = False
+            fallback_fields = []
+            fallback_notice = None
+
+        if primary_email or primary_phone or primary_address or description:
+            zauba_notice = ""
+            if zauba_data and (zauba_email_used or zauba_address_used):
+                zauba_notice = (
+                    "\n⚠  Email or address was not found on the official website.\n"
+                    "   Falling back to ZaubaCorp (MCA public registry) for missing fields.\n"
+                )
+
+            # Build formatted review table
+            def _field(label: str, value: str, source_tag: str = "") -> str:
+                val = value if value else "Not found"
+                tag = f"  {source_tag}" if source_tag else ""
+                return f"| {label:<18} | {val}{tag} |"
+
+            email_tag = "(MCA registry)" if zauba_email_used else ""
+            address_tag = "(MCA registry)" if zauba_address_used else ""
+
+            addr_line1 = parsed_addr.get("address_line1", "") if parsed_addr else ""
+            city_val = parsed_addr.get("city", "") if parsed_addr else ""
+            state_val = parsed_addr.get("state", "") if parsed_addr else ""
+            pincode_val = parsed_addr.get("pincode", "") if parsed_addr else ""
+            country_val = parsed_addr.get("country", "") if parsed_addr else ""
+
+            table_rows = [
+                "| Field              | Value                           |",
+                "|--------------------|----------------------------------|",
+                _field("Email", primary_email or "", email_tag),
+                _field("Phone", primary_phone or ""),
+                _field("Address", primary_address or "", address_tag),
+            ]
+            if addr_line1:
+                table_rows.append(_field("Address Line 1", addr_line1))
+            if city_val:
+                table_rows.append(_field("City", city_val))
+            if state_val:
+                table_rows.append(_field("State", state_val))
+            if pincode_val:
+                table_rows.append(_field("Pincode", pincode_val))
+            if country_val:
+                table_rows.append(_field("Country", country_val))
+            if description:
+                table_rows.append(_field("Description", description[:120] + ("..." if len(description) > 120 else "")))
+            if zauba_data and zauba_data.cin:
+                table_rows.append(_field("CIN", zauba_data.cin, "(MCA registry)"))
+            if zauba_data and zauba_data.directors:
+                table_rows.append(_field("Directors", ", ".join(zauba_data.directors[:3]), "(MCA registry)"))
+
+            person_block = ""
+            if target_person:
+                person_status = "✓ Found directly" if direct_person_found else "✗ Not found — using company contact"
+                person_block = (
+                    f"\n👤 Person: **{target_person}** — {person_status}\n"
+                )
+                if is_fallback and fallback_notice:
+                    person_block += f"   ⚠  {fallback_notice}\n"
+
+            lines = [
+                f"--- EXTRACTION COMPLETE ---",
+                f"Source: {url} (via {source}){zauba_notice}",
+                "",
+                *table_rows,
+                person_block,
+                "\n--- ACTION REQUIRED ---",
+                "Present the above details to the user in a clear table. Then STOP and wait.",
+                "Ask: 'Do all these details look correct? Tell me if you want to change any field, or say \"proceed\" to create the lead.'",
+                "Wait for user confirmation or corrections before calling erp_data_tool.",
+                "If the user approves, call erp_data_tool(operation='create', web_enriched=True, approved=True) with ALL available fields.",
+            ]
+            return "\n".join(lines)
+
+    except Exception as exc:
+        logger.warning("company_crawler extractor failed for '%s' (%s) — no contact details found.", url, exc)
+
+    return f"Could not extract any contact details from {url}."
+
 
 
 WEB_TOOLS = [web_search, web_fetch_page, web_crawl, web_company_search, web_company_extract]
+

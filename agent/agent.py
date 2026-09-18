@@ -163,6 +163,42 @@ def _is_write_rejection(message: str) -> bool:
     return bool(_NO_RE.match(text))
 
 
+_RESEARCH_FIELD_RE = {
+    "email_id": re.compile(r"-\s*Email:\s*(\S+@\S+)", re.IGNORECASE),
+    "phone": re.compile(r"-\s*Phone:\s*([+\d\t \-()]{7,})", re.IGNORECASE),
+    "address": re.compile(r"-\s*Address:\s*(.+)", re.IGNORECASE),
+    "address_line1": re.compile(r"-\s*Address Line 1:\s*(.+)", re.IGNORECASE),
+    "city": re.compile(r"-\s*City:\s*(.+)", re.IGNORECASE),
+    "state": re.compile(r"-\s*State:\s*(.+)", re.IGNORECASE),
+    "pincode": re.compile(r"-\s*Pincode:\s*(\d{6})", re.IGNORECASE),
+    "country": re.compile(r"-\s*Country:\s*(.+)", re.IGNORECASE),
+    "website": re.compile(r"Extracted details from (\S+)", re.IGNORECASE),
+    "description": re.compile(r"-\s*Description:\s*(.+)", re.IGNORECASE),
+    "is_fallback": re.compile(r"-\s*Is Fallback:\s*(Yes|True)", re.IGNORECASE),
+    "fallback_fields": re.compile(r"-\s*Fallback Fields:\s*(.+)", re.IGNORECASE),
+    "fallback_notice": re.compile(r"-\s*Fallback Notice:\s*(.+)", re.IGNORECASE),
+}
+_NOT_FOUND_RE = re.compile(r"^\s*not found\s*$", re.IGNORECASE)
+
+
+def _fields_from_research(research: str) -> dict:
+    found = {}
+    for field, pattern in _RESEARCH_FIELD_RE.items():
+        m = pattern.search(research or "")
+        if m:
+            value = m.group(1).strip()
+            # Clean off provenance annotations like (Source: ZaubaCorp / MCA Record)
+            value = re.sub(r"\s*\(Source:[^)]*\)", "", value, flags=re.IGNORECASE).strip()
+            if value and not _NOT_FOUND_RE.match(value):
+                if field == "is_fallback":
+                    found[field] = True
+                elif field == "fallback_fields":
+                    found[field] = [f.strip() for f in value.split(",") if f.strip()]
+                else:
+                    found[field] = value
+    return found
+
+
 # ---------------------------------------------------------------------
 # Tool execution dispatcher with gate enforcement and audit logging
 # ---------------------------------------------------------------------
@@ -174,19 +210,47 @@ async def _execute_tool(
     prompt_text: Optional[str] = None,
     bypass_gate: bool = False,
 ):
-    if not bypass_gate and session_id and _is_write_call(tool_name, args):
-        effective_args = state._sanitize_tool_args(tool_name, args) or {}
-        if tool_name == "erp_data_tool":
-            effective_args = {**effective_args, "session_id": session_id}
+    if tool_name in ("web_company_extract", "web_company_search", "web_crawl", "web_search", "web_fetch_page") and session_id:
+        from ERP_Unified.tools import record_web_research_activity
+        record_web_research_activity(session_id)
 
+    effective_args = state._sanitize_tool_args(tool_name, args) or {}
+    if tool_name == "erp_data_tool" and session_id:
+        effective_args = {**effective_args, "session_id": session_id}
+        doctype_str = str(effective_args.get("doctype", "")).strip()
+        if effective_args.get("operation") in ("create", "update"):
+            from ERP_Unified.tools import is_web_review_pending
+            had_web_tool = is_web_review_pending(session_id, doctype_str)
+
+            try:
+                transcript = audit_log.get_transcript(session_id)
+                for t in reversed(transcript):
+                    if t.get("tool_name") in ("web_company_extract", "web_crawl", "web_search", "web_company_search", "web_fetch_page"):
+                        had_web_tool = True
+                    if t.get("tool_name") == "web_company_extract" and t.get("content") and doctype_str.lower() == "lead":
+                        research_fields = _fields_from_research(t["content"])
+                        data_dict = dict(effective_args.get("data") or {})
+                        for k, v in research_fields.items():
+                            if k not in ("is_fallback", "fallback_fields"):
+                                data_dict.setdefault(k, v)
+                        effective_args["data"] = data_dict
+            except Exception as enrich_exc:
+                logger.debug("Could not auto-enrich Lead data from transcript: %s", enrich_exc)
+
+            if had_web_tool:
+                effective_args["web_enriched"] = True
+
+    if not bypass_gate and session_id and _is_write_call(tool_name, effective_args):
         # for the PREVIEW only -- merge in whatever this create flow already
         # accumulated across earlier turns, so a proposal built from just
         # this turn's one new field ("company=X") doesn't read as if it
-        # replaced everything asked before it. The real execution already
-        # does this merge internally regardless of what's shown here.
+        # replaced everything asked before it (the web-research enrichment
+        # above already went into effective_args, which wins over older
+        # accumulated values for any field both provide). The real execution
+        # already does this merge internally regardless of what's shown here.
         preview_args = effective_args
-        if tool_name == "erp_data_tool" and str(args.get("operation") or "").lower() in CREATE_OPERATIONS:
-            doctype = args.get("doctype")
+        if tool_name == "erp_data_tool" and str(effective_args.get("operation") or "").lower() in CREATE_OPERATIONS:
+            doctype = effective_args.get("doctype")
             if doctype:
                 accumulated = get_pending_create_data(session_id, doctype)
                 if accumulated:
@@ -217,9 +281,6 @@ async def _execute_tool(
             )
         return result
     try:
-        effective_args = state._sanitize_tool_args(tool_name, args) or {}
-        if tool_name == "erp_data_tool" and session_id:
-            effective_args = {**effective_args, "session_id": session_id}
         with audit_log.time_tool_call() as elapsed:
             result = await tool.ainvoke(effective_args)
         if session_id:
@@ -289,38 +350,59 @@ async def _stream_chat_completion(messages, tools=None):
     }
     if tools:
         data["tools"] = tools
+
     tool_acc = {}
     content = ""
     finish_reason = None
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=60.0)) as client:
-        async with client.stream("POST", url, json=data, headers=headers) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line or not line.startswith("data: "):
-                    continue
-                payload = line[6:].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(payload)
-                except Exception:
-                    continue
-                choice = (chunk.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                finish_reason = choice.get("finish_reason") or finish_reason
-                if delta.get("content"):
-                    content += delta["content"]
-                    yield {"type": "token", "text": delta["content"]}
-                for tc in delta.get("tool_calls") or []:
-                    idx = tc.get("index", 0)
-                    entry = tool_acc.setdefault(idx, {"id": None, "name": None, "arguments": ""})
-                    if tc.get("id"):
-                        entry["id"] = tc["id"]
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        entry["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        entry["arguments"] += fn["arguments"]
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            tool_acc = {}
+            content = ""
+            finish_reason = None
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as client:
+                async with client.stream("POST", url, json=data, headers=headers) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        payload = line[6:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload)
+                        except Exception:
+                            continue
+                        choice = (chunk.get("choices") or [{}])[0]
+                        delta = choice.get("delta") or {}
+                        finish_reason = choice.get("finish_reason") or finish_reason
+                        if delta.get("content"):
+                            content += delta["content"]
+                            yield {"type": "token", "text": delta["content"]}
+                        for tc in delta.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            entry = tool_acc.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+                            if tc.get("id"):
+                                entry["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                entry["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                entry["arguments"] += fn["arguments"]
+            # Successfully finished stream
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout) as net_err:
+            if not content and not tool_acc and attempt < max_retries - 1:
+                logger.warning(
+                    "LLM connection attempt %d/%d failed (%s) — retrying in 1.5s...",
+                    attempt + 1, max_retries, net_err,
+                )
+                await asyncio.sleep(1.5)
+                continue
+            logger.error("LLM connection failed after %d attempt(s): %s", attempt + 1, net_err)
+            raise
+
     tool_calls = []
     for idx in sorted(tool_acc):
         entry = tool_acc[idx]
@@ -398,11 +480,18 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     if pending and _is_write_approval(text):
         history.append(HumanMessage(content=text))
         yield {"type": "tool_call", "name": pending["tool_name"], "args": pending["args"]}
-        result = await _execute_tool(
-            pending["tool_name"], pending["args"],
-            session_id=session_id, user_id=user_id, prompt_text=text,
-            bypass_gate=True,
+        tool_task = asyncio.create_task(
+            _execute_tool(
+                pending["tool_name"], pending["args"],
+                session_id=session_id, user_id=user_id, prompt_text=text,
+                bypass_gate=True,
+            )
         )
+        while not tool_task.done():
+            done, _ = await asyncio.wait([tool_task], timeout=1.5)
+            if not done:
+                yield {"type": "ping"}
+        result = await tool_task
         yield {"type": "tool_result", "name": pending["tool_name"], "result": result}
         summary_messages = [
             SystemMessage(content=state.assistant.llm.system_prompt),
@@ -561,8 +650,14 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             history.append(ai_msg)
             gate_intercepted = False
             for tc in tool_calls:
-                yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
-                result = await _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
+                tool_task = asyncio.create_task(
+                    _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
+                )
+                while not tool_task.done():
+                    done, _ = await asyncio.wait([tool_task], timeout=1.5)
+                    if not done:
+                        yield {"type": "ping"}
+                result = await tool_task
                 yield {"type": "tool_result", "name": tc["name"], "result": result}
                 t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
                 call_messages.append(t_msg)

@@ -116,6 +116,18 @@ def _sanitize_tool_args(tool_name: str, args: dict) -> dict:
 
     cleaned = dict(args)
 
+    # For erp_data_tool write operations, ensure any stray top-level doc fields
+    # are safely packaged into cleaned["data"]
+    if tool_name == "erp_data_tool" and cleaned.get("operation") in ("create", "update"):
+        known_tool_params = set(fields.keys())
+        extra_doc_fields = {k: v for k, v in cleaned.items() if k not in known_tool_params}
+        if extra_doc_fields:
+            data_dict = dict(cleaned.get("data") or {})
+            for k, v in extra_doc_fields.items():
+                data_dict.setdefault(k, v)
+                cleaned.pop(k, None)
+            cleaned["data"] = data_dict
+
     for field_name, field_info in fields.items():
         if field_name not in cleaned:
             continue

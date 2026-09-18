@@ -90,6 +90,25 @@ def get_pending_create_data(session_id: str, doctype: str) -> dict:
 _PENDING_WEB_REVIEWS: set[tuple] = set()
 
 
+def record_web_research_activity(session_id: str, doctype: Optional[str] = None):
+    """Mark that this session has performed web research/crawler extraction,
+    so that any subsequent record creation in this session requires explicit review."""
+    if not session_id:
+        return
+    if doctype:
+        _PENDING_WEB_REVIEWS.add((session_id, doctype))
+    else:
+        _PENDING_WEB_REVIEWS.add((session_id, "*"))
+
+
+def is_web_review_pending(session_id: str, doctype: Optional[str] = None) -> bool:
+    if not session_id:
+        return False
+    if doctype and (session_id, doctype) in _PENDING_WEB_REVIEWS:
+        return True
+    return (session_id, "*") in _PENDING_WEB_REVIEWS
+
+
 def pending_web_review_doctype(session_id: str) -> Optional[str]:
     """Return the one reviewed record awaiting this session's approval.
 
@@ -97,7 +116,7 @@ def pending_web_review_doctype(session_id: str) -> Optional[str]:
     ``yes, create it`` into a deterministic approved create call instead of
     relying on the model to reconstruct tool arguments.
     """
-    pending = [doctype for review_session, doctype in _PENDING_WEB_REVIEWS if review_session == session_id]
+    pending = [doctype for review_session, doctype in _PENDING_WEB_REVIEWS if review_session == session_id and doctype != "*"]
     return pending[0] if len(pending) == 1 else None
 
 
@@ -134,6 +153,32 @@ def _resolve_link_value(target_doctype: str, value) -> str | None:
     if matches:
         return matches[0]["name"]
         
+    # Special handling for Country DocType: check ISO 2-letter or 3-letter codes and 'code' field
+    if target_doctype.strip().lower() == "country":
+        iso_map = {
+            "in": "India", "ind": "India", "us": "United States", "usa": "United States",
+            "uk": "United Kingdom", "gb": "United Kingdom", "gbr": "United Kingdom",
+            "ae": "United Arab Emirates", "uae": "United Arab Emirates",
+            "ca": "Canada", "can": "Canada", "au": "Australia", "aus": "Australia",
+            "de": "Germany", "deu": "Germany", "fr": "France", "fra": "France",
+            "sg": "Singapore", "sgp": "Singapore",
+        }
+        val_clean = value_str.strip().lower()
+        if val_clean in iso_map:
+            mapped_name = iso_map[val_clean]
+            try:
+                matches = erp_client.get_list("Country", fields=["name"], filters=[["name", "=", mapped_name]], limit=1, use_cache=False)
+                if matches:
+                    return matches[0]["name"]
+            except Exception:
+                pass
+        try:
+            matches = erp_client.get_list("Country", fields=["name"], filters=[["code", "=", val_clean]], limit=1, use_cache=False)
+            if matches:
+                return matches[0]["name"]
+        except Exception:
+            pass
+
     # 2. Try fuzzy lookup using common search fields
     try:
         meta = erp_client.get_meta(target_doctype)
@@ -751,7 +796,43 @@ def _run_create(
     merged = {**pending, **(data or {})}
     warnings: list[str] = []
     if web_enriched:
+        # Mark this specific doctype+session as web-enriched for the review gate
         _PENDING_WEB_REVIEWS.add(key)
+    elif (session_id, doctype) in _PENDING_WEB_REVIEWS:
+        # Re-use web_enriched status only if the same doctype in this session was already web-enriched
+        # (e.g., partial create re-entry). Does NOT bleed across unrelated doctypes.
+        web_enriched = True
+
+    # Preserve address details before schema filtering for DocTypes that use separate Address records (e.g. Lead)
+    address_info = {}
+    if doctype.strip().lower() == "lead":
+        for k in ("address", "address_line1", "city", "pincode", "country", "state"):
+            if merged.get(k):
+                address_info[k] = merged[k]
+
+        # For Lead, since ERPNext standard Lead DocType has city, state, country (but no separate address_line1),
+        # merge address_line1 into city so the full street/premise address is preserved directly on the Lead form.
+        addr_line1 = address_info.get("address_line1")
+        city_val = address_info.get("city")
+        state_val = address_info.get("state")
+        country_val = address_info.get("country") or "India"
+
+        if addr_line1 and city_val:
+            if addr_line1.strip().lower() not in city_val.strip().lower():
+                merged["city"] = f"{addr_line1.strip()}, {city_val.strip()}"
+            else:
+                merged["city"] = city_val.strip()
+        elif addr_line1 and not city_val:
+            merged["city"] = addr_line1.strip()
+        elif address_info.get("address") and not city_val:
+            merged["city"] = str(address_info.get("address")).strip()
+        elif city_val:
+            merged["city"] = city_val.strip()
+
+        if state_val and not merged.get("state"):
+            merged["state"] = state_val.strip()
+        if country_val and not merged.get("country"):
+            merged["country"] = country_val.strip()
 
     try:
         # defaults first, then sanitize -- otherwise a bad schema default
@@ -759,17 +840,21 @@ def _run_create(
         # validation and reaches ERPNext as a literal, invalid value
         merged = apply_default_values(doctype, merged)
         merged, warnings = _prepare_write_data(doctype, merged)
-        if (
-            doctype.strip().lower() == "lead"
-            and merged.get("first_name")
-            and merged.get("company_name")
-            and str(merged["first_name"]).strip().casefold()
-            == str(merged["company_name"]).strip().casefold()
-        ):
-            return (
-                "I cannot create this Lead because the person's first name was mapped "
-                "to the organization name. Please provide or research the person's name again."
-            )
+        if doctype.strip().lower() == "lead":
+            if (
+                merged.get("first_name")
+                and merged.get("company_name")
+                and str(merged["first_name"]).strip().casefold()
+                == str(merged["company_name"]).strip().casefold()
+            ):
+                return (
+                    "I cannot create this Lead because the person's first name was mapped "
+                    "to the organization name. Please provide or research the person's name again."
+                )
+            # Ensure lead_name is populated from contact person or organization name
+            if not merged.get("lead_name"):
+                merged["lead_name"] = merged.get("first_name") or merged.get("company_name")
+        merged = apply_default_values(doctype, merged)
         missing = missing_required_fields(doctype, merged)
     except Exception as exc:  # noqa: BLE001
         return explain_erp_error(exc, context=f"look up required fields for {doctype}")
@@ -792,8 +877,9 @@ def _run_create(
     # Nothing left to ask about -- clear the field-tracking state.
     _PENDING_CREATE_FIELD.pop(session_id, None)
 
-    if key in _PENDING_WEB_REVIEWS and approved is not True:
+    if (web_enriched or key in _PENDING_WEB_REVIEWS or (session_id, "*") in _PENDING_WEB_REVIEWS) and approved is not True:
         _PENDING_CREATES[key] = merged
+        _PENDING_WEB_REVIEWS.add(key)
         message = (
             f"REVIEW_REQUIRED: I gathered some of this {doctype} data from the web. "
             "Please review it before anything is created:\n"
@@ -806,7 +892,54 @@ def _run_create(
 
     # Nothing missing — safe to actually create the record now.
     def run():
-        result = erp_client.create_doc(doctype, merged)
+        try:
+            result = erp_client.create_doc(doctype, merged)
+        except Exception as create_exc:
+            if "Email Address must be unique" in str(create_exc) and doctype.strip().lower() == "lead" and "email_id" in merged:
+                # Retry without top-level email on Lead, preserving email in linked Address
+                merged.pop("email_id", None)
+                try:
+                    result = erp_client.create_doc(doctype, merged)
+                except Exception:
+                    raise create_exc
+            else:
+                raise
+
+        created_lead_id = result.get("name") if isinstance(result, dict) else str(result)
+
+        # If Lead has address information, create and link an associated Address record
+        if doctype.strip().lower() == "lead" and (address_info.get("address_line1") or address_info.get("address") or address_info.get("city")):
+            addr_line1 = address_info.get("address_line1") or address_info.get("address") or "Headquarters"
+            city_for_addr = address_info.get("city") or "Not Specified"
+            pincode = address_info.get("pincode") or ""
+            country = _resolve_link_value("Country", address_info.get("country") or "India") or "India"
+            state_for_addr = address_info.get("state") or ""
+            base_title = merged.get("company_name") or merged.get("lead_name") or created_lead_id
+            address_doc = {
+                "doctype": "Address",
+                "address_title": base_title,
+                "address_type": "Office",
+                "address_line1": addr_line1,
+                "city": city_for_addr,
+                "state": state_for_addr,
+                "pincode": pincode,
+                "country": country,
+                "email_id": merged.get("email_id"),
+                "phone": merged.get("mobile_no") or merged.get("phone"),
+                "links": [
+                    {"link_doctype": "Lead", "link_name": created_lead_id}
+                ]
+            }
+            try:
+                erp_client.create_doc("Address", address_doc)
+            except Exception as addr_exc:
+                # If name conflict, try with unique lead-scoped address title
+                try:
+                    address_doc["address_title"] = f"{base_title} - {created_lead_id}"
+                    erp_client.create_doc("Address", address_doc)
+                except Exception as retry_exc:
+                    logger.warning("Could not create linked Address for Lead %s: %s", created_lead_id, retry_exc)
+
         if submit:
             created_name = result.get("name")
             try:
@@ -815,11 +948,13 @@ def _run_create(
                 # On submit failure, doc is still created, so we still pop state
                 _PENDING_CREATES.pop(key, None)
                 _PENDING_WEB_REVIEWS.discard(key)
+                _PENDING_WEB_REVIEWS.discard((session_id, "*"))
                 return str(result) + f" (created as draft; submit failed: {explain_erp_error(exc)})"
         
         # On success, clear the pending state
         _PENDING_CREATES.pop(key, None)
         _PENDING_WEB_REVIEWS.discard(key)
+        _PENDING_WEB_REVIEWS.discard((session_id, "*"))
         return str(result)
 
     outcome = _safe_call(f"create {doctype}", run)
