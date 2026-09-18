@@ -11,6 +11,7 @@ HTTP TTS lives in routes/voice.py; this file is the duplex session only.
 
 import asyncio
 import json
+import random
 import re
 import threading
 import time
@@ -28,6 +29,39 @@ def safe_create_task(coro):
     _ws_bg_tasks.add(task)
     task.add_done_callback(_ws_bg_tasks.discard)
     return task
+
+
+# Short lines spoken while a tool call is running, so a slow one doesn't go silent.
+_TOOL_FILLER_PHRASES = {
+    "web_company_search": ["Let me search for that.", "Looking that up online."],
+    "web_company_extract": ["Extracting their details now.", "Pulling up their contact info."],
+    "web_crawl": ["Looking into their website."],
+    "web_search": ["Searching for that."],
+    "web_fetch_page": ["Pulling that page up."],
+    "erp_describe_fields": ["One moment."],
+    "erp_send_email": ["Sending that now."],
+    "convert_crm_record": ["Converting that record now."],
+    "onboard_new_lead": ["Setting that up."],
+    "batch_manage_project_tasks": ["Setting up those tasks."],
+    "reassign_tasks": ["Reassigning that now."],
+}
+_ERP_OP_FILLERS = {
+    "list": ["Checking your records.", "Looking that up in MagnaERP."],
+    "get": ["Pulling that record up."],
+    "create": ["Setting that up in MagnaERP."],
+    "update": ["Updating that now."],
+    "submit": ["Submitting that now."],
+}
+_DEFAULT_FILLER = ["Working on it.", "One moment."]
+
+
+def _tool_filler_phrase(tool_name: str, args: dict) -> str:
+    if tool_name == "erp_data_tool":
+        op = str((args or {}).get("operation") or "").strip().lower()
+        options = _ERP_OP_FILLERS.get(op, _DEFAULT_FILLER)
+    else:
+        options = _TOOL_FILLER_PHRASES.get(tool_name, _DEFAULT_FILLER)
+    return random.choice(options)
 
 
 def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, save_stream_history):
@@ -211,6 +245,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
             my_turn_id = state["turn_id"]
             token_buf = ""
             speak_tasks = []
+            filler_spoken = False
 
             async def enqueue_speech(sentence: str):
                 """Schedule TTS without blocking the agent stream."""
@@ -270,6 +305,7 @@ def register_voice_ws(app, stream_agent_turn, tts, logger, load_stream_history, 
                                 "name": event["name"],
                                 "args": event.get("args", {})
                             })
+                            await enqueue_speech(_tool_filler_phrase(event["name"], event.get("args", {})))
 
                         elif etype == "tool_result":
                             logger.info(
