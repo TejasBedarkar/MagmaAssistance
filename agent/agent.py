@@ -111,7 +111,7 @@ def _describe_pending_action(tool_name: str, args: dict) -> str:
         src = args.get("source_doctype", "?")
         name = args.get("source_name", "?")
         tgt = args.get("target_doctype", "?")
-        return f"Convert {src} '{name}' to a new {tgt} (using ERPNext's own field mapping)"
+        return f"Convert {src} '{name}' to a new {tgt} (using MagnaERP's own field mapping)"
 
     return f"Run {tool_name} with {args}"
 

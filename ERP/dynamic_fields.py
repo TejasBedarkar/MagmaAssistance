@@ -155,7 +155,7 @@ def field_question(field: dict) -> str:
 
     if fieldtype == "Link" and options:
         hint = _link_options_hint(options)
-        return f"What is the {label}? (this should be an existing {options} in ERPNext{hint})"
+        return f"What is the {label}? (this should be an existing {options} in MagnaERP{hint})"
     if fieldtype == "Select" and options:
         choices = [c.strip() for c in str(options).split("\n") if c.strip()]
         if choices:
@@ -324,26 +324,26 @@ def explain_erp_error(exc: Exception, context: str = "") -> str:
 
     if isinstance(exc, RuntimeError) and "erp_url is not configured" in text.lower():
         return (
-            f"{prefix}The ERPNext connection isn't set up yet — ERP_URL "
+            f"{prefix}The MagnaERP connection isn't set up yet — ERP_URL "
             "(and the API key/secret) need to be added to the .env file "
-            "before this assistant can reach ERPNext."
+            "before this assistant can reach MagnaERP."
         )
 
     if "mandatory" in haystack or "missing" in haystack or "required" in haystack:
         return (
-            f"{prefix}ERPNext rejected this because a required field is "
+            f"{prefix}MagnaERP rejected this because a required field is "
             f"missing: {detail}. Please provide that and try again."
         )
 
     if "could not find" in haystack or "linkvalidationerror" in haystack:
         return (
             f"{prefix}One of the values doesn't match an existing record "
-            f"in ERPNext: {detail}. Double-check the exact name/spelling "
+            f"in MagnaERP: {detail}. Double-check the exact name/spelling "
             "(these link fields need an exact match)."
         )
 
     if "already exists" in haystack or "duplicate" in haystack:
-        return f"{prefix}A record with these details already exists in ERPNext: {detail}."
+        return f"{prefix}A record with these details already exists in MagnaERP: {detail}."
 
     # Frappe describes unknown/non-queryable columns as "Field not
     # permitted in query".  That is a query-schema error, not an RBAC
@@ -352,35 +352,35 @@ def explain_erp_error(exc: Exception, context: str = "") -> str:
         return (
             f"{prefix}The query used a field that does not exist or cannot be "
             f"queried on this document type: {detail}. Use "
-            "erp_describe_fields for the exact ERPNext fieldnames and retry."
+            "erp_describe_fields for the exact MagnaERP fieldnames and retry."
         )
 
     if status_code == 403 or "permission" in haystack or "not permitted" in haystack:
         return (
-            f"{prefix}ERPNext refused this — the API user doesn't have "
+            f"{prefix}MagnaERP refused this — the API user doesn't have "
             "permission for this action. This usually needs a role/"
-            "permission change on the ERPNext side, not a retry."
+            "permission change on the MagnaERP side, not a retry."
         )
 
     if "connectionerror" in haystack or "timeout" in haystack or "timed out" in haystack:
         return (
-            f"{prefix}Couldn't reach ERPNext — it may be offline or "
-            "unreachable from here. Check that the ERPNext server is "
+            f"{prefix}Couldn't reach MagnaERP — it may be offline or "
+            "unreachable from here. Check that the MagnaERP server is "
             "running and ERP_URL in .env points to the right address."
         )
 
     if server_messages:
-        return f"{prefix}ERPNext rejected this: {detail}."
+        return f"{prefix}MagnaERP rejected this: {detail}."
 
     if status_code == 417:
         return (
-            f"{prefix}ERPNext's dev server rejected the request format "
+            f"{prefix}MagnaERP's dev server rejected the request format "
             "(HTTP 417). This is a known local-dev quirk, not necessarily "
             "a data problem — try again, and if it persists the backend "
             "may need restarting."
         )
 
-    return f"{prefix}Something went wrong talking to ERPNext: {text}"
+    return f"{prefix}Something went wrong talking to MagnaERP: {text}"
 
 
 def safe_call(label: str, fn):

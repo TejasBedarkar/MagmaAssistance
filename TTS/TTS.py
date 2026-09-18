@@ -13,6 +13,7 @@ against OpenAITTS.
 Optional overrides:
     TTS_VOICE=alloy            # one of OPENAI_VOICES below
     OPENAI_TTS_MODEL=gpt-4o-mini-tts
+    TTS_ACCENT_INSTRUCTIONS   # steers speaking style/accent; see below
 """
 
 import os
@@ -28,10 +29,16 @@ OPENAI_VOICES = {
 
 DEFAULT_VOICE = "alloy"
 DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
+# None of OpenAI's named voices are dedicated Indian-English voices --
+# gpt-4o-mini-tts instead supports steering speaking style via plain-
+# language instructions (unsupported on tts-1/tts-1-hd, so only applied
+# for models that aren't those).
+DEFAULT_ACCENT_INSTRUCTIONS = os.getenv("TTS_ACCENT_INSTRUCTIONS", "")
+_INSTRUCTIONS_UNSUPPORTED_MODELS = {"tts-1", "tts-1-hd"}
 
 
 class OpenAITTS:
-    def __init__(self, voice=DEFAULT_VOICE, model=None):
+    def __init__(self, voice=DEFAULT_VOICE, model=None, accent_instructions=None):
         api_key = os.getenv("OPENAI_API_KEY")
 
         if not api_key:
@@ -44,6 +51,16 @@ class OpenAITTS:
         # default instead of sending a request that will 400.
         self.voice = voice if voice in OPENAI_VOICES else DEFAULT_VOICE
         self.model = model or os.getenv("OPENAI_TTS_MODEL", DEFAULT_TTS_MODEL)
+        self.accent_instructions = (
+            accent_instructions
+            if accent_instructions is not None
+            else DEFAULT_ACCENT_INSTRUCTIONS
+        )
+
+    def _instructions_kwarg(self):
+        if not self.accent_instructions or self.model in _INSTRUCTIONS_UNSUPPORTED_MODELS:
+            return {}
+        return {"instructions": self.accent_instructions}
 
     def synthesize_to_file(self, text: str, output_path=None):
 
@@ -55,6 +72,7 @@ class OpenAITTS:
             model=self.model,
             voice=self.voice,
             input=text,
+            **self._instructions_kwarg(),
         ) as response:
             response.stream_to_file(output_path)
 
@@ -62,7 +80,13 @@ class OpenAITTS:
 
     def synthesize_stream(self, text, response_format="pcm"):
         if not text.strip(): return
-        with self.client.audio.speech.with_streaming_response.create(model=self.model, voice=self.voice, input=text, response_format=response_format) as response:
+        with self.client.audio.speech.with_streaming_response.create(
+            model=self.model,
+            voice=self.voice,
+            input=text,
+            response_format=response_format,
+            **self._instructions_kwarg(),
+        ) as response:
             for chunk in response.iter_bytes(chunk_size=4096):
                 if chunk: yield chunk
 

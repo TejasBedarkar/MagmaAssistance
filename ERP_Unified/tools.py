@@ -237,6 +237,36 @@ def _resolve_link_filters(doctype: str, filters: Optional[list]) -> tuple[Option
     return resolved_filters, warnings
 
 
+_NAMING_TEMPLATE_RE = re.compile(r'\.(YYYY|YY|MM|DD|#+)\b')
+
+
+def _looks_like_naming_template(value) -> bool:
+    """True for a raw Frappe naming-series pattern like 'CUST-.YYYY.-', which is a template, not a record ID."""
+    return isinstance(value, str) and bool(_NAMING_TEMPLATE_RE.search(value))
+
+
+# Doctypes convert_crm_record can move a record on from -- if a value that
+# failed to resolve turns out to actually be one of these, the model almost
+# certainly reused that record's own ID instead of converting it first.
+_PIPELINE_SOURCE_DOCTYPES = ("Lead", "Opportunity", "Quotation")
+
+
+def _find_pipeline_source(target_doctype: str, value) -> Optional[str]:
+    """If `value` is really the ID of a Lead/Opportunity/Quotation instead of a {target_doctype}, return which."""
+    if not isinstance(value, str) or not value:
+        return None
+    for src in _PIPELINE_SOURCE_DOCTYPES:
+        if src == target_doctype:
+            continue
+        try:
+            matches = erp_client.get_list(src, fields=["name"], filters=[["name", "=", value]], limit=1, use_cache=False)
+        except Exception:
+            continue
+        if matches:
+            return src
+    return None
+
+
 def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[str]]:
     """Validate model-produced values against the live ERPNext schema.
 
@@ -333,10 +363,27 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
                     raise
                 if not resolved_id:
                     cleaned.pop(fieldname, None)
-                    warnings.append(
-                        f"Omitted {fieldname}='{value}' because no matching "
-                        f"{target_doctype} exists in ERPNext."
-                    )
+                    if _looks_like_naming_template(value):
+                        warnings.append(
+                            f"Omitted {fieldname}='{value}' -- that's a naming "
+                            f"series template, not a real record ID. Use the exact "
+                            f"`name` value an earlier tool result actually returned "
+                            f"for that {target_doctype}, not one guessed from its pattern."
+                        )
+                    else:
+                        source_doctype = _find_pipeline_source(target_doctype, value)
+                        if source_doctype:
+                            warnings.append(
+                                f"Omitted {fieldname}='{value}' -- that's the ID of an "
+                                f"existing {source_doctype}, not a {target_doctype}. "
+                                f"Convert it with convert_crm_record first, then use the "
+                                f"{target_doctype} ID that returns."
+                            )
+                        else:
+                            warnings.append(
+                                f"Omitted {fieldname}='{value}' because no matching "
+                                f"{target_doctype} exists in MagnaERP."
+                            )
                 else:
                     cleaned[fieldname] = resolved_id
             elif fieldtype == "Dynamic Link":
@@ -402,6 +449,24 @@ _OPERATOR_MAP = {
 }
 
 
+_KNOWN_OPS = {"like", "notlike", "=", "!=", ">", ">=", "<", "<="} | set(_OPERATOR_MAP)
+
+
+def _looks_like_operator(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.lower().replace(" ", "").replace("_", "").replace("-", "") in _KNOWN_OPS
+
+
+def _filter_triple(field: str, op: str, value):
+    """Builds one [field, op, value] filter, adding % wildcards to a bare 'like' value."""
+    op_key = str(op).lower().replace(" ", "").replace("_", "").replace("-", "")
+    clean_op = _OPERATOR_MAP.get(op_key, str(op))
+    if op_key in ("like", "notlike") and isinstance(value, str) and "%" not in value:
+        value = f"%{value}%"
+    return [field, clean_op, value]
+
+
 def _normalize_filters(filters: Optional[list | dict]) -> Optional[list]:
     """Convert natural language comparison operators ('greater than', 'greaterthan', 'less than')
     to standard SQL/Frappe comparison operators ('>', '<', '>=', etc.). Also handles
@@ -414,26 +479,36 @@ def _normalize_filters(filters: Optional[list | dict]) -> Optional[list]:
         if isinstance(f, tuple) and len(f) == 2 and isinstance(f[0], str):
             k, v = f
             if isinstance(v, (list, tuple)) and len(v) == 2:
-                key = str(v[0]).lower().replace(" ", "").replace("_", "").replace("-", "")
-                normalized.append([k, _OPERATOR_MAP.get(key, str(v[0])), v[1]])
+                normalized.append(_filter_triple(k, v[0], v[1]))
             elif isinstance(v, (list, tuple)) and len(v) >= 3:
                 normalized.append(list(v))
             else:
                 normalized.append([k, "=", v])
         elif isinstance(f, dict):
+            # A model sometimes spells one filter as two dict keys instead of
+            # the documented {field: [op, val]} -- e.g. {field: "like", "value":
+            # x} or even {field: "like", x: ""} with the value used as a key.
+            # Whichever key's value reads as an operator is the field/op pair;
+            # the other pair supplies the actual value (its value if present,
+            # else its own key, since that's where the model put the value).
+            if len(f) == 2:
+                pairs = list(f.items())
+                op_pair = next((p for p in pairs if _looks_like_operator(p[1])), None)
+                if op_pair:
+                    field, op = op_pair
+                    other_key, other_val = next(p for p in pairs if p is not op_pair)
+                    value = other_val if other_val not in (None, "") else other_key
+                    normalized.append(_filter_triple(field, op, value))
+                    continue
             for k, v in f.items():
                 if isinstance(v, (list, tuple)) and len(v) == 2:
-                    key = str(v[0]).lower().replace(" ", "").replace("_", "").replace("-", "")
-                    normalized.append([k, _OPERATOR_MAP.get(key, str(v[0])), v[1]])
+                    normalized.append(_filter_triple(k, v[0], v[1]))
                 elif isinstance(v, (list, tuple)) and len(v) >= 3:
                     normalized.append(list(v))
                 else:
                     normalized.append([k, "=", v])
         elif isinstance(f, (list, tuple)) and len(f) >= 3:
-            field, raw_op, val = f[0], str(f[1]), f[2]
-            key = raw_op.lower().replace(" ", "").replace("_", "").replace("-", "")
-            clean_op = _OPERATOR_MAP.get(key, raw_op)
-            normalized.append([field, clean_op, val])
+            normalized.append(_filter_triple(f[0], f[1], f[2]))
         else:
             normalized.append(f)
     return normalized
@@ -447,7 +522,7 @@ def erp_data_tool(
     fields: Optional[list] = None,
     filters: Optional[list] = None,
     order_by: Optional[str] = None,
-    limit: int = 20,
+    limit: Optional[int] = None,
     data: Optional[dict] = None,
     submit: bool = False,
     session_id: str = "default",
@@ -504,7 +579,7 @@ def erp_data_tool(
     if op in BLOCKED_OPERATIONS:
         return (
             f"The '{operation}' operation is not permitted through this tool. "
-            "Only read, create, and update operations are allowed on ERPNext data."
+            "Only read, create, and update operations are allowed on MagnaERP data."
         )
 
     if op in CREATE_OPERATIONS:
@@ -515,8 +590,8 @@ def erp_data_tool(
             req_fields = fields
             clean_filters = _normalize_filters(filters)
             clean_filters, link_warnings = _resolve_link_filters(doctype, clean_filters)
+            dt_lower = (doctype or "").strip().lower()
             if not req_fields:
-                dt_lower = (doctype or "").strip().lower()
                 if dt_lower == "sales order":
                     req_fields = ["name", "customer", "transaction_date", "grand_total", "status"]
                 elif dt_lower == "work order":
@@ -534,17 +609,44 @@ def erp_data_tool(
                 elif dt_lower == "employee":
                     req_fields = ["name", "employee_name", "department", "designation", "status"]
 
+            effective_order_by = order_by
+            # Deterministic, code-level cap for Leads instead of relying on
+            # the model to slice/count a returned list itself -- it doesn't
+            # do that reliably. Treat an explicit limit=10 the same as no
+            # limit at all: the model is told not to pass it, but sometimes
+            # redundantly does anyway, and 10 rows + a remaining-count line
+            # is the right result either way. Any other explicit limit
+            # (e.g. "show me 20 leads") is respected as a genuine ask.
+            auto_cap_leads = dt_lower == "lead" and (limit is None or limit == 10)
+            if dt_lower == "lead":
+                if not effective_order_by:
+                    effective_order_by = "creation desc"
+                fetch_limit = 200 if auto_cap_leads else limit
+            else:
+                fetch_limit = limit if limit is not None else 20
+
             results = erp_client.get_list(
-                doctype, fields=req_fields, filters=clean_filters, order_by=order_by, limit=limit,
+                doctype, fields=req_fields, filters=clean_filters, order_by=effective_order_by, limit=fetch_limit,
             )
             if not results and clean_filters:
                 fallback, fallback_warnings = _fallback_to_name_filter(
-                    doctype, clean_filters, req_fields, order_by, limit
+                    doctype, clean_filters, req_fields, effective_order_by, fetch_limit
                 )
                 if fallback:
                     results = fallback
                     link_warnings = link_warnings + fallback_warnings
-            return _with_warnings(str(results), link_warnings)
+
+            summary_prefix = ""
+            if auto_cap_leads and len(results) > 10:
+                total = len(results)
+                remaining = total - 10
+                results = results[:10]
+                summary_prefix = (
+                    f"Showing the 10 most recent Leads out of {total} total "
+                    f"({remaining} more not shown).\n"
+                )
+
+            return _with_warnings(summary_prefix + str(results), link_warnings)
 
         if op in GET_OPERATIONS:
             if not name:
@@ -764,7 +866,7 @@ def erp_describe_fields(doctype: str) -> str:
                 lines.append(f"- {f['label']}: {f['fieldname']} [{f['fieldtype']}]")
         lines.append("")
         if not req:
-            lines.append("ERPNext does not mark any user-supplied field as required for creation.")
+            lines.append("MagnaERP does not mark any user-supplied field as required for creation.")
         else:
             lines.append("Required fields for creation:")
             for f in req:

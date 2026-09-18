@@ -77,7 +77,13 @@ def convert_crm_record(
     IMPORTANT: `dry_run` defaults to True. A dry run fetches ERPNext's own
     field mapping and shows it for review WITHOUT creating anything. Only
     call again with dry_run=False, after explicit user confirmation, to
-    actually create the record."""
+    actually create the record.
+
+    The dry run's `naming_series` line (e.g. 'CUST-.YYYY.-') is only a
+    template, not the record's ID -- some doctypes name records by that
+    series, others by their title instead. Once the real (dry_run=False)
+    call returns, its `name` field is the exact, final ID -- use that
+    value in any later tool call, never one guessed from the series."""
 
     src = source_doctype.strip().title()
     tgt = "Sales Order" if target_doctype.strip().lower() == "sales order" else target_doctype.strip().title()
@@ -95,7 +101,7 @@ def convert_crm_record(
 
     if dry_run:
         lines = [
-            f"DRY RUN -- nothing created yet. ERPNext's own mapping for "
+            f"DRY RUN -- nothing created yet. MagnaERP's own mapping for "
             f"{src} '{source_name}' -> {tgt}:", "",
         ]
         for k, v in data.items():
@@ -116,7 +122,7 @@ def convert_crm_record(
     if missing:
         labels = ", ".join(f"{f['label']} ({f['fieldname']})" for f in missing)
         return (
-            f"ERPNext's own mapping is missing required field(s) for {tgt}: "
+            f"MagnaERP's own mapping is missing required field(s) for {tgt}: "
             f"{labels}. {field_question(missing[0])} Once you have the answer, "
             f"include it and call this tool again with dry_run=False."
         )
