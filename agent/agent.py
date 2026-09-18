@@ -650,6 +650,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             history.append(ai_msg)
             gate_intercepted = False
             for tc in tool_calls:
+                yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
                 tool_task = asyncio.create_task(
                     _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
                 )
