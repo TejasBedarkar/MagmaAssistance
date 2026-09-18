@@ -75,6 +75,10 @@ _PENDING_CREATES: dict[tuple, dict] = {}
 # that once several fields have been asked about in one create flow.
 _PENDING_CREATE_FIELD: dict[str, tuple[str, str]] = {}
 
+# How many Leads a session has already been shown, so "show more" continues
+# from there instead of the model having to guess or recompute an offset.
+_LEAD_LIST_SHOWN: dict[str, int] = {}
+
 
 def get_pending_create_field(session_id: str) -> Optional[tuple[str, str]]:
     """Returns (doctype, fieldname) if `session_id` is mid-way through a
@@ -206,6 +210,7 @@ def erp_data_tool(
     session_id: str = "default",
     web_enriched: bool = False,
     approved: Optional[bool] = None,
+    more: bool = False,
 ) -> str:
     """Single generic gateway to ERPNext for ANY doctype, instead of a
     separate tool per doctype/action. `doctype` is the exact ERPNext
@@ -217,6 +222,9 @@ def erp_data_tool(
                    names), `filters` (ERPNext filter format, e.g.
                    [["status", "=", "Open"]], [["transaction_date", ">=", "2026-01-01"]]),
                    `order_by`, and `limit`. Note: Always use standard operators ('>=', '>', '<=', '<', '=', '!=') in filters.
+                   For 'Lead' with no `limit`, only the 10 most recent are returned;
+                   when the user asks to see more, call again with `more=True` (same
+                   `session_id`, no `limit`) to get the next 10 -- do not guess an offset.
       - 'get'    : fetch one full record by `name` (the document ID).
       - 'create' : create a new record. Pass whatever fields the user
                    has already given in `data` (can be partial or
@@ -315,14 +323,25 @@ def erp_data_tool(
                     link_warnings = link_warnings + fallback_warnings
 
             summary_prefix = ""
-            if auto_cap_leads and len(results) > 10:
+            if auto_cap_leads:
                 total = len(results)
-                remaining = total - 10
-                results = results[:10]
-                summary_prefix = (
-                    f"Showing the 10 most recent Leads out of {total} total "
-                    f"({remaining} more not shown).\n"
-                )
+                offset = _LEAD_LIST_SHOWN.get(session_id, 0) if more else 0
+                page = results[offset:offset + 10]
+                _LEAD_LIST_SHOWN[session_id] = offset + len(page)
+                remaining = max(0, total - (offset + len(page)))
+                results = page
+                if more and not page:
+                    summary_prefix = "There are no more Leads to show.\n"
+                elif offset == 0 and total > 10:
+                    summary_prefix = (
+                        f"Showing the 10 most recent Leads out of {total} total "
+                        f"({remaining} more not shown).\n"
+                    )
+                elif offset > 0:
+                    summary_prefix = (
+                        f"Showing Leads {offset + 1}-{offset + len(page)} of {total} total "
+                        f"({remaining} more not shown).\n"
+                    )
 
             return _with_warnings(summary_prefix + str(results), link_warnings)
 
