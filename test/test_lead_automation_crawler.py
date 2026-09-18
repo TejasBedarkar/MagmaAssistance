@@ -208,8 +208,9 @@ def test_erpnext_lead_with_linked_address_creation():
     mock_addr_result = {"name": "ADDR-00001", "address_title": "Apex Tech"}
 
     with patch("ERP_Unified.tools.erp_client.create_doc") as mock_create, \
-         patch("ERP_Unified.tools.erp_client.get_meta") as mock_meta:
-        
+         patch("ERP_Unified.tools.erp_client.get_meta") as mock_meta, \
+         patch("ERP_Unified.tools.erp_client.get_list") as mock_get_list:
+
         mock_meta.return_value = {
             "fields": [
                 {"fieldname": "lead_name", "fieldtype": "Data", "reqd": 1},
@@ -218,7 +219,11 @@ def test_erpnext_lead_with_linked_address_creation():
                 {"fieldname": "mobile_no", "fieldtype": "Data"},
             ]
         }
-        
+        # The Lead->Address linking step resolves the Country field via a
+        # real lookup call -- stub it so the test stays self-contained
+        # instead of reaching out to a live MagnaERP instance.
+        mock_get_list.return_value = [{"name": "India"}]
+
         mock_create.side_effect = [mock_lead_result, mock_addr_result]
 
         lead_data = {
