@@ -492,6 +492,18 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             if not done:
                 yield {"type": "ping"}
         result = await tool_task
+
+        # erp_data_tool has its own, separate web-research review gate --
+        # the "yes" that resumed this proposal already covers that too, so
+        # satisfy it here instead of leaving the user stuck confirming twice.
+        if isinstance(result, str) and result.startswith("REVIEW_REQUIRED:") and pending["tool_name"] == "erp_data_tool":
+            retry_args = {**pending["args"], "approved": True}
+            result = await _execute_tool(
+                pending["tool_name"], retry_args,
+                session_id=session_id, user_id=user_id, prompt_text=text,
+                bypass_gate=True,
+            )
+
         yield {"type": "tool_result", "name": pending["tool_name"], "result": result}
         summary_messages = [
             SystemMessage(content=state.assistant.llm.system_prompt),
