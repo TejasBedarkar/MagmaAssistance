@@ -28,6 +28,7 @@ from config import (
     TOOL_RAG_BYPASS_THRESHOLD,
 )
 import db.postgres_audit_log as audit_log
+from document_context import WEB_TOOL_NAMES, build_document_context, web_allowed_this_turn
 from ERP_Unified.tools import get_pending_create_field, get_pending_create_data, CREATE_OPERATIONS
 from llm_client import _clean_schema_for_openai, convert_message_to_dict
 import state
@@ -477,6 +478,13 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             f"correction, a new request), respond to that instead."
         )))
 
+    # last thing the assistant said, used to spot a bare "yes" to "want me to search online?"
+    prev_ai_text = next(
+        (m.content for m in reversed(history)
+         if isinstance(m, AIMessage) and isinstance(m.content, str) and m.content.strip()),
+        None,
+    )
+
     history.append(HumanMessage(content=text))
     trimmed = trim_messages(
         history,
@@ -490,6 +498,14 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     candidate_tools = []
     if state.ALL_TOOLS:
         candidate_tools = list(state.ALL_TOOLS) if len(state.ALL_TOOLS) <= TOOL_RAG_BYPASS_THRESHOLD else (state.tool_rag.retrieve(text) if state.tool_rag else [])
+
+    # DOCUMENT FIRST, WEB SECOND: once the user has uploaded files, work from them.
+    # Web tools come back only if the user says something is wrong/missing, asks
+    # for a search, pastes a URL, or says yes to our offer to search online.
+    has_documents = bool(session_id and state.document_store.get(session_id))
+    web_withheld = has_documents and not web_allowed_this_turn(text, prev_ai_text)
+    if web_withheld:
+        candidate_tools = [t for t in candidate_tools if t.name not in WEB_TOOL_NAMES]
 
     openai_tools = None
     if candidate_tools:
@@ -505,6 +521,16 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
         f"\nToday's real date is {datetime.now().strftime('%Y-%m-%d')} ({datetime.now().strftime('%A')}). "
         f"Never guess or assume a date -- always compute 'this month'/'today'/'last week' etc. from this."
     )
+    doc_context = build_document_context(session_id) if session_id else ""
+    if doc_context:
+        system_parts.append("\n" + doc_context)
+        if web_withheld:
+            system_parts.append(
+                "\nWeb tools are switched off for this message because you already have the uploaded "
+                "file(s) to work from. If details the user needs (email, phone, address, ...) are not in "
+                "the files, say exactly what is missing and offer to search online for it -- do not "
+                "claim to have searched."
+            )
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
     call_messages = [SystemMessage(content="\n".join(system_parts)), *trimmed]
