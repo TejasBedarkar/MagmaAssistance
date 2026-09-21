@@ -601,9 +601,10 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     # nudge: "yes" / "proceed" with no pending approval means the user is approving the action in discussion
     approving_proposal_turn = False
     if not pending and _is_write_approval(text):
-        approving_proposal_turn = True
         last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
-        if last_ai and isinstance(last_ai.content, str):
+        # only when the assistant's last message really was a proposal; a stray "proceed" must not skip the write gate
+        if last_ai and isinstance(last_ai.content, str) and _PROSE_PROPOSAL_RE.search(last_ai.content):
+            approving_proposal_turn = True
             history.append(SystemMessage(content=(
                 "The user just approved proceeding with a direct approval (\"Proceed\" / \"yes\"). "
                 "Call whichever tool that was discussed or proposed (erp_data_tool, or a dry_run-based "

@@ -98,44 +98,53 @@ def _normalize_speech_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+_ANSWER_START_RE = re.compile(
+    r"^(yes|yeah|yep|yup|ya|ok|okay|sure|please|proceed|go ahead|confirm|approve|no|nope|nah|cancel|stop)\b"
+)
+
+
 def is_voice_echo(
     text: str,
     recent_spoken: list[tuple[float, str]],
     now: float,
     max_age: float = 10.0,
 ) -> bool:
-    """Returns True if text appears to be an echo of assistant filler or speech."""
+    """True if text looks like the mic picking up the assistant's own filler or speech.
+
+    A spoken answer ("yes please proceed", "no cancel") is never echo, even though the assistant's
+    confirmation prompt uses the same words; short utterances are only compared to the fillers.
+    """
     norm_text = _normalize_speech_text(text)
     if not norm_text:
         return True
+    if _ANSWER_START_RE.match(norm_text):
+        return False
+    words_text = norm_text.split()
 
-    # 1. Direct match against standard filler phrases
+    # 1. Fillers are distinctive short phrases, so a partial pickup counts too
     for filler in ALL_FILLER_PHRASES:
         norm_filler = _normalize_speech_text(filler)
         if norm_text == norm_filler:
             return True
-        if len(norm_text) > 4 and norm_text in norm_filler:
+        if len(words_text) >= 2 and len(norm_text) > 4 and norm_text in norm_filler:
             return True
         if len(norm_filler) > 4 and norm_filler in norm_text:
             return True
 
-    # 2. Check against recent spoken phrases within max_age seconds
+    # 2. Longer utterances against what was said in the last few seconds
+    if len(words_text) < 4:
+        return False
     for timestamp, phrase in reversed(recent_spoken):
         if now - timestamp > max_age:
             continue
         norm_phrase = _normalize_speech_text(phrase)
         if not norm_phrase:
             continue
-        if norm_text == norm_phrase or norm_text in norm_phrase or norm_phrase in norm_text:
+        if norm_text in norm_phrase or norm_phrase in norm_text:
             return True
-
-        # High word-overlap similarity (> 75%)
-        words_text = set(norm_text.split())
         words_phrase = set(norm_phrase.split())
-        if words_text and words_phrase:
-            overlap = len(words_text & words_phrase) / len(words_text)
-            if overlap >= 0.75:
-                return True
+        if len(set(words_text) & words_phrase) / len(words_text) >= 0.75:
+            return True
 
     return False
 

@@ -58,3 +58,19 @@ def test_legitimate_user_speech_not_blocked():
     assert not is_voice_echo("Create a new quotation for customer XYZ", recent, now)
     assert not is_voice_echo("Yes, submit that sales order", recent, now)
     assert not is_voice_echo("Show me open leads", recent, now)
+
+
+def test_spoken_answers_are_not_echo_of_the_confirmation_prompt():
+    now = 1000.0
+    recent = [
+        (999.0, "Please confirm with a plain yes to proceed with creating the lead."),
+        (998.0, "Here are the details of the lead I am about to create."),
+    ]
+    for answer in ["Yes", "yes please proceed", "Proceed", "Yes please proceed with creating the lead",
+                   "go ahead", "No cancel that", "Okay please create this lead"]:
+        assert not is_voice_echo(answer, recent, now), answer
+
+
+def test_a_single_word_is_not_matched_against_a_filler():
+    assert not is_voice_echo("records", [], 1000.0)
+    assert not is_voice_echo("moment", [], 1000.0)
