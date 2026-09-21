@@ -642,6 +642,8 @@ export default function AssistantPortal({ isOpen, onClose }) {
                         updateLastBotMessage(chatId, (msg) => ({
                             ...msg,
                             text: msg.text || (event.text ?? event.content ?? ''),
+                            action_card: event.action_card || msg.action_card,
+                            suggested_actions: event.suggested_actions || msg.suggested_actions,
                             streaming: false,
                         }));
                         completed = true;

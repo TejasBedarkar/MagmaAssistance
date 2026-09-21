@@ -5,8 +5,9 @@ Data validation, link resolution, warning construction, and query filter
 normalization for ERP_Unified tools.
 """
 
+import json
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from ERP.erp_client import erp_client
 
@@ -137,6 +138,85 @@ def _find_pipeline_source(target_doctype: str, value) -> Optional[str]:
     return None
 
 
+def _parse_table_rows(value: Any, child_doctype: Optional[str]) -> list[dict]:
+    """Parse string, list of strings, or JSON into standard Frappe child table rows."""
+    if isinstance(value, list):
+        return _normalize_child_rows(value, child_doctype)
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if trimmed.startswith("[") and trimmed.endswith("]"):
+            try:
+                parsed = json.loads(trimmed)
+                if isinstance(parsed, list):
+                    return _normalize_child_rows(parsed, child_doctype)
+            except Exception:
+                pass
+        lines = [line.strip() for line in re.split(r"[;\n]+", trimmed) if line.strip()]
+        rows = []
+        for line in lines:
+            parts = [p.strip() for p in line.split(",") if p.strip()]
+            if not parts:
+                continue
+            item_raw = parts[0]
+            qty_match = re.search(r"(?:quantity|qty)?\s*[:=]?\s*(\d+(?:\.\d+)?)", line, re.IGNORECASE)
+            qty = float(qty_match.group(1)) if qty_match else 1.0
+            clean_item = re.sub(r"\(.*?\)", "", item_raw).strip()
+            if not clean_item:
+                continue
+            rows.append({
+                "item_code": clean_item,
+                "qty": qty,
+                "stock_uom": "Nos",
+                "rate": 0.0,
+            })
+        return _normalize_child_rows(rows, child_doctype)
+    return []
+
+
+def _normalize_child_rows(rows: list, child_doctype: Optional[str]) -> list[dict]:
+    """Ensure each child row has valid, resolved item_code and required quantities."""
+    normalized = []
+    for r in rows:
+        if not isinstance(r, dict):
+            if isinstance(r, str) and r.strip():
+                r = {"item_code": r.strip(), "qty": 1.0, "stock_uom": "Nos"}
+            else:
+                continue
+        row = dict(r)
+        item_val = row.get("item_code") or row.get("item")
+        if item_val:
+            try:
+                resolved_item = _resolve_link_value("Item", str(item_val))
+                if not resolved_item:
+                    c_name = str(item_val).strip()
+                    c_code = c_name.replace(" ", "-").upper()
+                    grp = "Raw Material" if any(rm in c_name.lower() for rm in ["wood", "graphite", "steel", "plastic", "raw", "lead"]) else "Products"
+                    new_item = erp_client.create_doc("Item", {
+                        "item_code": c_code,
+                        "item_name": c_name,
+                        "item_group": grp,
+                        "stock_uom": "Nos",
+                        "is_stock_item": 1,
+                    })
+                    resolved_item = new_item.get("name", c_code) if isinstance(new_item, dict) else str(new_item)
+                row["item_code"] = resolved_item
+            except Exception:
+                row["item_code"] = str(item_val)
+        if "qty" not in row or not row["qty"]:
+            row["qty"] = 1.0
+        else:
+            try:
+                row["qty"] = float(row["qty"])
+            except Exception:
+                row["qty"] = 1.0
+        if "stock_uom" not in row or not row["stock_uom"]:
+            row["stock_uom"] = "Nos"
+        if "rate" not in row:
+            row["rate"] = 0.0
+        normalized.append(row)
+    return normalized
+
+
 def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[str]]:
     """Validate model-produced values against the live ERPNext schema.
 
@@ -249,12 +329,37 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
                                 f"Convert it with convert_crm_record first, then use the "
                                 f"{target_doctype} ID that returns."
                             )
-                        else:
+                        elif target_doctype == "Company":
+                            try:
+                                comps = erp_client.get_list("Company", fields=["name"], limit=1, use_cache=False)
+                                if comps:
+                                    resolved_id = comps[0]["name"]
+                                    warnings.append(f"Auto-selected default Company '{resolved_id}'.")
+                            except Exception:
+                                pass
+                        elif target_doctype == "Item" and isinstance(value, str) and value.strip() and not _looks_like_naming_template(value):
+                            try:
+                                c_name = value.strip()
+                                c_code = c_name.replace(" ", "-").upper()
+                                grp = "Raw Material" if any(rm in c_name.lower() for rm in ["wood", "graphite", "steel", "plastic", "raw", "lead"]) else "Products"
+                                new_item = erp_client.create_doc("Item", {
+                                    "item_code": c_code,
+                                    "item_name": c_name,
+                                    "item_group": grp,
+                                    "stock_uom": "Nos",
+                                    "is_stock_item": 1,
+                                })
+                                resolved_id = new_item.get("name", c_code) if isinstance(new_item, dict) else str(new_item)
+                                warnings.append(f"Auto-created missing Item '{resolved_id}' in MagnaERP.")
+                            except Exception:
+                                pass
+
+                        if not resolved_id:
                             warnings.append(
                                 f"Omitted {fieldname}='{value}' because no matching "
                                 f"{target_doctype} exists in MagnaERP."
                             )
-                else:
+                if resolved_id:
                     cleaned[fieldname] = resolved_id
             elif fieldtype == "Dynamic Link":
                 cleaned.pop(fieldname, None)
@@ -271,11 +376,19 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
                 )
 
         if fieldtype == "Table":
+            child_doctype = field.get("options")
             if not isinstance(value, list):
-                cleaned.pop(fieldname, None)
-                warnings.append(
-                    f"Omitted {fieldname} because it requires a list of table rows, but a {type(value).__name__} was provided."
-                )
+                parsed = _parse_table_rows(value, child_doctype)
+                if parsed:
+                    cleaned[fieldname] = parsed
+                    warnings.append(f"Auto-formatted {len(parsed)} table rows for {fieldname}.")
+                else:
+                    cleaned.pop(fieldname, None)
+                    warnings.append(
+                        f"Omitted {fieldname} because it requires a list of table rows, but a {type(value).__name__} was provided."
+                    )
+            else:
+                cleaned[fieldname] = _normalize_child_rows(value, child_doctype)
             continue
 
         # catches e.g. Notes getting a list instead of a string

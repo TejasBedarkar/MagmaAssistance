@@ -65,4 +65,6 @@ test_*.py
 !smoke_test/test/test_*.py
 last_history.json
 *.bundle.js
+output/
+tmp/
 

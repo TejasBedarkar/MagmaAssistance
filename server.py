@@ -28,8 +28,10 @@ from llm_client import (
     convert_message_to_dict,
     OpenAIChatModel,
 )
+from routes.action import router as action_router
 from routes.audit import router as audit_router
 from routes.chat import router as chat_router
+from routes.plans import router as plans_router
 from routes.session import router as session_router
 from routes.upload import router as upload_router
 from routes.voice import router as voice_router
@@ -126,6 +128,8 @@ app.add_middleware(
 # Mount Routers
 # ---------------------------------------------------------------------
 app.include_router(chat_router)
+app.include_router(action_router)
+app.include_router(plans_router)
 app.include_router(voice_router)
 app.include_router(upload_router)
 app.include_router(session_router)

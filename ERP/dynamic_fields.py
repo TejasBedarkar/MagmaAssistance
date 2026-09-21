@@ -239,6 +239,19 @@ def apply_default_values(doctype: str, data: dict | None) -> dict:
             choices = [c.strip() for c in str(f["options"]).split("\n") if c.strip()]
             if choices:
                 data[fieldname] = choices[0]
+            continue
+
+        if f.get("fieldtype") == "Link" and f.get("options") == "Company":
+            try:
+                comps = erp_client.get_list("Company", fields=["name"], limit=1, use_cache=False)
+                if comps:
+                    data[fieldname] = comps[0]["name"]
+            except Exception:
+                pass
+            continue
+
+    if doctype.strip().lower() == "bom" and not data.get("quantity"):
+        data["quantity"] = 1.0
 
     return data
 

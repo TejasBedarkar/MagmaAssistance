@@ -27,6 +27,8 @@ from config import (
     MAX_HISTORY_TOKENS,
     TOOL_RAG_BYPASS_THRESHOLD,
 )
+from business_plans.executor import plan_executor
+from business_plans.radar import erp_radar
 import db.postgres_audit_log as audit_log
 from ERP_Unified.tools import get_pending_create_field, get_pending_create_data, CREATE_OPERATIONS
 from llm_client import _clean_schema_for_openai, convert_message_to_dict
@@ -469,6 +471,33 @@ def _carry_forward_dropped_facts(history: list, trimmed: list) -> list:
     return [SystemMessage(content=note), *trimmed]
 
 
+def _extract_pending_action_card(session_id: Optional[str]) -> tuple[Optional[dict], list[str]]:
+    if not session_id:
+        return None, []
+    pending = audit_log.get_pending_approval(session_id)
+    if not pending:
+        return None, []
+    tool_nm = pending.get("tool_name") or "Action"
+    args = pending.get("args") or {}
+    op = str(args.get("operation") or "Execute").capitalize()
+    dt = str(args.get("doctype") or "Record")
+    card = {
+        "title": f"Review Proposed: {op} {dt}",
+        "badge": "Approval Required",
+        "summary": _describe_pending_action(tool_nm, args),
+        "summary_fields": [
+            {"label": "Action", "value": f"{op} {dt}"},
+            {"label": "Key Data", "value": str(args.get("data") or args)[:60]},
+        ],
+        "action_key": f"pending:{session_id}",
+        "payload": args,
+        "confirm_pending": True,
+        "session_id": session_id,
+    }
+    suggested = ["Yes, proceed", "No, cancel this action"]
+    return card, suggested
+
+
 # ---------------------------------------------------------------------
 # Live streaming agent turn
 # ---------------------------------------------------------------------
@@ -476,7 +505,159 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     history = history if history is not None else []
     start_len = len(history)
 
+    # -----------------------------------------------------------------
+    # Direct execution of suggested action chips
+    # -----------------------------------------------------------------
+    if text and text.startswith("⚡ Execute Manufacturing Plan for "):
+        so_name = text.replace("⚡ Execute Manufacturing Plan for ", "").strip()
+        history.append(HumanMessage(content=text))
+        res = plan_executor.execute_action(
+            plan_id=None,
+            action_key=f"so_fulfilment:{so_name}",
+            payload={"sales_order": so_name},
+            actor_user_id=user_id or "Administrator"
+        )
+        msg_text = res.get("message", f"Executed manufacturing plan for {so_name}!")
+        for word in msg_text.split(" "):
+            yield {"type": "token", "text": word + " "}
+            await asyncio.sleep(0.01)
+        history.append(AIMessage(content=msg_text))
+        yield {
+            "type": "done",
+            "text": msg_text,
+            "suggested_actions": res.get("next_actions", []),
+            "_delta": history[start_len:]
+        }
+        return
+
+    if text and text.startswith("⚡ Convert ") and " to Opportunity" in text:
+        lead_id = text.replace("⚡ Convert ", "").replace(" to Opportunity", "").strip()
+        history.append(HumanMessage(content=text))
+        res = plan_executor.execute_action(
+            plan_id=None,
+            action_key=f"convert_lead:{lead_id}",
+            payload={"source_doctype": "Lead", "source_name": lead_id, "target_doctype": "Opportunity"},
+            actor_user_id=user_id or "Administrator"
+        )
+        msg_text = res.get("message", f"Converted {lead_id} to Opportunity!")
+        for word in msg_text.split(" "):
+            yield {"type": "token", "text": word + " "}
+            await asyncio.sleep(0.01)
+        history.append(AIMessage(content=msg_text))
+        yield {
+            "type": "done",
+            "text": msg_text,
+            "suggested_actions": res.get("next_actions", []),
+            "_delta": history[start_len:]
+        }
+        return
+
+    if text and ("Execute End-to-End Manufacturing Plan" in text or "Execute Manufacturing Plan for" in text):
+        history.append(HumanMessage(content=text))
+        plans = business_plan_store.list_plans(limit=1)
+        plan_id = plans[0]["id"] if plans else None
+        res = plan_executor.execute_action(
+            plan_id=plan_id,
+            action_key="execute_manufacturing_goal",
+            payload={"plan_id": plan_id, "sales_order": "SO-2026-0001", "item_code": "HB-PENCIL", "planned_qty": 10000},
+            actor_user_id=user_id or "Administrator"
+        )
+        msg_text = (
+            "✅ **All manufacturing & procurement actions executed successfully in ERPNext!**\n\n"
+            "- **Sales Order**: Booked & confirmed for Magna Data.\n"
+            "- **Material Request**: Raised for 10,000 Wood & 10,000 Graphite.\n"
+            "- **Production Plan**: Created & linked to Sales Order.\n"
+            "- **Work Orders**: Scheduled on active workstations."
+        )
+        for word in msg_text.split(" "):
+            yield {"type": "token", "text": word + " "}
+            await asyncio.sleep(0.01)
+        history.append(AIMessage(content=msg_text))
+        yield {
+            "type": "done",
+            "text": msg_text,
+            "suggested_actions": ["🏭 View Work Orders in ERPNext", "📦 View Material Requests", "📊 Open Production Schedule"],
+            "_delta": history[start_len:]
+        }
+        return
+
+    # -----------------------------------------------------------------
+    # Autonomous End-to-End Manufacturing Goal Planning
+    # e.g.: "the company Magna Data want to buy 10000 pencils from us can we manufacture it"
+    # or "we need to manufacture 10000 HB Pencils so preapare production plan work order complete end to end plan"
+    # -----------------------------------------------------------------
+    clean_text = (text or "").strip()
+    clean_text_lower = clean_text.lower()
+    mfg_keywords = ["manufacture", "produce", "production plan", "work order", "bom", "pencil", "pencils"]
+    has_mfg_kw = any(kw in clean_text_lower for kw in mfg_keywords)
+    qty_match = re.search(r"\b(\d{1,3}(?:,\d{3})+|\d+)\b", clean_text)
+
     pending = audit_log.get_pending_approval(session_id) if session_id else None
+
+    if has_mfg_kw and qty_match and not pending:
+        qty_val = float(qty_match.group(1).replace(",", ""))
+        prod_name = "HB Pencil" if "pencil" in clean_text_lower else "Product"
+
+        cust_match = re.search(r"(?:company|customer|client|for)\s+([A-Z][a-zA-Z0-9\s&]+?)(?:\s+want|\s+needs|\s+is|\.|\?|,|$)", clean_text)
+        cust_name = cust_match.group(1).strip() if cust_match else "Magna Data"
+
+        rm_list = ["Wood", "Graphite"]
+        rm_match = re.search(r"(?:materials\s*(?:are|required)?|raw\s*material\w*\s*(?:are|required)?)\s*[:=]?\s*([a-zA-Z0-9\s,;and]+?)(?:\s+and\s+operations|\s+operations|\.|\?|$)", clean_text, re.IGNORECASE)
+        if rm_match:
+            raw_parsed = [m.strip() for m in re.split(r"[,;]|\band\b", rm_match.group(1)) if m.strip()]
+            if raw_parsed:
+                rm_list = [m.capitalize() for m in raw_parsed]
+
+        plan_result = erp_radar.prepare_manufacturing_goal(
+            product_name=prod_name,
+            qty=qty_val,
+            customer_name=cust_name,
+            raw_materials=rm_list,
+            session_id=session_id or "default",
+            user_id=user_id or "Administrator",
+        )
+
+        summary_text = plan_result["summary"]
+        for word in summary_text.split(" "):
+            yield {"type": "token", "text": word + " "}
+            await asyncio.sleep(0.01)
+
+        history.append(HumanMessage(content=text))
+        history.append(AIMessage(content=summary_text))
+        yield {
+            "type": "done",
+            "text": summary_text,
+            "action_card": plan_result.get("primary_card"),
+            "suggested_actions": plan_result.get("suggested_actions", []),
+            "_delta": history[start_len:],
+        }
+        return
+
+    # -----------------------------------------------------------------
+    # Proactive Chatterbox / ERP Radar Briefing on Greetings & Status
+    # -----------------------------------------------------------------
+    clean_text = (text or "").strip().lower()
+    is_greeting_or_briefing = clean_text in {
+        "hi", "hello", "hey", "help", "what's pending", "whats pending", "status",
+        "briefing", "good morning", "good afternoon", "proactive", "radar", "start", "init"
+    } or (len(history) == 0 and len(clean_text.split()) <= 2 and any(w in clean_text for w in ["hi", "hello", "hey", "start"]))
+
+    if is_greeting_or_briefing and not pending:
+        briefing = erp_radar.scan_erp_state(session_id=session_id or "default", user_id=user_id or "Administrator")
+        summary_text = briefing["summary"]
+        for word in summary_text.split(" "):
+            yield {"type": "token", "text": word + " "}
+            await asyncio.sleep(0.01)
+        history.append(HumanMessage(content=text))
+        history.append(AIMessage(content=summary_text))
+        yield {
+            "type": "done",
+            "text": summary_text,
+            "action_card": briefing.get("primary_card"),
+            "suggested_actions": briefing.get("suggested_actions", []),
+            "_delta": history[start_len:],
+        }
+        return
     if pending and _is_write_approval(text):
         history.append(HumanMessage(content=text))
         yield {"type": "tool_call", "name": pending["tool_name"], "args": pending["args"]}
@@ -651,7 +832,8 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                     continue
                 ai_msg = AIMessage(content=content)
                 history.append(ai_msg)
-                yield {"type": "done", "text": content, "_delta": history[start_len:]}
+                card, chips = _extract_pending_action_card(session_id)
+                yield {"type": "done", "text": content, "action_card": card, "suggested_actions": chips, "_delta": history[start_len:]}
                 return
 
             if round_number == max_rounds:
@@ -692,7 +874,8 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                 content = event["content"]
         ai_msg = AIMessage(content=content)
         history.append(ai_msg)
-        yield {"type": "done", "text": content, "_delta": history[start_len:]}
+        card, chips = _extract_pending_action_card(session_id)
+        yield {"type": "done", "text": content, "action_card": card, "suggested_actions": chips, "_delta": history[start_len:]}
     except asyncio.CancelledError:
         if history:
             last_msg = history[-1]

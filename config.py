@@ -12,6 +12,11 @@ LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "4096"))
 MAX_COMPLETION_ROUNDS = int(os.environ.get("LLM_MAX_COMPLETION_ROUNDS", "4"))
 LLM_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("LLM_REQUEST_TIMEOUT_SECONDS", "90"))
 
+# Business plans use an isolated SQLite store during the single-process pilot.
+# Move this to a PostgreSQL-backed implementation before multi-worker,
+# proactive production execution.
+BUSINESS_PLAN_DB_PATH = os.environ.get("BUSINESS_PLAN_DB_PATH", "db/business_plans.db")
+
 TOOL_RAG_TOP_K = int(os.environ.get("TOOL_RAG_TOP_K", "3"))
 TOOL_RAG_MIN_SCORE = float(os.environ.get("TOOL_RAG_MIN_SCORE", "0.25"))
 TOOL_RAG_BYPASS_THRESHOLD = int(os.environ.get("TOOL_RAG_BYPASS_THRESHOLD", "100"))
