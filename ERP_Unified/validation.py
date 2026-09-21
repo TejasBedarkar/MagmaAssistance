@@ -213,6 +213,13 @@ def _normalize_child_rows(rows: list, child_doctype: Optional[str]) -> list[dict
             row["stock_uom"] = "Nos"
         if "rate" not in row:
             row["rate"] = 0.0
+        if row.get("warehouse"):
+            try:
+                resolved_wh = _resolve_link_value("Warehouse", str(row["warehouse"]))
+                if resolved_wh:
+                    row["warehouse"] = resolved_wh
+            except Exception:
+                pass
         normalized.append(row)
     return normalized
 
@@ -234,6 +241,11 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
         for field in meta.get("fields", []) or []
         if field.get("fieldname")
     }
+
+    dt_clean = doctype.strip().lower()
+    if dt_clean in ("sales order", "quotation", "sales invoice", "delivery note"):
+        if cleaned.get("warehouse") and not cleaned.get("set_warehouse"):
+            cleaned["set_warehouse"] = cleaned.pop("warehouse")
 
     if doctype.strip().lower() == "task" and cleaned.get("assigned_to"):
         # a common, wrong instinct -- Task has no such field, assignment is

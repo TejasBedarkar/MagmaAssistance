@@ -254,7 +254,20 @@ async def _execute_tool(
         if tool_name == "erp_data_tool" and str(effective_args.get("operation") or "").lower() in CREATE_OPERATIONS:
             doctype = effective_args.get("doctype")
             if doctype:
+                from ERP.dynamic_fields import apply_default_values, missing_required_fields
+                from ERP_Unified.validation import _prepare_write_data
                 accumulated = get_pending_create_data(session_id, doctype)
+                merged = {**accumulated, **(effective_args.get("data") or {})}
+                merged = apply_default_values(doctype, merged)
+                merged, _ = _prepare_write_data(doctype, merged)
+                merged = apply_default_values(doctype, merged)
+                missing = missing_required_fields(doctype, merged)
+                if missing:
+                    # Still gathering required fields -- run tool directly to get the next field question
+                    tool = state.tool_map.get(tool_name)
+                    if tool is not None:
+                        result = await tool.ainvoke(effective_args) if hasattr(tool, "ainvoke") else tool.invoke(effective_args)
+                        return result
                 if accumulated:
                     preview_args = {
                         **effective_args,

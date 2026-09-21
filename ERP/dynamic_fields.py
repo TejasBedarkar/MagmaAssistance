@@ -250,7 +250,100 @@ def apply_default_values(doctype: str, data: dict | None) -> dict:
                 pass
             continue
 
-    if doctype.strip().lower() == "bom" and not data.get("quantity"):
+    dt_clean = doctype.strip().lower()
+
+    # Determine company
+    company = data.get("company")
+    if not company:
+        try:
+            comps = erp_client.get_list("Company", fields=["name", "default_currency"], limit=1, use_cache=False)
+            if comps:
+                company = comps[0]["name"]
+                data["company"] = company
+        except Exception:
+            company = "Demo Company"
+            data["company"] = company
+
+    # Determine company default currency
+    def_curr = "INR"
+    try:
+        comp_doc = erp_client.get_list("Company", filters=[["name", "=", company]], fields=["default_currency"], limit=1, use_cache=False)
+        if comp_doc and comp_doc[0].get("default_currency"):
+            def_curr = comp_doc[0]["default_currency"]
+    except Exception:
+        pass
+
+    # Transactional doctypes defaults
+    if dt_clean in ("sales order", "quotation", "sales invoice", "delivery note", "purchase order", "purchase invoice", "purchase receipt"):
+        data.setdefault("currency", def_curr)
+        data.setdefault("conversion_rate", 1.0)
+        data.setdefault("price_list_currency", data.get("currency", def_curr))
+        data.setdefault("plc_conversion_rate", 1.0)
+        from datetime import datetime, timedelta
+        data.setdefault("transaction_date", datetime.now().strftime("%Y-%m-%d"))
+
+        # Sales-specific defaults
+        if dt_clean in ("sales order", "quotation", "sales invoice", "delivery note"):
+            data.setdefault("selling_price_list", "Standard Selling")
+            if dt_clean == "sales order":
+                data.setdefault("order_type", "Sales")
+                data.setdefault("delivery_date", (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"))
+
+        # Purchase-specific defaults
+        if dt_clean in ("purchase order", "purchase invoice", "purchase receipt"):
+            data.setdefault("buying_price_list", "Standard Buying")
+            data.setdefault("schedule_date", (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"))
+
+        # Warehouse resolution for parent & child rows
+        wh = data.get("set_warehouse") or data.get("warehouse")
+        if wh:
+            try:
+                from ERP_Unified.validation import _resolve_link_value
+                resolved_wh = _resolve_link_value("Warehouse", wh)
+                if not resolved_wh:
+                    wh_matches = erp_client.get_list(
+                        "Warehouse",
+                        filters=[["company", "=", company], ["name", "like", f"%{wh}%"]],
+                        fields=["name"],
+                        limit=1,
+                        use_cache=False,
+                    )
+                    if wh_matches:
+                        resolved_wh = wh_matches[0]["name"]
+                if resolved_wh:
+                    wh = resolved_wh
+            except Exception:
+                pass
+        else:
+            try:
+                whs = erp_client.get_list(
+                    "Warehouse",
+                    filters=[["company", "=", company], ["is_group", "=", 0]],
+                    fields=["name"],
+                    limit=10,
+                    use_cache=False,
+                )
+                fg_or_stores = [w["name"] for w in whs if any(k in w["name"].lower() for k in ["stores", "finished"])]
+                wh = fg_or_stores[0] if fg_or_stores else (whs[0]["name"] if whs else None)
+            except Exception:
+                wh = None
+
+        if wh:
+            data["set_warehouse"] = wh
+            data.pop("warehouse", None)
+
+        # Propagate to child items if present
+        if data.get("items") and isinstance(data["items"], list):
+            for row in data["items"]:
+                if isinstance(row, dict):
+                    if wh and not row.get("warehouse"):
+                        row["warehouse"] = wh
+                    if data.get("delivery_date") and not row.get("delivery_date"):
+                        row["delivery_date"] = data["delivery_date"]
+                    if not row.get("conversion_factor"):
+                        row["conversion_factor"] = 1.0
+
+    if dt_clean == "bom" and not data.get("quantity"):
         data["quantity"] = 1.0
 
     return data
