@@ -487,6 +487,8 @@ export default function AssistantPortal({ isOpen, onClose }) {
     const ttsQueueRef = useRef([]);
     const ttsSpeakingRef = useRef(false);
     const ttsInterruptedRef = useRef(false);
+    const recentBotPhrasesRef = useRef([]);
+    const lastTtsEndTimeRef = useRef(0);
 
     const activeChat = chatHistory.find(c => c.id === currentChatId);
     const activeMessages = activeChat ? activeChat.messages : messages;
@@ -797,9 +799,15 @@ export default function AssistantPortal({ isOpen, onClose }) {
 
     // Drain the TTS sentence queue — called after each utterance ends.
     const drainTtsQueue = () => {
-        if (ttsInterruptedRef.current) { ttsQueueRef.current = []; ttsSpeakingRef.current = false; return; }
+        if (ttsInterruptedRef.current) {
+            ttsQueueRef.current = [];
+            ttsSpeakingRef.current = false;
+            lastTtsEndTimeRef.current = Date.now();
+            return;
+        }
         if (ttsQueueRef.current.length === 0) {
             ttsSpeakingRef.current = false;
+            lastTtsEndTimeRef.current = Date.now();
             // All speech done — return orb to listening state
             if (voiceModeOpenRef.current) setVoiceStatus('listening');
             return;
@@ -821,10 +829,12 @@ export default function AssistantPortal({ isOpen, onClose }) {
         };
         utterance.onend = () => { 
             window._activeUtterances = window._activeUtterances.filter(u => u !== utterance);
+            lastTtsEndTimeRef.current = Date.now();
             drainTtsQueue(); 
         };
         utterance.onerror = (e) => {
             window._activeUtterances = window._activeUtterances.filter(u => u !== utterance);
+            lastTtsEndTimeRef.current = Date.now();
             console.error('[MAGMA VOICE] TTS error:', e.error);
             drainTtsQueue();
         };
@@ -832,10 +842,53 @@ export default function AssistantPortal({ isOpen, onClose }) {
         window.speechSynthesis.speak(utterance);
     };
 
+    // Helper to detect if a transcript matches recent assistant speech or fillers
+    const isAssistantEcho = (transcript) => {
+        if (!transcript) return true;
+        const norm = transcript.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+        if (!norm) return true;
+
+        const fillers = [
+            'let me search for that', 'looking that up online', 'extracting their details now',
+            'pulling up their contact info', 'looking into their website', 'searching for that',
+            'pulling that page up', 'one moment', 'sending that now', 'converting that record now',
+            'setting that up', 'setting up those tasks', 'reassigning that now',
+            'checking your records', 'looking that up in magmaerp', 'pulling that record up',
+            'setting that up in magmaerp', 'updating that now', 'submitting that now', 'working on it'
+        ];
+        for (const f of fillers) {
+            if (norm === f || (norm.length > 4 && f.includes(norm)) || (f.length > 4 && norm.includes(f))) {
+                return true;
+            }
+        }
+
+        const now = Date.now();
+        for (let i = recentBotPhrasesRef.current.length - 1; i >= 0; i--) {
+            const item = recentBotPhrasesRef.current[i];
+            if (now - item.time > 12000) continue;
+            const botNorm = item.text.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+            if (!botNorm) continue;
+            if (norm === botNorm || botNorm.includes(norm) || norm.includes(botNorm)) {
+                return true;
+            }
+            const tWords = norm.split(' ');
+            const bWords = new Set(botNorm.split(' '));
+            const matches = tWords.filter(w => bWords.has(w)).length;
+            if (tWords.length > 0 && matches / tWords.length >= 0.7) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     // Queue a sentence for low-latency streaming speech.
     const speakSentence = (text) => {
         const clean = (text || '').trim();
         if (!clean) return;
+        recentBotPhrasesRef.current.push({ text: clean, time: Date.now() });
+        if (recentBotPhrasesRef.current.length > 20) {
+            recentBotPhrasesRef.current.shift();
+        }
         ttsInterruptedRef.current = false;
         ttsQueueRef.current.push(clean);
         if (!ttsSpeakingRef.current) drainTtsQueue();
@@ -896,15 +949,12 @@ export default function AssistantPortal({ isOpen, onClose }) {
         addVoiceEvent(type, text || event.name || event.tool_name || '');
 
         if (type === 'partial_transcript') {
+            const isSpeakingOrCooling = ttsSpeakingRef.current || (Date.now() - lastTtsEndTimeRef.current < 650);
+            if (isSpeakingOrCooling || isAssistantEcho(text)) {
+                return;
+            }
             setLiveTranscript(text);
             setVoiceStatus('listening');
-            
-            // Barge-in: STT heard you speak while TTS is playing!
-            if (ttsSpeakingRef.current) {
-                console.log('[MAGMA VOICE] Barge-in via STT interim!');
-                interruptSpeech();
-                voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
-            }
 
         } else if (type === 'final_transcript') {
             setLiveTranscript(text);
@@ -1028,12 +1078,9 @@ export default function AssistantPortal({ isOpen, onClose }) {
                 if (interim) {
                     const cleanInterim = interim.trim();
                     if (cleanInterim) {
-                        handleVoiceEvent({ type: 'partial_transcript', text: interim });
-                        // Barge-in Heuristic: Ignore tiny breathing artifacts < 3 characters
-                        if (ttsSpeakingRef.current && cleanInterim.length > 2) {
-                            console.log('[MAGMA VOICE] Barge-in via STT interim!', cleanInterim);
-                            interruptSpeech();
-                            voiceSocketRef.current?.send(JSON.stringify({ type: 'interrupt' }));
+                        const isSpeakingOrCooling = ttsSpeakingRef.current || (Date.now() - lastTtsEndTimeRef.current < 650);
+                        if (!isSpeakingOrCooling && !isAssistantEcho(cleanInterim)) {
+                            handleVoiceEvent({ type: 'partial_transcript', text: interim });
                         }
                     }
                 }
@@ -1046,6 +1093,13 @@ export default function AssistantPortal({ isOpen, onClose }) {
                         console.log('[MAGMA VOICE] Ignored noise/breathing artifact:', final);
                         return;
                     }
+
+                    // Echo suppression: Ignore any transcript matching assistant's recent speech or tool fillers
+                    const isSpeakingOrCooling = ttsSpeakingRef.current || (Date.now() - lastTtsEndTimeRef.current < 650);
+                    if (isSpeakingOrCooling || isAssistantEcho(cleanText)) {
+                        console.log('[MAGMA VOICE] Filtered assistant echo final transcript:', cleanText);
+                        return;
+                    }
                     
                     if (!voiceSocketRef.current || voiceSocketRef.current.readyState !== WebSocket.OPEN) {
                         console.warn('[MAGMA VOICE] Dropping transcript because WebSocket is not open yet.');
@@ -1053,8 +1107,8 @@ export default function AssistantPortal({ isOpen, onClose }) {
                     }
                     console.log('[MAGMA VOICE] STT final transcript:', cleanText);
 
-                    // 1. Cancel the OLD bot message locally if we are barging in
-                    if (voiceStatusRef.current === 'speaking' || voiceStatusRef.current === 'thinking') {
+                    // 1. Cancel the OLD bot message locally if we were still thinking
+                    if (voiceStatusRef.current === 'thinking') {
                         interruptSpeech();
                         if (voiceChatIdRef.current) {
                             updateLastBotMessage(voiceChatIdRef.current, (msg) => ({
@@ -1068,7 +1122,7 @@ export default function AssistantPortal({ isOpen, onClose }) {
                     // 2. handleVoiceEvent adds the NEW user text + NEW bot placeholder to the UI
                     handleVoiceEvent({ type: 'final_transcript', text: cleanText });
                     
-                    // 3. Send the transcript to the server (which cleanly cancels the server's old task automatically)
+                    // 3. Send the transcript to the server
                     voiceSocketRef.current.send(JSON.stringify({ type: 'user_speech', text: cleanText }));
                 }
             };

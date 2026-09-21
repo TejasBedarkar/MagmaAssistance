@@ -119,9 +119,18 @@ def _describe_pending_action(tool_name: str, args: dict) -> str:
 
 
 _YES_RE = re.compile(
-    r"^\s*(y|yes|yep|yeah|yup|ya|sure|ok|okay|confirm(?:ed)?|approved?|"
-    r"go ahead|do it|go for it|proceed|send it|create it|submit it|"
-    r"please do|sounds good|looks good|correct|affirmative)\b",
+    r"^\s*(?:(?:please|kindly|can\s+you|could\s+you|you\s+can|you\s+may|i)\s+)?"
+    r"(y|yes|yep|yeah|yup|ya|sure|ok|okay|confirm(?:ed)?|approv(?:e|ed|al)?|"
+    r"go\s+ahead|do\s+it|go\s+for\s+it|proceed|send\s+it|create\s+it|submit\s+it|"
+    r"please\s+do|sounds\s+good|looks\s+good|correct|affirmative)\b",
+    re.IGNORECASE,
+)
+_PROCEED_ANYWHERE_RE = re.compile(
+    r"\b(proceed|go\s+ahead|confirm(?:ed)?|approv(?:e|ed))\b",
+    re.IGNORECASE,
+)
+_NEGATION_RE = re.compile(
+    r"\b(no|nope|nah|not|don'?t|do\s+not|never|stop|cancel|abort|reject)\b",
     re.IGNORECASE,
 )
 _NO_RE = re.compile(
@@ -131,13 +140,20 @@ _NO_RE = re.compile(
 _CORRECTION_RE = re.compile(
     r"\b(but|however|wait|hold on|actually|instead|except|change|"
     r"different|rather|update|remove|use|make it|first|before|"
-    r"only if|unless|not )\b|\?",
+    r"only if|unless)\b|\?",
     re.IGNORECASE,
 )
 _PROSE_PROPOSAL_RE = re.compile(
-    r"\b(shall i (proceed|go ahead)|would you like me to (proceed|create|go ahead)|"
-    r"confirm (this|with a plain)|ready to (create|proceed)|"
-    r"want me to proceed)\b",
+    r"\b(shall\s+i\s+(?:proceed|go\s+ahead|create|submit)|"
+    r"should\s+i\s+(?:proceed|go\s+ahead|create|submit)|"
+    r"would\s+you\s+like\s+me\s+to\s+(?:proceed|create|go\s+ahead|submit)|"
+    r"do\s+you\s+want\s+me\s+to\s+(?:proceed|create|go\s+ahead|submit)|"
+    r"want\s+me\s+to\s+proceed|"
+    r"ready\s+to\s+(?:create|proceed|submit)|"
+    r"confirm\s+(?:this|with\s+a\s+plain|the|to\s+proceed)|"
+    r"please\s+confirm|"
+    r"reply\s+yes\s+to\s+approve|"
+    r"let\s+me\s+know\s+(?:if\s+you\s+would\s+like\s+me\s+to\s+proceed|to\s+proceed))\b",
     re.IGNORECASE,
 )
 
@@ -145,11 +161,15 @@ _PROSE_PROPOSAL_RE = re.compile(
 def _is_write_approval(message: str) -> bool:
     """True only for an unambiguous go-ahead."""
     text = (message or "").strip()
-    if not text or len(text.split()) > 10:
+    if not text or len(text.split()) > 12:
         return False
-    if _CORRECTION_RE.search(text):
+    if _NEGATION_RE.search(text) or _CORRECTION_RE.search(text):
         return False
-    return bool(_YES_RE.match(text))
+    if _YES_RE.match(text):
+        return True
+    if _PROCEED_ANYWHERE_RE.search(text):
+        return True
+    return False
 
 
 def _is_write_rejection(message: str) -> bool:
@@ -540,11 +560,13 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             HumanMessage(
                 content=(
                     f"The user approved the pending action(s), and the system just attempted them. "
-                    f"{results_text}\nLook at each result: if it succeeded, confirm what "
-                    f"was done; if it failed or is asking for more information (e.g. a missing "
+                    f"{results_text}\nLook at each result: if it succeeded, state clearly that "
+                    f"it succeeded and what was done (including record ID/name if available); "
+                    f"if it failed or is asking for more information (e.g. a missing "
                     f"required field), say so plainly -- do NOT say it 'has been executed' or "
                     f"'succeeded' unless the result actually shows a created/updated record. "
                     f"Say 'created' only for a create and 'updated' for an update. "
+                    f"The user has ALREADY approved this action -- do NOT ask for confirmation again. "
                     f"Do not call any tools."
                 )
             ),
@@ -555,6 +577,8 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                 yield {"type": "token", "text": event["text"]}
             else:
                 content = event["content"]
+        if session_id:
+            audit_log.clear_pending_approval(session_id)
         history.append(AIMessage(content=content))
         yield {"type": "done", "text": content, "_delta": history[start_len:]}
         return
@@ -575,9 +599,11 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
         audit_log.clear_pending_approval(session_id)
 
     # nudge: "yes" with no pending approval usually means the prior proposal was prose-only
+    approving_proposal_turn = False
     if not pending and _is_write_approval(text):
         last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
         if last_ai and isinstance(last_ai.content, str) and _PROSE_PROPOSAL_RE.search(last_ai.content):
+            approving_proposal_turn = True
             history.append(SystemMessage(content=(
                 "The user just approved the proposal below -- the EXACT text of your "
                 "own previous message -- with a plain \"yes\". Call whichever tool "
@@ -588,7 +614,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                 "conversation, even one that looks similar -- only this one. If your "
                 "own proposal below was actually missing information needed to call "
                 "the tool (e.g. no assignee given for a task), do not guess or invent "
-                "a value -- ask the user for it instead of calling the tool.\n\n"
+                "a value -- ask the user for it instead of calling the tool. Do NOT ask for confirmation again.\n\n"
                 f"YOUR PREVIOUS MESSAGE (the one just approved):\n\"\"\"\n{last_ai.content}\n\"\"\""
             )))
 
@@ -720,14 +746,31 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             gate_intercepted = False
             for tc in tool_calls:
                 yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
+                bypass = approving_proposal_turn and _is_write_call(tc["name"], tc.get("args") or {})
                 tool_task = asyncio.create_task(
-                    _execute_tool(tc["name"], tc.get("args") or {}, session_id=session_id, user_id=user_id, prompt_text=text)
+                    _execute_tool(
+                        tc["name"], tc.get("args") or {},
+                        session_id=session_id, user_id=user_id, prompt_text=text,
+                        bypass_gate=bypass,
+                    )
                 )
                 while not tool_task.done():
                     done, _ = await asyncio.wait([tool_task], timeout=1.5)
                     if not done:
                         yield {"type": "ping"}
                 result = await tool_task
+
+                if bypass and isinstance(result, str) and result.startswith("REVIEW_REQUIRED:") and tc["name"] == "erp_data_tool":
+                    retry_args = {**(tc.get("args") or {}), "approved": True}
+                    result = await _execute_tool(
+                        tc["name"], retry_args,
+                        session_id=session_id, user_id=user_id, prompt_text=text,
+                        bypass_gate=True,
+                    )
+
+                if bypass:
+                    approving_proposal_turn = False
+
                 yield {"type": "tool_result", "name": tc["name"], "result": result}
                 t_msg = ToolMessage(content=str(result), tool_call_id=tc["id"])
                 call_messages.append(t_msg)
