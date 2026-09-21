@@ -51,6 +51,13 @@ _ERP_OP_FILLERS = {
 }
 _DEFAULT_FILLER = ["Working on it.", "One moment."]
 
+ALL_FILLER_PHRASES: set[str] = set()
+for _phrases in _TOOL_FILLER_PHRASES.values():
+    ALL_FILLER_PHRASES.update(p.strip().lower() for p in _phrases)
+for _phrases in _ERP_OP_FILLERS.values():
+    ALL_FILLER_PHRASES.update(p.strip().lower() for p in _phrases)
+ALL_FILLER_PHRASES.update(p.strip().lower() for p in _DEFAULT_FILLER)
+
 
 def _tool_filler_phrase(tool_name: str, args: dict) -> str:
     if tool_name == "erp_data_tool":
@@ -85,6 +92,54 @@ def clean_for_speech(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
+def _normalize_speech_text(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^\w\s]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def is_voice_echo(
+    text: str,
+    recent_spoken: list[tuple[float, str]],
+    now: float,
+    max_age: float = 10.0,
+) -> bool:
+    """Returns True if text appears to be an echo of assistant filler or speech."""
+    norm_text = _normalize_speech_text(text)
+    if not norm_text:
+        return True
+
+    # 1. Direct match against standard filler phrases
+    for filler in ALL_FILLER_PHRASES:
+        norm_filler = _normalize_speech_text(filler)
+        if norm_text == norm_filler:
+            return True
+        if len(norm_text) > 4 and norm_text in norm_filler:
+            return True
+        if len(norm_filler) > 4 and norm_filler in norm_text:
+            return True
+
+    # 2. Check against recent spoken phrases within max_age seconds
+    for timestamp, phrase in reversed(recent_spoken):
+        if now - timestamp > max_age:
+            continue
+        norm_phrase = _normalize_speech_text(phrase)
+        if not norm_phrase:
+            continue
+        if norm_text == norm_phrase or norm_text in norm_phrase or norm_phrase in norm_text:
+            return True
+
+        # High word-overlap similarity (> 75%)
+        words_text = set(norm_text.split())
+        words_phrase = set(norm_phrase.split())
+        if words_text and words_phrase:
+            overlap = len(words_text & words_phrase) / len(words_text)
+            if overlap >= 0.75:
+                return True
+
+    return False
+
+
 def register_voice_ws(app, stream_agent_turn, logger, load_stream_history, save_stream_history):
 
     @app.websocket("/ws/voice")
@@ -106,7 +161,14 @@ def register_voice_ws(app, stream_agent_turn, logger, load_stream_history, save_
 
         connected = True
         state: dict = {"turn_task": None}
+        recent_spoken: list[tuple[float, str]] = []
         send_lock = asyncio.Lock()
+
+        def remember_phrase(phrase: str):
+            if phrase:
+                recent_spoken.append((time.monotonic(), phrase))
+                if len(recent_spoken) > 30:
+                    del recent_spoken[:-30]
 
         async def send_json(payload: dict):
             nonlocal connected
@@ -171,6 +233,7 @@ def register_voice_ws(app, stream_agent_turn, logger, load_stream_history, save_
                                 for sentence in parts[:-1]:
                                     cleaned = clean_for_speech(sentence)
                                     if cleaned:
+                                        remember_phrase(cleaned)
                                         await send_json({"type": "voice_sentence", "text": cleaned})
                                 token_buf = parts[-1]
 
@@ -186,10 +249,9 @@ def register_voice_ws(app, stream_agent_turn, logger, load_stream_history, save_
                             })
                             if not filler_spoken:
                                 filler_spoken = True  # one filler per reply, however many tools it calls
-                                await send_json({
-                                    "type": "voice_sentence",
-                                    "text": _tool_filler_phrase(event["name"], event.get("args", {})),
-                                })
+                                filler = _tool_filler_phrase(event["name"], event.get("args", {}))
+                                remember_phrase(filler)
+                                await send_json({"type": "voice_sentence", "text": filler})
 
                         elif etype == "tool_result":
                             logger.info(
@@ -205,6 +267,7 @@ def register_voice_ws(app, stream_agent_turn, logger, load_stream_history, save_
                         elif etype == "done":
                             final = clean_for_speech(token_buf)
                             if final:
+                                remember_phrase(final)
                                 await send_json({"type": "voice_sentence", "text": final})
                             token_buf = ""
                             elapsed = (time.monotonic() - t0) * 1000
@@ -258,6 +321,12 @@ def register_voice_ws(app, stream_agent_turn, logger, load_stream_history, save_
                 if msg_type == "user_speech":
                     text = (control.get("text") or "").strip()
                     if not text:
+                        continue
+                    if is_voice_echo(text, recent_spoken, time.monotonic()):
+                        logger.info(
+                            "[WS/voice] Discarded echo of assistant speech: %r  session=%s",
+                            text, session_id,
+                        )
                         continue
                     await cancel_turn()
                     state["turn_task"] = asyncio.create_task(run_turn(text))
