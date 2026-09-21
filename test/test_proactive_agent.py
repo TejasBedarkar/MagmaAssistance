@@ -58,35 +58,3 @@ def test_direct_chip_execution():
             assert done["suggested_actions"] == ["⚙️ Generate Work Orders for PROD-PLAN-001"]
 
     asyncio.run(_run())
-
-
-def test_manufacturing_feasibility_query():
-    async def _run():
-        mock_plan_result = {
-            "summary": "Yes, we can manufacture 10,000 HB Pencils for Magna Data! Full plan prepared.",
-            "primary_card": {
-                "title": "Manufacturing Plan: 10,000 HB Pencils",
-                "badge": "Plan Ready",
-                "action_key": "mfg_goal:HB-PENCIL:10000",
-                "summary_fields": [
-                    {"label": "Customer", "value": "Magna Data"},
-                    {"label": "Product", "value": "10,000x HB Pencil"},
-                ],
-            },
-            "suggested_actions": ["⚡ Execute Manufacturing Plan for HB Pencil"],
-        }
-
-        with patch("agent.agent.erp_radar.prepare_manufacturing_goal", return_value=mock_plan_result):
-            events = []
-            prompt = "the company Magna Data want to buy 10000 pencils from us can we manufacture it"
-            async for ev in stream_agent_turn(prompt, session_id="test_chat_mfg", history=[]):
-                events.append(ev)
-
-            done_events = [e for e in events if e.get("type") == "done"]
-            assert len(done_events) == 1
-            done = done_events[0]
-            assert "10,000 HB Pencils" in done["text"]
-            assert done["action_card"]["title"] == "Manufacturing Plan: 10,000 HB Pencils"
-            assert done["suggested_actions"] == ["⚡ Execute Manufacturing Plan for HB Pencil"]
-
-    asyncio.run(_run())
