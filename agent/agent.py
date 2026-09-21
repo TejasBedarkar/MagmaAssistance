@@ -355,7 +355,7 @@ async def _stream_chat_completion(messages, tools=None):
     tool_acc = {}
     content = ""
     finish_reason = None
-    max_retries = 3
+    max_retries = 4
 
     for attempt in range(max_retries):
         try:
@@ -393,15 +393,21 @@ async def _stream_chat_completion(messages, tools=None):
                                 entry["arguments"] += fn["arguments"]
             # Successfully finished stream
             break
-        except (httpx.ConnectError, httpx.ConnectTimeout) as net_err:
-            if not content and not tool_acc and attempt < max_retries - 1:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.HTTPStatusError) as net_err:
+            # Only network drops and OpenAI overload (429/5xx) are worth retrying; a 4xx is our bug.
+            status = net_err.response.status_code if isinstance(net_err, httpx.HTTPStatusError) else None
+            transient = status is None or status == 429 or status >= 500
+            if transient and not content and not tool_acc and attempt < max_retries - 1:
+                delay = 1.5 * (attempt + 1)
                 logger.warning(
-                    "LLM connection attempt %d/%d failed (%s) — retrying in 1.5s...",
-                    attempt + 1, max_retries, net_err,
+                    "LLM call attempt %d/%d failed (%s) — retrying in %.1fs...",
+                    attempt + 1, max_retries, net_err, delay,
                 )
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(delay)
                 continue
-            logger.error("LLM connection failed after %d attempt(s): %s", attempt + 1, net_err)
+            logger.error("LLM call failed after %d attempt(s): %s", attempt + 1, net_err)
+            if transient:
+                raise RuntimeError("The AI service is busy right now. Please try again in a moment.") from net_err
             raise
 
     tool_calls = []
