@@ -275,24 +275,40 @@ class VisionMixin:
     # GENERAL-PURPOSE DOCUMENT READER (ANY PDF / IMAGE, NOT JUST POs)
     # =====================================================================
     @traceable(name="LLM._vision_transcribe_image", run_type="llm")
-    def _vision_transcribe_image(self, data_url: str) -> str:
+    def _vision_transcribe_image(self, data_url: str, describe: bool = False) -> str:
         """Helper: sends one image to GPT-4o Vision and returns a plain
         transcription of everything visible on it (tables rendered as
         markdown tables). Used by extract_document_text() for scanned
         pages / plain images -- separate from the strict PO JSON prompt
-        used in extract_po_data_from_document()."""
+        used in extract_po_data_from_document().
+
+        describe=True is used for standalone uploaded images (business
+        cards, screenshots, photos, charts): after the transcription the
+        model adds a short factual description, so an image with little or
+        no text (a product photo, a chart) still yields usable context."""
+        system_prompt = (
+            "Transcribe ALL text visible in this document image "
+            "exactly as it appears, preserving reading order. "
+            "Render any tables as markdown tables. Do not "
+            "summarize, comment, or add anything not present in "
+            "the image."
+        )
+        if describe:
+            system_prompt = (
+                "You are reading an image a user uploaded to a business ERP assistant.\n"
+                "1. Under the heading 'Text in image:' transcribe ALL visible text exactly as it "
+                "appears, in reading order, with tables as markdown tables. Write 'none' if there is no text.\n"
+                "2. Under the heading 'What the image shows:' write 1-3 factual sentences describing "
+                "what it is (e.g. business card, invoice, screenshot, product photo, chart, handwritten note) "
+                "and any details that matter (logos, company names, people, quantities, colours, damage).\n"
+                "Never guess or add information that is not visible."
+            )
         payload = {
             "model": "gpt-4o",
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "Transcribe ALL text visible in this document image "
-                        "exactly as it appears, preserving reading order. "
-                        "Render any tables as markdown tables. Do not "
-                        "summarize, comment, or add anything not present in "
-                        "the image."
-                    ),
+                    "content": system_prompt,
                 },
                 {
                     "role": "user",
@@ -304,7 +320,7 @@ class VisionMixin:
             ],
             "temperature": 0.0,
         }
-        response = requests.post(self.base_url, json=payload, headers=self.headers)
+        response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=120)
         response.raise_for_status()
         res_json = response.json()
         message = res_json["choices"][0]["message"]
@@ -398,7 +414,7 @@ class VisionMixin:
                 # Plain image -- Vision OCR is the only option.
                 b64_file = base64.b64encode(file_bytes).decode("utf-8")
                 data_url = f"data:{mime_type};base64,{b64_file}"
-                text = self._vision_transcribe_image(data_url)
+                text = self._vision_transcribe_image(data_url, describe=True)
                 return {"text": text, "page_count": 1, "pages_read": 1, "method": "vision"}
 
         except Exception as e:
