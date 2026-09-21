@@ -60,6 +60,21 @@ ADDRESS_KEYWORDS = [
 ]
 
 POSTAL_CODE_RE = re.compile(r"\b\d{5,6}(-\d{4})?\b|\b\d{3}\s\d{3}\b|[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}")
+US_STATE_ZIP_RE = re.compile(r"\b[A-Z]{2}\s+(\d{5}(?:-\d{4})?)\b")
+
+_PHONE_PREFIX_COUNTRY = {
+    "+1": "United States", "+44": "United Kingdom", "+61": "Australia", "+65": "Singapore",
+    "+971": "United Arab Emirates", "+49": "Germany", "+33": "France", "+91": "India",
+}
+
+
+def country_from_phone(phone: str) -> str:
+    """Best-effort country from an international phone prefix; '' when unknown."""
+    digits = re.sub(r"[^\d+]", "", phone or "")
+    for prefix in sorted(_PHONE_PREFIX_COUNTRY, key=len, reverse=True):
+        if digits.startswith(prefix):
+            return _PHONE_PREFIX_COUNTRY[prefix]
+    return ""
 
 GENERIC_EMAIL_PREFIXES = [
     "info", "contact", "enquiry", "enquiries", "inquiry", "inquiries",
@@ -188,9 +203,16 @@ def parse_address_fields(raw_address: str) -> ParsedAddress:
     state = ""
 
     # 1. Extract pincode
-    pin_match = POSTAL_CODE_RE.search(clean_addr)
-    if pin_match:
-        pincode = pin_match.group(0).strip()
+    us_zip = US_STATE_ZIP_RE.search(clean_addr)
+    if us_zip:
+        pincode = us_zip.group(1)
+    else:
+        for pin_match in POSTAL_CODE_RE.finditer(clean_addr):
+            # a number at the very start followed by more text is a street number ("10900 NE 8th St"), not a postcode
+            if pin_match.start() == 0 and len(clean_addr) > pin_match.end() + 1:
+                continue
+            pincode = pin_match.group(0).strip()
+            break
 
     # 2. Extract country
     for c in COMMON_COUNTRIES:
@@ -205,7 +227,10 @@ def parse_address_fields(raw_address: str) -> ParsedAddress:
             if candidate in _ISO_COUNTRY_MAP:
                 country = _ISO_COUNTRY_MAP[candidate]
     if not country:
-        country = "India" if re.search(r"\b\d{6}\b", clean_addr) else ""
+        if us_zip:
+            country = "United States"
+        elif re.search(r"\b\d{6}\b", clean_addr):
+            country = "India"
     country = normalize_country_name(country)
 
     # 3. Extract state
@@ -246,13 +271,15 @@ def parse_address_fields(raw_address: str) -> ParsedAddress:
         candidate = parts[-2].strip()
         if not POSTAL_CODE_RE.search(candidate) and len(candidate) < 30 and not any(st.lower() in candidate.lower() for st in COMMON_INDIAN_STATES):
             city = candidate
+            if address_line1.endswith(city):
+                address_line1 = address_line1[: -len(city)].rstrip(", ") or address_line1
 
     return ParsedAddress(
         address_line1=address_line1 or clean_addr,
         city=city,
         state=state,
         pincode=pincode,
-        country=country or "India",
+        country=country,
         full_address=clean_addr,
     )
 
@@ -533,7 +560,7 @@ def _extract_from_schema_org(soup: BeautifulSoup, target_person: Optional[str] =
                             address_line1=street or joined,
                             city=locality or region,
                             pincode=postal,
-                            country=country or "India",
+                            country=country or ("India" if re.fullmatch(r"\d{6}", postal or "") else ""),
                             full_address=joined,
                         ))
                 elif isinstance(addr, str) and addr.strip():
@@ -603,7 +630,7 @@ def _extract_from_microdata(soup: BeautifulSoup, target_person: Optional[str] = 
                 address_line1=street or full,
                 city=city,
                 pincode=pincode,
-                country=country or "India",
+                country=country or ("India" if re.fullmatch(r"\d{6}", pincode or "") else ""),
                 full_address=full,
             ))
 

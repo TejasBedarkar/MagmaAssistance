@@ -97,6 +97,21 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS pending_approval_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                args TEXT NOT NULL,          -- JSON
+                created_at TEXT NOT NULL     -- ISO 8601 UTC
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_items_session ON pending_approval_items(session_id)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS pending_approvals (
                 session_id TEXT PRIMARY KEY,
                 tool_name TEXT NOT NULL,
@@ -107,36 +122,60 @@ def init_db() -> None:
         )
 
 
+# Doctypes where several creates in one turn are separate records (e.g. five tasks), not revisions.
+_MULTI_CREATE_DOCTYPES = {"task"}
+
+
+def _pending_key(tool_name: str, args: dict) -> str:
+    """Two proposals with the same key are revisions of one action; different keys are separate actions."""
+    args = args or {}
+    if tool_name != "erp_data_tool":
+        return tool_name
+    op = str(args.get("operation") or "").strip().lower()
+    doctype = str(args.get("doctype") or "").strip().lower()
+    if op in ("create", "insert", "add", "new"):
+        if doctype in _MULTI_CREATE_DOCTYPES:
+            return f"create:{doctype}:{json.dumps(args.get('data') or {}, sort_keys=True)}"
+        return f"create:{doctype}"
+    return f"{op}:{doctype}:{args.get('name') or ''}"
+
+
 def save_pending_approval(session_id: str, tool_name: str, args: dict) -> None:
-    """Stash a proposed write so it survives a backend restart -- without
-    this, a restart between "shall I proceed?" and the user's "yes" drops
-    the pending action silently, and the agent has nothing left to confirm
-    against."""
+    """Stash a proposed write so it survives a backend restart. A turn can propose several
+    actions (five tasks, say); a same-key proposal replaces the earlier one as a revision."""
+    key = _pending_key(tool_name, args)
     with _lock, _connect() as conn:
         conn.execute(
-            "INSERT INTO pending_approvals (session_id, tool_name, args, created_at) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(session_id) DO UPDATE SET tool_name=excluded.tool_name, "
-            "args=excluded.args, created_at=excluded.created_at",
-            (session_id, tool_name, json.dumps(args), datetime.now(timezone.utc).isoformat()),
+            "DELETE FROM pending_approval_items WHERE session_id = ? AND dedupe_key = ?",
+            (session_id, key),
+        )
+        conn.execute(
+            "INSERT INTO pending_approval_items (session_id, dedupe_key, tool_name, args, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, key, tool_name, json.dumps(args), datetime.now(timezone.utc).isoformat()),
         )
 
 
-def get_pending_approval(session_id: str) -> Optional[dict]:
+def get_pending_approvals(session_id: str) -> list:
+    """All stashed actions for the session, oldest first."""
     with _lock, _connect() as conn:
-        row = conn.execute(
-            "SELECT tool_name, args FROM pending_approvals WHERE session_id = ?", (session_id,)
-        ).fetchone()
-    if not row:
-        return None
-    return {"tool_name": row["tool_name"], "args": json.loads(row["args"])}
+        rows = conn.execute(
+            "SELECT tool_name, args FROM pending_approval_items WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    return [{"tool_name": r["tool_name"], "args": json.loads(r["args"])} for r in rows]
+
+
+def get_pending_approval(session_id: str) -> Optional[dict]:
+    items = get_pending_approvals(session_id)
+    return items[0] if items else None
 
 
 def clear_pending_approval(session_id: Optional[str]) -> None:
     if not session_id:
         return
     with _lock, _connect() as conn:
-        conn.execute("DELETE FROM pending_approvals WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM pending_approval_items WHERE session_id = ?", (session_id,))
 
 
 def log_turn(

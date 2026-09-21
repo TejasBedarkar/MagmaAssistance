@@ -41,9 +41,11 @@ from ERP.dynamic_fields import (
     safe_call as _safe_call,
 )
 from ERP.tools.project_onboarding_tools import PROJECT_ONBOARDING_TOOLS
+from ERP.tools.project_onboarding_helpers import _default_company, _resolve_assignee
 from ERP.tools.task_assignment_tools import TASK_ASSIGNMENT_TOOLS
 from ERP.tools.crm_conversion_tools import CRM_CONVERSION_TOOLS
 from ERP_Unified.validation import (
+    find_blocking_link_problem,
     _is_valid_email,
     _normalize_filters,
     _prepare_write_data,
@@ -430,6 +432,27 @@ def _guess_missing_field(doctype: str, error_text: str) -> Optional[dict]:
     return None
 
 
+# What the user already told us this conversation, so we don't ask for it again.
+_SESSION_COMPANY: dict[str, str] = {}
+_LAST_PROJECT: dict[str, str] = {}
+
+
+def apply_session_defaults(session_id: str, doctype: str, data: Optional[dict]) -> dict:
+    """Fill Company (asked once) and a Task's Project (the one just created) from this conversation."""
+    filled = dict(data or {})
+    dt = doctype.strip().lower()
+    if dt in ("project", "task") and not filled.get("company"):
+        try:
+            company = _SESSION_COMPANY.get(session_id) or _default_company()
+        except Exception:  # noqa: BLE001
+            company = _SESSION_COMPANY.get(session_id)
+        if company:
+            filled["company"] = company
+    if dt == "task" and not filled.get("project") and _LAST_PROJECT.get(session_id):
+        filled["project"] = _LAST_PROJECT[session_id]
+    return filled
+
+
 def _run_create(
     doctype: str,
     data: Optional[dict],
@@ -445,7 +468,8 @@ def _run_create(
     create) and its own control flow for the missing-fields case."""
     key = (session_id, doctype)
     pending = _PENDING_CREATES.get(key, {})
-    merged = {**pending, **(data or {})}
+    merged = apply_session_defaults(session_id, doctype, {**pending, **(data or {})})
+    assignee_raw = merged.pop("assigned_to", None) if doctype.strip().lower() == "task" else None
     warnings: list[str] = []
     if web_enriched:
         # Mark this specific doctype+session as web-enriched for the review gate
@@ -491,7 +515,12 @@ def _run_create(
         # (e.g. a raw "Today" token) slips past _prepare_write_data's
         # validation and reaches ERPNext as a literal, invalid value
         merged = apply_default_values(doctype, merged)
+        blocker = find_blocking_link_problem(doctype, merged)
+        if blocker:
+            return blocker
         merged, warnings = _prepare_write_data(doctype, merged)
+        if merged.get("company") and doctype.strip().lower() in ("project", "task"):
+            _SESSION_COMPANY[session_id] = merged["company"]
         if doctype.strip().lower() == "lead":
             if (
                 merged.get("first_name")
@@ -558,6 +587,22 @@ def _run_create(
                 raise
 
         created_lead_id = result.get("name") if isinstance(result, dict) else str(result)
+
+        if doctype.strip().lower() == "project" and created_lead_id:
+            _LAST_PROJECT[session_id] = created_lead_id
+        if doctype.strip().lower() == "task" and assignee_raw and created_lead_id:
+            assignee = _resolve_assignee(str(assignee_raw))
+            if "user" in assignee:
+                try:
+                    erp_client.call_method_post("frappe.desk.form.assign_to.add", {
+                        "assign_to": [assignee["user"]], "doctype": "Task",
+                        "name": created_lead_id, "notify": 1,
+                    })
+                    warnings.append(f"Assigned {created_lead_id} to {assignee['user']}.")
+                except Exception as assign_exc:  # noqa: BLE001
+                    warnings.append(f"Created {created_lead_id} but could not assign it to {assignee['user']}: {assign_exc}")
+            else:
+                warnings.append(f"Created {created_lead_id} but did not assign it: {assignee['error']}")
 
         # If Lead has address information, create and link an associated Address record
         if doctype.strip().lower() == "lead" and (address_info.get("address_line1") or address_info.get("address") or address_info.get("city")):

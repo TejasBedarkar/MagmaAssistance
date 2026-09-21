@@ -187,6 +187,14 @@ If P4 mixes these, the multi-site migration is painful; if clean, it's a small c
   pastes a URL, or says yes to the assistant's own "search online?" offer. Writes still go
   through the normal approval gate. Needs `openpyxl`, `python-docx`, `Pillow` (`xlrd` for .xls) —
   all in `requirements.txt`. `/api/upload-po` (OCR-PO) is a separate, still-unwired path.
+- **Write gate — several actions per "yes"** — a turn can propose many writes (e.g. five tasks);
+  `pending_approval_items` (audit DB) keeps them all, a re-proposal of the same action replaces
+  the earlier one, and one "yes" runs them in order (`stream_agent_turn` resume path). Per
+  conversation the create flow also remembers the Company the user gave and the last Project
+  created (`apply_session_defaults`), so tasks land on that project without asking again. A Lead/
+  Opportunity/Quotation ID used as a Customer is blocked at proposal time
+  (`find_blocking_link_problem`) instead of creating the record without it. Task `assigned_to`
+  is applied after creation via `assign_to.add`; `due_date` maps to `exp_end_date`.
 - **Multi-agent workflow** — settled: single streaming agent + code-enforced write gate
   (both shipped in P1). Manufacturing multi-step planner = backlog.
 

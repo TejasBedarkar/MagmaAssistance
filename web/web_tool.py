@@ -42,6 +42,7 @@ from .company_crawler.crawler import find_contact_pages, get_page_html
 from .company_crawler.extractor import (
     extract_contact_info, filter_emails_to_domain,
     pick_primary_email, pick_primary_phone, pick_primary_address,
+    country_from_phone,
 )
 from .company_crawler.zaubacorp import lookup_zaubacorp_fallback
 
@@ -863,6 +864,8 @@ def web_company_extract(url: str, person_name: Optional[str] = None, company_nam
             state_val = parsed_addr.get("state", "") if parsed_addr else ""
             pincode_val = parsed_addr.get("pincode", "") if parsed_addr else ""
             country_val = parsed_addr.get("country", "") if parsed_addr else ""
+            if not country_val:
+                country_val = country_from_phone(primary_phone or "")
 
             table_rows = [
                 "| Field              | Value                           |",

@@ -29,7 +29,8 @@ from config import (
 )
 import db.postgres_audit_log as audit_log
 from document_context import WEB_TOOL_NAMES, build_document_context, web_allowed_this_turn
-from ERP_Unified.tools import get_pending_create_field, get_pending_create_data, CREATE_OPERATIONS
+from ERP_Unified.tools import get_pending_create_field, get_pending_create_data, apply_session_defaults, CREATE_OPERATIONS
+from ERP_Unified.validation import find_blocking_link_problem
 from llm_client import _clean_schema_for_openai, convert_message_to_dict
 import state
 
@@ -260,6 +261,19 @@ async def _execute_tool(
                         "data": {**accumulated, **(effective_args.get("data") or {})},
                     }
 
+        if tool_name == "erp_data_tool" and str(effective_args.get("operation") or "").lower() in CREATE_OPERATIONS:
+            doctype = str(effective_args.get("doctype") or "")
+            filled = apply_session_defaults(session_id, doctype, preview_args.get("data"))
+            effective_args = {**effective_args, "data": {**(effective_args.get("data") or {}), **{k: v for k, v in filled.items() if k not in (effective_args.get("data") or {})}}}
+            preview_args = {**preview_args, "data": {**(preview_args.get("data") or {}), **{k: v for k, v in filled.items() if k not in (preview_args.get("data") or {})}}}
+            blocker = await asyncio.to_thread(find_blocking_link_problem, doctype, preview_args.get("data"))
+            if blocker:
+                audit_log.log_turn(
+                    session_id, "tool", blocker, tool_name=tool_name, tool_args=effective_args,
+                    user_id=user_id, prompt_text=prompt_text, tool_status="blocked",
+                )
+                return blocker
+
         audit_log.save_pending_approval(session_id, tool_name, effective_args)
         proposal = (
             f"PROPOSED ACTION (not yet executed): {_describe_pending_action(tool_name, preview_args)}\n"
@@ -483,44 +497,54 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     history = history if history is not None else []
     start_len = len(history)
 
-    pending = audit_log.get_pending_approval(session_id) if session_id else None
+    pending_items = audit_log.get_pending_approvals(session_id) if session_id else []
+    pending = pending_items[0] if pending_items else None
     if pending and _is_write_approval(text):
         history.append(HumanMessage(content=text))
-        yield {"type": "tool_call", "name": pending["tool_name"], "args": pending["args"]}
-        tool_task = asyncio.create_task(
-            _execute_tool(
-                pending["tool_name"], pending["args"],
-                session_id=session_id, user_id=user_id, prompt_text=text,
-                bypass_gate=True,
+        results = []
+        for item in pending_items:
+            yield {"type": "tool_call", "name": item["tool_name"], "args": item["args"]}
+            tool_task = asyncio.create_task(
+                _execute_tool(
+                    item["tool_name"], item["args"],
+                    session_id=session_id, user_id=user_id, prompt_text=text,
+                    bypass_gate=True,
+                )
             )
-        )
-        while not tool_task.done():
-            done, _ = await asyncio.wait([tool_task], timeout=1.5)
-            if not done:
-                yield {"type": "ping"}
-        result = await tool_task
+            while not tool_task.done():
+                done, _ = await asyncio.wait([tool_task], timeout=1.5)
+                if not done:
+                    yield {"type": "ping"}
+            result = await tool_task
 
-        # erp_data_tool has its own, separate web-research review gate --
-        # the "yes" that resumed this proposal already covers that too, so
-        # satisfy it here instead of leaving the user stuck confirming twice.
-        if isinstance(result, str) and result.startswith("REVIEW_REQUIRED:") and pending["tool_name"] == "erp_data_tool":
-            retry_args = {**pending["args"], "approved": True}
-            result = await _execute_tool(
-                pending["tool_name"], retry_args,
-                session_id=session_id, user_id=user_id, prompt_text=text,
-                bypass_gate=True,
-            )
+            # erp_data_tool has its own, separate web-research review gate --
+            # the "yes" that resumed this proposal already covers that too, so
+            # satisfy it here instead of leaving the user stuck confirming twice.
+            if isinstance(result, str) and result.startswith("REVIEW_REQUIRED:") and item["tool_name"] == "erp_data_tool":
+                retry_args = {**item["args"], "approved": True}
+                result = await _execute_tool(
+                    item["tool_name"], retry_args,
+                    session_id=session_id, user_id=user_id, prompt_text=text,
+                    bypass_gate=True,
+                )
 
-        yield {"type": "tool_result", "name": pending["tool_name"], "result": result}
+            yield {"type": "tool_result", "name": item["tool_name"], "result": result}
+            results.append(result)
+
+        if len(results) == 1:
+            results_text = f"Tool result: {results[0]}"
+        else:
+            results_text = "Tool results, in order:\n" + "\n".join(f"{i}. {r}" for i, r in enumerate(results, 1))
         summary_messages = [
             SystemMessage(content=state.assistant.llm.system_prompt),
             HumanMessage(
                 content=(
-                    f"The user approved the pending action, and the system just attempted it. "
-                    f"Tool result: {result}\nLook at the result: if it succeeded, confirm what "
+                    f"The user approved the pending action(s), and the system just attempted them. "
+                    f"{results_text}\nLook at each result: if it succeeded, confirm what "
                     f"was done; if it failed or is asking for more information (e.g. a missing "
                     f"required field), say so plainly -- do NOT say it 'has been executed' or "
                     f"'succeeded' unless the result actually shows a created/updated record. "
+                    f"Say 'created' only for a create and 'updated' for an update. "
                     f"Do not call any tools."
                 )
             ),
@@ -540,9 +564,10 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
         history.append(HumanMessage(content=text))
         cancel_text = "Okay, I've cancelled that — nothing was changed."
         history.append(AIMessage(content=cancel_text))
-        audit_log.log_turn(session_id, "tool", cancel_text, tool_name=pending["tool_name"],
-                           tool_args=pending["args"], user_id=user_id, prompt_text=text,
-                           tool_status="rejected")
+        for item in pending_items:
+            audit_log.log_turn(session_id, "tool", cancel_text, tool_name=item["tool_name"],
+                               tool_args=item["args"], user_id=user_id, prompt_text=text,
+                               tool_status="rejected")
         yield {"type": "done", "text": cancel_text, "_delta": history[start_len:]}
         return
 

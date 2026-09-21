@@ -105,6 +105,8 @@ def convert_crm_record(
             f"{src} '{source_name}' -> {tgt}:", "",
         ]
         for k, v in data.items():
+            if k == "naming_series":
+                continue  # a template like 'CRM-OPP-.YYYY.-', not the record's ID -- the real ID exists only after creation
             lines.append(f"- {k}: {v}")
         lines.append("")
         lines.append(

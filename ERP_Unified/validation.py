@@ -155,6 +155,14 @@ def _prepare_write_data(doctype: str, data: Optional[dict]) -> tuple[dict, list[
         if field.get("fieldname")
     }
 
+    if doctype.strip().lower() == "task":
+        # models say due_date/start_date; the Task fields are exp_end_date/exp_start_date
+        for alias, real in (("due_date", "exp_end_date"), ("end_date", "exp_end_date"),
+                            ("deadline", "exp_end_date"), ("start_date", "exp_start_date")):
+            if cleaned.get(alias) and not cleaned.get(real):
+                cleaned[real] = cleaned[alias]
+            cleaned.pop(alias, None)
+
     if doctype.strip().lower() == "task" and cleaned.get("assigned_to"):
         # a common, wrong instinct -- Task has no such field, assignment is
         # a separate Frappe mechanism (frappe.desk.form.assign_to.add),
@@ -382,3 +390,33 @@ def _normalize_filters(filters: Optional[list | dict]) -> Optional[list]:
         else:
             normalized.append(f)
     return normalized
+
+
+def find_blocking_link_problem(doctype: str, data: Optional[dict]) -> Optional[str]:
+    """A message when a Link value is really a Lead/Opportunity/Quotation ID (e.g. a Lead ID used as
+    the Project customer); creating the record without that link would silently drop the customer."""
+    try:
+        meta = erp_client.get_meta(doctype)
+    except Exception:
+        return None
+    for field in meta.get("fields", []) or []:
+        name = field.get("fieldname")
+        value = (data or {}).get(name)
+        if field.get("fieldtype") != "Link" or not field.get("options") or not isinstance(value, str) or not value:
+            continue
+        target = field["options"]
+        if target in _PIPELINE_SOURCE_DOCTYPES:
+            continue
+        try:
+            if _resolve_link_value(target, value):
+                continue
+            source = _find_pipeline_source(target, value)
+        except Exception:
+            continue
+        if source:
+            return (
+                f"I can't create this {doctype} yet: '{value}' is a {source} ID, not a {target}. "
+                f"Convert it first with convert_crm_record (to a {target}), then create the {doctype} "
+                f"with the {target} ID that returns. Ask the user to confirm the conversion."
+            )
+    return None
