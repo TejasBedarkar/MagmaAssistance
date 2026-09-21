@@ -26,6 +26,7 @@ Browser (React app, loaded from Frappe)
   │  fetch POST https://ai.tjdem.online/api/chat/stream   (SSE)
   │  or  WebSocket  wss://ai.tjdem.online/ws/voice
   │       browser SpeechRecognition text → same stream_agent_turn → voice_sentence text
+  │  or  POST /api/upload-document   (files → document_context → system prompt of every turn)
   ▼
 MagmaAssistance  (EC2, systemd magmaassistance.service, port 8050; LLM_MODEL=gpt-4o)
   agent/ : stream_agent_turn()          ← hand-rolled ReAct loop, ≤4 tool rounds
@@ -80,11 +81,12 @@ Manufacturing multi-step planner = backlog, not now.
 - `ERP/erp_client.py` — **all of it**, including `ERPIdentity` / `use_identity` / `resolve_identity` (orphaned but must be re-wired, not deleted)
 - `ERP/dynamic_fields.py`, `ERP/doctype_knowledge.py`
 - `LLM/LLM.py` — `LLM` class, `GENERAL_ERP_PROMPT`, `extract_po_data_from_document`, `extract_document_text`
+- `LLM/document_reader.py` + `document_context.py` — uploaded-file pipeline (see §4 "Uploaded documents")
 - **audit logging** — the *concept* is kept, but move it to SQLite (see Storage note below + P2)
 - `Voice/ws_voice.py` (`/ws/voice`, text-only),
   `TTS/TTS.py`, `TTS/STT.py` (one-shot file STT), `routes/voice.py` (HTTP `/api/tts*`),
   `storage/s3_storage.py`
-- `config.py` — shared env defaults (LLM, TTS, live-voice STT VAD knobs)
+- `config.py` — shared env defaults (LLM, TTS)
 - `custom_ui/public/js/magna_ai_assistant/` (the React app)
 - `custom_ui/api/{metadata,auth,access_control,crud}.py` — **unused today, needed for RBAC. Keep.**
 
@@ -163,10 +165,28 @@ If P4 mixes these, the multi-site migration is painful; if clean, it's a small c
 ### Other decisions
 
 - **Live voice** — `/ws/voice` is text-only: the browser's Web Speech API does STT and TTS,
-  the server streams `voice_sentence` text from the same `stream_agent_turn` as chat.
-  The OpenAI STT/TTS voice pipeline was replaced by Web Speech on 21 Sep 2026.
+  the server streams `voice_sentence` text (markdown/tables stripped, plus a short filler
+  phrase per tool call) from the same `stream_agent_turn` as chat. No audio crosses the socket.
+  Voice picker (UK Female/Male, US English, Hindi) and mic mute live in `AssistantPortal.jsx`;
+  mute only stops listening, the reply keeps speaking. The chat **Read Aloud** button is
+  separate and still uses OpenAI TTS (`/api/tts*`, `TTS/TTS.py`).
+  *History:* Web Speech (18 Aug) → OpenAI STT/TTS pipeline (18 Sep) → Web Speech again
+  (21 Sep, PR #74) because OpenAI TTS has no seed/voice lock, so the voice drifted between
+  the per-sentence calls. The OpenAI pipeline is recoverable: frontend `559920c`, backend
+  `1df1e1f`; last pre-OpenAI states are `upstream/pre-openai-voice` (frontend) and
+  `origin/pre-openai-voice` (backend). Native Realtime speech-to-speech was evaluated and
+  not adopted (would bypass the tool loop, write gate and RBAC; costs more).
   The old WebRTC/Realtime conversation path was deleted in P2; do not revive it
   without a product decision.
+- **Uploaded documents** — `POST /api/upload-document` accepts images, PDF, Excel, CSV/TSV,
+  JSON, Word and text (type detected by extension first, MIME second; `MAX_UPLOAD_MB`, default 10).
+  `LLM/document_reader.py` turns the file into text (Vision for images/scans),
+  `document_context.py` keeps up to 10 files per session and `stream_agent_turn` renders them
+  into the system prompt on every turn. **Document first, web second:** while a session has
+  files, web tools are withheld unless the user says something is wrong/missing, asks to search,
+  pastes a URL, or says yes to the assistant's own "search online?" offer. Writes still go
+  through the normal approval gate. Needs `openpyxl`, `python-docx`, `Pillow` (`xlrd` for .xls) —
+  all in `requirements.txt`. `/api/upload-po` (OCR-PO) is a separate, still-unwired path.
 - **Multi-agent workflow** — settled: single streaming agent + code-enforced write gate
   (both shipped in P1). Manufacturing multi-step planner = backlog.
 
@@ -271,11 +291,11 @@ could silently break.
       `scripts/run_llm_cli.py`. Re-exports preserved on `LLM/LLM.py` and `LLM/__init__.py`.
 
 *Optional, only if the person has spare time — each is one cohesive domain, not urgent:*
-- [x] `web/web_tool.py` — superseded, not split: the crawler PR replaced its scraping
-      internals outright with the `web/company_crawler/` package (resolver/crawler/
-      extractor/zaubacorp/blocklist), which already solves the same "file too big"
-      problem with a better design. Splitting the old code into `web/scraper.py` would
-      have resurrected logic that no longer exists.
+- [ ] `web/web_tool.py` (~920 lines) — **not split**. PR #43's `web/scraper.py` split was
+      closed as superseded: the crawler PR added the `web/company_crawler/` package
+      (resolver/crawler/extractor/zaubacorp/blocklist) and rewrote this file, but the
+      older scraping helpers (`_fetch_soup`, `_extract_contacts_from_soup`, email/phone
+      regexes, ...) still live in `web_tool.py`. Splitting them out is a post-demo follow-up.
 - [x] `ERP_Unified/tools.py` (~1070 → ~706, after the crawler PR's own additions here too) —
       extracted `_prepare_write_data` / `_resolve_link_value` / `_normalize_filters` /
       `_is_valid_email` / `_with_warnings` into `ERP_Unified/validation.py`, along with the
@@ -287,7 +307,7 @@ could silently break.
 `db/postgres_audit_log.py` — handled in P2 (audit → SQLite). `MagnaCLI.py` — dev tool.
 
 ### Rough timeline
-P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · **P2 done (2026-09-11, `d2852e9`)** — MCP/unused tools/dead deps/audit→SQLite/WebRTC voice all merged · **P3 done + merged (2026-09-10, `d24d5f9`; CSRF follow-up `f2bb60d`)** · **P5 done (2026-09-11)** — split `server.py` into `config`, `llm_client`, `state`, `history`, `agent`, `routes/`, and `LLM/LLM.py` into `prompts`, `client`, `vision`, `scripts/` · **next: P4 (capability gating)**
+P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approval gate, LangGraph deletion, `MagnaCLI.py` repointed · **P2 done (2026-09-11, `d2852e9`)** — MCP/unused tools/dead deps/audit→SQLite/WebRTC voice all merged · **P3 done + merged (2026-09-10, `d24d5f9`; CSRF follow-up `f2bb60d`)** · **P5 done (2026-09-11)** — split `server.py` into `config`, `llm_client`, `state`, `history`, `agent`, `routes/`, and `LLM/LLM.py` into `prompts`, `client`, `vision`, `scripts/` · **voice/uploads (2026-09-21)** — text-only Web Speech voice restored (PR #74), uploaded-document pipeline merged (PRs #45–#51) · **next: P4 (capability gating)**
 
 ---
 
@@ -297,7 +317,7 @@ P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approv
 2. `ERP_Unified/tools.py` → `erp_data_tool`, `_run_create`
 3. `ERP/erp_client.py` → `use_identity`, `_auth_headers`, `resolve_identity`
 4. `LLM/prompts.py` + `LLM/client.py` → system prompt + LLM wrapper
-5. `Voice/ws_voice.py` → live voice transport (same agent as chat)
+5. `Voice/ws_voice.py` → live voice transport (same agent as chat); `document_context.py` + `LLM/document_reader.py` → uploaded files
 6. `custom_ui/.../AssistantPortal.jsx` → `streamAssistantTurn` + `/ws/voice` block
 7. `custom_ui/api/metadata.py` + `auth.py` — the RBAC building block
 8. `db/postgres_audit_log.py` — audit (SQLite-backed despite the module name; see P2)

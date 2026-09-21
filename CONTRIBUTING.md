@@ -115,6 +115,9 @@ fixes
       second) to avoid hitting the shared rate limit on every save. Run it
       **without** `--skip-llm` once, right before you push — that full run
       is what actually has to pass.
+- [ ] `python -m pytest test -q` passes (unit tests in `test/`, no live ERP needed)
+- [ ] New Python imports are in `requirements.txt` — a missing dependency only shows up on a fresh install
+- [ ] Files end with a newline
 - [ ] `git status` clean except your intended changes
 - [ ] No secrets, no `.env`, no `*.sqlite`, no `venv/`, no `ERP/models/` in the diff
 - [ ] Commit messages follow §3
@@ -221,6 +224,8 @@ service account.
 - ❌ Delete anything in the "KEEP" or "DEAD but load-bearing" lists in
   `ARCHITECTURE.md` without reading the note there first
 - ❌ Mix unrelated changes in one PR
+- ❌ Branch from an old commit and edit prompts/`agent.py` — rebase on `cleanup/consolidation` first,
+  or your PR will silently undo newer work (e.g. the OCR prompt PR conflicted with the crawler's 4-step lead flow)
 
 ---
 
