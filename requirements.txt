@@ -62,3 +62,8 @@ tldextract
 phonenumbers
 playwright
 boto3
+# Uploaded-file reader (LLM/document_reader.py): Excel, Word, images. xlrd is only for legacy .xls.
+openpyxl
+python-docx
+Pillow
+xlrd
