@@ -598,23 +598,18 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
     if pending:
         audit_log.clear_pending_approval(session_id)
 
-    # nudge: "yes" with no pending approval usually means the prior proposal was prose-only
+    # nudge: "yes" / "proceed" with no pending approval means the user is approving the action in discussion
     approving_proposal_turn = False
     if not pending and _is_write_approval(text):
+        approving_proposal_turn = True
         last_ai = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
-        if last_ai and isinstance(last_ai.content, str) and _PROSE_PROPOSAL_RE.search(last_ai.content):
-            approving_proposal_turn = True
+        if last_ai and isinstance(last_ai.content, str):
             history.append(SystemMessage(content=(
-                "The user just approved the proposal below -- the EXACT text of your "
-                "own previous message -- with a plain \"yes\". Call whichever tool "
-                "that specific proposal was about (erp_data_tool, or a dry_run-based "
+                "The user just approved proceeding with a direct approval (\"Proceed\" / \"yes\"). "
+                "Call whichever tool that was discussed or proposed (erp_data_tool, or a dry_run-based "
                 "tool like onboard_new_lead/batch_manage_project_tasks/reassign_tasks/"
-                "convert_crm_record with dry_run=False) NOW, with that exact data. Do "
-                "NOT act on any other, earlier action from earlier in this "
-                "conversation, even one that looks similar -- only this one. If your "
-                "own proposal below was actually missing information needed to call "
-                "the tool (e.g. no assignee given for a task), do not guess or invent "
-                "a value -- ask the user for it instead of calling the tool. Do NOT ask for confirmation again.\n\n"
+                "convert_crm_record with dry_run=False) NOW. Do NOT propose it in prose or ask the user "
+                "to confirm again -- the user has already approved, so execute it directly now.\n\n"
                 f"YOUR PREVIOUS MESSAGE (the one just approved):\n\"\"\"\n{last_ai.content}\n\"\"\""
             )))
 
