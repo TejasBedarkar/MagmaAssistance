@@ -71,8 +71,19 @@ def safe_create_task(coro):
 # ---------------------------------------------------------------------
 # Per-session runtime state
 # ---------------------------------------------------------------------
-# session_id -> {filename, text, injected}
-document_store: Dict[str, Dict[str, Any]] = {}
+# session_id -> [ {filename, file_type, text, ...}, ... ]
+# The store and its helpers live in document_context.py (dependency-free, so it
+# can be unit-tested); re-exported here so existing `state.document_store`
+# callers keep working. stream_agent_turn() renders it into the system prompt
+# via build_document_context() -- before this, uploads were stored here but
+# never read back, so the model never saw them.
+from document_context import (  # noqa: E402
+    add_session_document,
+    build_document_context,
+    clear_session_documents,
+    document_store,
+    get_session_documents,
+)
 
 # session_id -> ERPIdentity (resolved user identity for RBAC)
 session_identities: Dict[str, ERPIdentity] = {}
