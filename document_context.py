@@ -123,6 +123,13 @@ def build_document_context(session_id: Optional[str]) -> str:
         "a document is genuine or fake. Every ERP write still needs the normal confirmation.\n"
         "- Work from the documents FIRST. Do not use web tools to look up things the documents already answer.\n"
         "- If something isn't in the documents, say so plainly; never invent it.\n"
+        "- The document is the source of truth: when creating or updating a Lead, Customer, Contact, Opportunity or Order "
+        "from it, take the values from the document and do NOT run web search or crawling to enrich them. Propose the record "
+        "with exactly what the document contains -- do not hold it back because an email, phone or address is missing.\n"
+        "- The web is allowed only when the user says something is wrong or missing, asks you to search online, or gives a URL. "
+        "If you notice gaps, say plainly what is not in the document and offer ONCE: 'Want me to search online for these?'. "
+        "Never search on your own initiative. After a yes, apply the relevance check and label web-sourced values separately.\n"
+        "- web_enriched=True applies only to values that actually came from the web, never to values taken from the document.\n"
     )
 
     fresh = [d for d in docs if d.get("fresh")]
