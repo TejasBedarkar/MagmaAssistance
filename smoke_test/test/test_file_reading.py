@@ -1,12 +1,8 @@
 """
 Checks: POST /api/upload-document
 
-Only PDF and image (jpeg/png) are exercised here because server.py's
-`allowed_types` on this route is literally
-["image/jpeg", "image/png", "application/pdf", "image/jpg"] --
-there is no CSV/XLSX/DOCX handling anywhere in this codebase (no
-pandas/openpyxl/python-docx import exists). test_rejects_unsupported_type
-below exists specifically to catch it if that silently changes.
+Exercises a PDF (native text), an image (Vision), a CSV (accepted) and an .exe
+(rejected). Excel/Word/JSON go through the same reader (LLM/document_reader.py).
 """
 
 import json
@@ -36,11 +32,8 @@ def _upload(client: Client, filename: str) -> TestResult:
     return TestResult(f"file_reading.{filename}", ok, str(body)[:300])
 
 
-def _rejects_unsupported_type(client: Client) -> TestResult:
-    """Uploads a .csv and expects a 400 -- confirms the current
-    "PDF/image only" behavior hasn't silently changed. A 200 here would
-    mean CSV support was added and this whole module's docstring (and
-    ARCHITECTURE.md's file-type assumptions) needs updating."""
+def _accepts_csv(client: Client) -> TestResult:
+    """CSV is a supported upload type -- expects a 200 and the file read as csv."""
     fake_csv = b"item_code,item_name,qty\nITM-001,Steel Rod,10\n"
     try:
         resp = client.post_multipart(
@@ -48,16 +41,29 @@ def _rejects_unsupported_type(client: Client) -> TestResult:
             fields={"session_id": "smoke-filereading", "user_id": "smoke"},
             files={"file": ("sample.csv", fake_csv)},
         )
+        body = json.loads(resp.read())
+        ok = resp.status == 200 and body.get("file_type") == "csv"
+        return TestResult("file_reading.accepts_csv", ok, str(body)[:200])
+    except ClientError as exc:
+        return TestResult("file_reading.accepts_csv", False, str(exc))
+
+
+def _rejects_unsupported_type(client: Client) -> TestResult:
+    """Uploads an .exe and expects a 400 -- confirms unsupported types are still refused."""
+    try:
+        resp = client.post_multipart(
+            "/api/upload-document",
+            fields={"session_id": "smoke-filereading", "user_id": "smoke"},
+            files={"file": ("sample.exe", b"MZ\x00\x00not a document")},
+        )
         return TestResult(
-            "file_reading.rejects_csv", False,
-            f"expected 400, got {resp.status} -- CSV upload now accepted?",
+            "file_reading.rejects_exe", False,
+            f"expected 400, got {resp.status} -- unsupported type accepted?",
         )
     except ClientError as exc:
-        # urllib raises HTTPError (a URLError subclass) for 4xx/5xx;
-        # a 400 here is the PASS case.
+        # urllib raises HTTPError for 4xx/5xx; a 400 here is the PASS case.
         detail = str(exc)
-        ok = "400" in detail
-        return TestResult("file_reading.rejects_csv", ok, detail)
+        return TestResult("file_reading.rejects_exe", "400" in detail, detail)
 
 
 def run(client: Client, ctx: dict) -> list[TestResult]:
@@ -70,5 +76,6 @@ def run(client: Client, ctx: dict) -> list[TestResult]:
         results.append(TestResult("file_reading.sample_po.png", False, skipped=True, detail="skipped -- --skip-llm"))
     else:
         results.append(timed("file_reading.sample_po.png", _upload, client, "sample_po.png"))
-    results.append(timed("file_reading.rejects_csv", _rejects_unsupported_type, client))
+    results.append(timed("file_reading.accepts_csv", _accepts_csv, client))
+    results.append(timed("file_reading.rejects_exe", _rejects_unsupported_type, client))
     return results
