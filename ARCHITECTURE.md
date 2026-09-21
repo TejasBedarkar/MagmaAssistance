@@ -25,7 +25,7 @@
 Browser (React app, loaded from Frappe)
   │  fetch POST https://ai.tjdem.online/api/chat/stream   (SSE)
   │  or  WebSocket  wss://ai.tjdem.online/ws/voice
-  │       mic PCM → Realtime STT → same stream_agent_turn → OpenAI TTS PCM
+  │       browser SpeechRecognition text → same stream_agent_turn → voice_sentence text
   ▼
 MagmaAssistance  (EC2, systemd magmaassistance.service, port 8050; LLM_MODEL=gpt-4o)
   agent/ : stream_agent_turn()          ← hand-rolled ReAct loop, ≤4 tool rounds
@@ -81,7 +81,7 @@ Manufacturing multi-step planner = backlog, not now.
 - `ERP/dynamic_fields.py`, `ERP/doctype_knowledge.py`
 - `LLM/LLM.py` — `LLM` class, `GENERAL_ERP_PROMPT`, `extract_po_data_from_document`, `extract_document_text`
 - **audit logging** — the *concept* is kept, but move it to SQLite (see Storage note below + P2)
-- `Voice/ws_voice.py` (`/ws/voice`), `Voice/realtime_stt.py` (OpenAI Realtime transcription),
+- `Voice/ws_voice.py` (`/ws/voice`, text-only),
   `TTS/TTS.py`, `TTS/STT.py` (one-shot file STT), `routes/voice.py` (HTTP `/api/tts*`),
   `storage/s3_storage.py`
 - `config.py` — shared env defaults (LLM, TTS, live-voice STT VAD knobs)
@@ -162,9 +162,9 @@ If P4 mixes these, the multi-site migration is painful; if clean, it's a small c
 
 ### Other decisions
 
-- **Live voice** — `/ws/voice` over OpenAI Realtime STT (`Voice/realtime_stt.py`,
-  transcription-only + server_vad) and OpenAI TTS PCM out (`TTS/TTS.py`). Same
-  `stream_agent_turn` as chat. Browser Web Speech was retired 16–17 Sep 2026.
+- **Live voice** — `/ws/voice` is text-only: the browser's Web Speech API does STT and TTS,
+  the server streams `voice_sentence` text from the same `stream_agent_turn` as chat.
+  The OpenAI STT/TTS voice pipeline was replaced by Web Speech on 21 Sep 2026.
   The old WebRTC/Realtime conversation path was deleted in P2; do not revive it
   without a product decision.
 - **Multi-agent workflow** — settled: single streaming agent + code-enforced write gate
@@ -297,7 +297,7 @@ P0 done · **P1 done + merged (2026-09-10)** — checkpointer swap, write-approv
 2. `ERP_Unified/tools.py` → `erp_data_tool`, `_run_create`
 3. `ERP/erp_client.py` → `use_identity`, `_auth_headers`, `resolve_identity`
 4. `LLM/prompts.py` + `LLM/client.py` → system prompt + LLM wrapper
-5. `Voice/ws_voice.py` + `Voice/realtime_stt.py` → live voice transport (same agent as chat)
+5. `Voice/ws_voice.py` → live voice transport (same agent as chat)
 6. `custom_ui/.../AssistantPortal.jsx` → `streamAssistantTurn` + `/ws/voice` block
 7. `custom_ui/api/metadata.py` + `auth.py` — the RBAC building block
 8. `db/postgres_audit_log.py` — audit (SQLite-backed despite the module name; see P2)

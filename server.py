@@ -135,7 +135,6 @@ app.include_router(audit_router)
 register_voice_ws(
     app,
     stream_agent_turn,
-    state.assistant.tts,
     logger,
     load_stream_history,
     save_stream_history,

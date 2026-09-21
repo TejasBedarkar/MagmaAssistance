@@ -18,16 +18,3 @@ TOOL_RAG_BYPASS_THRESHOLD = int(os.environ.get("TOOL_RAG_BYPASS_THRESHOLD", "100
 
 MAX_HISTORY_TOKENS = 60000  # Approximated: 1 token ~= 4 chars
 
-# Live voice STT (Voice/realtime_stt.py → /ws/voice). gpt-live-transcribe rejects server_vad.
-REALTIME_STT_MODEL = os.environ.get("REALTIME_STT_MODEL", "gpt-transcribe")
-REALTIME_STT_LANGUAGE = os.environ.get("REALTIME_STT_LANGUAGE", "en")
-REALTIME_STT_PROMPT = os.environ.get(
-    "REALTIME_STT_PROMPT",
-    "Business conversation with an ERP assistant. Expect company names, "
-    "person names, and ERP terms like Lead, Opportunity, Quotation, Sales Order.",
-)
-REALTIME_STT_VAD_THRESHOLD = float(os.environ.get("REALTIME_STT_VAD_THRESHOLD", "0.6"))
-REALTIME_STT_SILENCE_MS = int(os.environ.get("REALTIME_STT_SILENCE_MS", "650"))
-REALTIME_STT_PREFIX_PADDING_MS = int(os.environ.get("REALTIME_STT_PREFIX_PADDING_MS", "400"))
-REALTIME_STT_MIN_WORDS = int(os.environ.get("REALTIME_STT_MIN_WORDS", "2"))
-REALTIME_STT_SAMPLE_RATE = int(os.environ.get("REALTIME_STT_SAMPLE_RATE", "24000"))
