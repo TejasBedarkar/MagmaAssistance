@@ -135,6 +135,7 @@ def register_voice_ws(app, stream_agent_turn, logger, load_stream_history, save_
             t0 = time.monotonic()
             logger.info("[WS/voice] turn START  session=%s  text=%r", session_id, text[:120])
             token_buf = ""
+            filler_spoken = False
 
             history = await load_stream_history(session_id)
             start_len = len(history)
@@ -183,10 +184,12 @@ def register_voice_ws(app, stream_agent_turn, logger, load_stream_history, save_
                                 "name": event["name"],
                                 "args": event.get("args", {})
                             })
-                            await send_json({
-                                "type": "voice_sentence",
-                                "text": _tool_filler_phrase(event["name"], event.get("args", {})),
-                            })
+                            if not filler_spoken:
+                                filler_spoken = True  # one filler per reply, however many tools it calls
+                                await send_json({
+                                    "type": "voice_sentence",
+                                    "text": _tool_filler_phrase(event["name"], event.get("args", {})),
+                                })
 
                         elif etype == "tool_result":
                             logger.info(
