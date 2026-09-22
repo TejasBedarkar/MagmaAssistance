@@ -38,6 +38,7 @@ from ERP.dynamic_fields import (
     field_question,
     explain_erp_error,
     apply_default_values,
+    apply_transaction_currency_defaults,
     safe_call as _safe_call,
 )
 from ERP.tools.project_onboarding_tools import PROJECT_ONBOARDING_TOOLS
@@ -441,7 +442,9 @@ def apply_session_defaults(session_id: str, doctype: str, data: Optional[dict]) 
     """Fill Company (asked once) and a Task's Project (the one just created) from this conversation."""
     filled = dict(data or {})
     dt = doctype.strip().lower()
-    if dt in ("project", "task") and not filled.get("company"):
+    if not filled.get("company"):
+        # Safe for every doctype: _prepare_write_data drops any field the doctype's
+        # own schema doesn't have, so this only ever lands where "company" is real.
         try:
             company = _SESSION_COMPANY.get(session_id) or _default_company()
         except Exception:  # noqa: BLE001
@@ -511,9 +514,12 @@ def _run_create(
             merged["country"] = country_val.strip()
 
     try:
-        # defaults first, then sanitize -- otherwise a bad schema default
-        # (e.g. a raw "Today" token) slips past _prepare_write_data's
-        # validation and reaches ERPNext as a literal, invalid value
+        # currency/price-list defaults first (they can seed `company`-derived
+        # values other defaults don't touch), then schema defaults, then
+        # sanitize -- otherwise a bad schema default (e.g. a raw "Today"
+        # token) slips past _prepare_write_data's validation and reaches
+        # ERPNext as a literal, invalid value
+        merged = apply_transaction_currency_defaults(doctype, merged)
         merged = apply_default_values(doctype, merged)
         blocker = find_blocking_link_problem(doctype, merged)
         if blocker:

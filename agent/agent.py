@@ -37,6 +37,20 @@ import state
 logger = logging.getLogger("agent-server")
 
 # ---------------------------------------------------------------------
+def _fallback_if_empty(content: str, call_messages: list) -> str:
+    """A model reply of pure empty text happens occasionally after a long
+    tool round-trip (e.g. several one-field-at-a-time questions in a row) --
+    with nothing guarding it, the user sees a tool badge and literally
+    nothing else. Fall back to the last tool result rather than showing a
+    blank turn."""
+    if content and content.strip():
+        return content
+    for msg in reversed(call_messages):
+        if isinstance(msg, ToolMessage) and str(msg.content).strip():
+            return str(msg.content)
+    return "Sorry, I didn't catch that -- could you say that again?"
+
+
 # Code-enforced write-approval gate predicates and helpers
 # ---------------------------------------------------------------------
 _GATED_WRITE_OPERATIONS = {
@@ -577,6 +591,9 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                 yield {"type": "token", "text": event["text"]}
             else:
                 content = event["content"]
+        if not content.strip():
+            content = str(results[-1]) if results else "Done."
+            yield {"type": "token", "text": content}
         if session_id:
             audit_log.clear_pending_approval(session_id)
         history.append(AIMessage(content=content))
@@ -728,6 +745,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                         "prompt automatically once you do."
                     )))
                     continue
+                content = _fallback_if_empty(content, call_messages)
                 ai_msg = AIMessage(content=content)
                 history.append(ai_msg)
                 yield {"type": "done", "text": content, "_delta": history[start_len:]}
@@ -786,6 +804,10 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
                 yield {"type": "token", "text": event["text"]}
             else:
                 content = event["content"]
+        fallback = _fallback_if_empty(content, call_messages)
+        if fallback != content:
+            yield {"type": "token", "text": fallback}
+            content = fallback
         ai_msg = AIMessage(content=content)
         history.append(ai_msg)
         yield {"type": "done", "text": content, "_delta": history[start_len:]}

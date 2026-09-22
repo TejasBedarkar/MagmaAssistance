@@ -243,6 +243,73 @@ def apply_default_values(doctype: str, data: dict | None) -> dict:
     return data
 
 
+_TXN_CURRENCY_FIELDS = {
+    "currency", "selling_price_list", "buying_price_list",
+    "price_list_currency", "conversion_rate", "plc_conversion_rate",
+}
+
+
+def apply_transaction_currency_defaults(doctype: str, data: dict | None) -> dict:
+    """Fills in the currency/price-list fields ERPNext's own desk UI derives
+    automatically from Company + Price List (Quotation, Sales Order, Purchase
+    Order, ...) instead of leaving them to the one-by-one question flow.
+
+    Our REST-only write bypasses those client-side scripts entirely, so
+    `currency`/`price_list_currency`/`conversion_rate`/`plc_conversion_rate`/
+    `selling_price_list`/`buying_price_list` all show up as plain required
+    fields with no default -- asking a user for each one, in order, on a
+    single-currency site is pure friction. Assumes the common case (no
+    multi-currency deal) and only touches a field that's actually present on
+    the doctype's own schema, so it's a no-op everywhere else.
+    """
+    data = dict(data or {})
+    try:
+        meta = erp_client.get_meta(doctype)
+    except Exception:  # noqa: BLE001
+        return data
+    fieldnames = {f.get("fieldname") for f in meta.get("fields", []) or []}
+    if not (fieldnames & _TXN_CURRENCY_FIELDS):
+        return data  # not a transaction doctype -- nothing to derive
+
+    company_currency = None
+    company = data.get("company")
+    if company:
+        try:
+            company_currency = erp_client.get_doc("Company", company).get("default_currency")
+        except Exception:  # noqa: BLE001
+            pass
+    company_currency = company_currency or "INR"
+
+    if "currency" in fieldnames and not data.get("currency"):
+        data["currency"] = company_currency
+
+    is_buying = doctype.strip().lower() in ("purchase order", "purchase receipt", "purchase invoice", "supplier quotation")
+    price_list_field = "buying_price_list" if is_buying else "selling_price_list"
+    price_list = data.get(price_list_field)
+    if price_list_field in fieldnames and not price_list:
+        price_list = "Standard Buying" if is_buying else "Standard Selling"
+        data[price_list_field] = price_list
+
+    if "price_list_currency" in fieldnames and not data.get("price_list_currency"):
+        pl_currency = None
+        if price_list:
+            try:
+                pl_currency = erp_client.get_doc("Price List", price_list).get("currency")
+            except Exception:  # noqa: BLE001
+                pass
+        data["price_list_currency"] = pl_currency or company_currency
+
+    # Same currency on both sides -> 1:1, the overwhelmingly common case on a
+    # single-currency site. A genuine cross-currency deal still needs the
+    # user to correct this, same as it would need to override any default.
+    if "conversion_rate" in fieldnames and not data.get("conversion_rate"):
+        data["conversion_rate"] = 1
+    if "plc_conversion_rate" in fieldnames and not data.get("plc_conversion_rate"):
+        data["plc_conversion_rate"] = 1
+
+    return data
+
+
 def next_question(doctype: str, data: dict | None) -> tuple[dict, str] | None:
     """Convenience wrapper: returns (field, question) for the SINGLE next
     missing required field for `doctype` given what's already in `data`,
