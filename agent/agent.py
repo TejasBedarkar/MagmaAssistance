@@ -704,6 +704,19 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             )
     if task_context:
         system_parts.append(f"\nCurrent task in progress: {task_context}.")
+
+    # Skills: retrieved fresh every turn from the user's message + the
+    # running task_context (not from history, so a long conversation
+    # can't dilute or drop this the way it can with plain chat turns --
+    # see skills_engine/skill_rag.py). Empty for turns that don't match
+    # any skill, which keeps the prompt lean the rest of the time.
+    if state.skill_manager and state.skill_manager.skills:
+        skill_query = f"{task_context or ''}\n{text}".strip()
+        active_skills = state.skill_manager.retrieve(skill_query)
+        if active_skills:
+            logger.debug("Active skills for this turn: %s", [s.id for s in active_skills])
+            system_parts.append("\n" + state.skill_manager.render(active_skills))
+
     call_messages = [SystemMessage(content="\n".join(system_parts)), *trimmed]
 
     max_rounds = 4
