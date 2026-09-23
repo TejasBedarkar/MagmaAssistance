@@ -9,6 +9,9 @@ from typing import Any, Dict, Optional
 from config import (
     LLM_MODEL,
     MAX_HISTORY_TOKENS,
+    SKILL_RAG_MIN_SCORE,
+    SKILL_RAG_TOP_K,
+    SKILLS_DIR,
     TOOL_RAG_BYPASS_THRESHOLD,
     TOOL_RAG_MIN_SCORE,
     TOOL_RAG_TOP_K,
@@ -21,6 +24,7 @@ from ERP.tools.DashboardUI_tools import DASHBOARD_UI_TOOLS
 from ERP_Unified.tools import ERP_UNIFIED_TOOLS
 from llm_client import OpenAIChatModel  # ensures LLM.model property is attached
 from Main import VoiceAssistant
+from skills_engine import SkillManager
 from web.web_tool import WEB_TOOLS
 
 logger = logging.getLogger("agent-server")
@@ -41,6 +45,23 @@ if ALL_TOOLS:
         logger.info("Skipping HuggingFace ToolRAG indexing (only %d tools).", len(ALL_TOOLS))
 else:
     logger.info("No ERP tools registered.")
+
+# ---------------------------------------------------------------------
+# Skills: workflow-specific instruction blocks (see skills_engine/ and
+# skills/README.md). Loaded once at startup, same as ALL_TOOLS above;
+# retrieved fresh per-turn in agent.py rather than living permanently in
+# the static system prompt.
+# ---------------------------------------------------------------------
+logger.info("Loading skills from '%s'...", SKILLS_DIR)
+skill_manager = SkillManager(SKILLS_DIR, top_k=SKILL_RAG_TOP_K, min_score=SKILL_RAG_MIN_SCORE)
+if skill_manager.skills:
+    logger.info(
+        "Loaded %d skill(s): %s",
+        len(skill_manager.skills),
+        ", ".join(s.id for s in skill_manager.skills),
+    )
+else:
+    logger.info("No skills found in '%s' -- add SKILL.md folders there to enable skill guidance.", SKILLS_DIR)
 
 # ---------------------------------------------------------------------
 # VoiceAssistant instance (STT + TTS + LLM chat)
