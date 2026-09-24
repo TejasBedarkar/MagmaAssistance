@@ -33,7 +33,9 @@ _MIN_CHARS_PER_DOC = 6000
 
 WEB_TOOL_NAMES = {
     "web_search", "web_fetch_page", "web_crawl", "web_company_search", "web_company_extract",
+    "apollo_enrich_lead",
 }
+
 
 
 # ---------------------------------------------------------------------

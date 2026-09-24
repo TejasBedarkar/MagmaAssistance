@@ -18,3 +18,6 @@ TOOL_RAG_BYPASS_THRESHOLD = int(os.environ.get("TOOL_RAG_BYPASS_THRESHOLD", "100
 
 MAX_HISTORY_TOKENS = 60000  # Approximated: 1 token ~= 4 chars
 
+APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
+
+

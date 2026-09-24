@@ -166,16 +166,16 @@ def _is_write_rejection(message: str) -> bool:
 
 
 _RESEARCH_FIELD_RE = {
-    "email_id": re.compile(r"-\s*Email:\s*(\S+@\S+)", re.IGNORECASE),
-    "phone": re.compile(r"-\s*Phone:\s*([+\d\t \-()]{7,})", re.IGNORECASE),
-    "address": re.compile(r"-\s*Address:\s*(.+)", re.IGNORECASE),
-    "address_line1": re.compile(r"-\s*Address Line 1:\s*(.+)", re.IGNORECASE),
-    "city": re.compile(r"-\s*City:\s*(.+)", re.IGNORECASE),
-    "state": re.compile(r"-\s*State:\s*(.+)", re.IGNORECASE),
-    "pincode": re.compile(r"-\s*Pincode:\s*(\d{6})", re.IGNORECASE),
-    "country": re.compile(r"-\s*Country:\s*(.+)", re.IGNORECASE),
-    "website": re.compile(r"Extracted details from (\S+)", re.IGNORECASE),
-    "description": re.compile(r"-\s*Description:\s*(.+)", re.IGNORECASE),
+    "email_id": re.compile(r"(?:-\s*Email:\s*|\|\s*Email\s*\|\s*)([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", re.IGNORECASE),
+    "phone": re.compile(r"(?:-\s*Phone:\s*|\|\s*Phone\s*\|\s*)([+\d][\d\s\-]{5,}\d)", re.IGNORECASE),
+    "address": re.compile(r"(?:-\s*Address:\s*|\|\s*Address\s*\|\s*)([^|\n]+)", re.IGNORECASE),
+    "address_line1": re.compile(r"(?:-\s*Address Line 1:\s*|\|\s*Address Line 1\s*\|\s*)([^|\n]+)", re.IGNORECASE),
+    "city": re.compile(r"(?:-\s*City:\s*|\|\s*City\s*\|\s*)([^|\n]+)", re.IGNORECASE),
+    "state": re.compile(r"(?:-\s*State:\s*|\|\s*State\s*\|\s*)([^|\n]+)", re.IGNORECASE),
+    "pincode": re.compile(r"(?:-\s*Pincode:\s*|\|\s*Pincode\s*\|\s*)(\d{6})", re.IGNORECASE),
+    "country": re.compile(r"(?:-\s*Country:\s*|\|\s*Country\s*\|\s*)([^|\n]+)", re.IGNORECASE),
+    "website": re.compile(r"(?:Extracted details from\s+|\|\s*Website\s*\|\s*)(\S+)", re.IGNORECASE),
+    "description": re.compile(r"(?:-\s*Description:\s*|\|\s*Description\s*\|\s*)([^|\n]+)", re.IGNORECASE),
     "is_fallback": re.compile(r"-\s*Is Fallback:\s*(Yes|True)", re.IGNORECASE),
     "fallback_fields": re.compile(r"-\s*Fallback Fields:\s*(.+)", re.IGNORECASE),
     "fallback_notice": re.compile(r"-\s*Fallback Notice:\s*(.+)", re.IGNORECASE),
@@ -189,8 +189,9 @@ def _fields_from_research(research: str) -> dict:
         m = pattern.search(research or "")
         if m:
             value = m.group(1).strip()
-            # Clean off provenance annotations like (Source: ZaubaCorp / MCA Record)
-            value = re.sub(r"\s*\(Source:[^)]*\)", "", value, flags=re.IGNORECASE).strip()
+            # Clean off provenance annotations and trailing punctuation
+            value = re.sub(r"\s*\((?:Source:[^)]*|MCA registry|Verified Direct|Corporate|Direct Dial|Office)[^)]*\)", "", value, flags=re.IGNORECASE).strip()
+            value = value.rstrip("(").rstrip("|").strip()
             if value and not _NOT_FOUND_RE.match(value):
                 if field == "is_fallback":
                     found[field] = True
@@ -199,6 +200,7 @@ def _fields_from_research(research: str) -> dict:
                 else:
                     found[field] = value
     return found
+
 
 
 # ---------------------------------------------------------------------
@@ -212,7 +214,7 @@ async def _execute_tool(
     prompt_text: Optional[str] = None,
     bypass_gate: bool = False,
 ):
-    if tool_name in ("web_company_extract", "web_company_search", "web_crawl", "web_search", "web_fetch_page") and session_id:
+    if tool_name in ("apollo_enrich_lead", "web_company_extract", "web_company_search", "web_crawl", "web_search", "web_fetch_page") and session_id:
         from ERP_Unified.tools import record_web_research_activity
         record_web_research_activity(session_id)
 
@@ -227,9 +229,9 @@ async def _execute_tool(
             try:
                 transcript = audit_log.get_transcript(session_id)
                 for t in reversed(transcript):
-                    if t.get("tool_name") in ("web_company_extract", "web_crawl", "web_search", "web_company_search", "web_fetch_page"):
+                    if t.get("tool_name") in ("apollo_enrich_lead", "web_company_extract", "web_crawl", "web_search", "web_company_search", "web_fetch_page"):
                         had_web_tool = True
-                    if t.get("tool_name") == "web_company_extract" and t.get("content") and doctype_str.lower() == "lead":
+                    if t.get("tool_name") in ("apollo_enrich_lead", "web_company_extract") and t.get("content") and doctype_str.lower() == "lead":
                         research_fields = _fields_from_research(t["content"])
                         data_dict = dict(effective_args.get("data") or {})
                         for k, v in research_fields.items():
@@ -238,6 +240,7 @@ async def _execute_tool(
                         effective_args["data"] = data_dict
             except Exception as enrich_exc:
                 logger.debug("Could not auto-enrich Lead data from transcript: %s", enrich_exc)
+
 
             if had_web_tool:
                 effective_args["web_enriched"] = True

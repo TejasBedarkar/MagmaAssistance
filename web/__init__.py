@@ -6,6 +6,7 @@ from .web_tool import (
     web_fetch_page,
     web_search,
 )
+from .apollo_tool import apollo_enrich_lead
 
 __all__ = [
     "WEB_TOOLS",
@@ -14,4 +15,6 @@ __all__ = [
     "web_crawl",
     "web_company_search",
     "web_company_extract",
+    "apollo_enrich_lead",
 ]
+
