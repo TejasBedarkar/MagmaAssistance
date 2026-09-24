@@ -6,9 +6,11 @@ import copy
 import logging
 from datetime import datetime, timezone
 
+from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.base.id import uuid6
 
+import db.postgres_audit_log as audit_log
 import state
 
 logger = logging.getLogger("agent-server")
@@ -24,7 +26,7 @@ async def load_stream_history(session_id: str) -> list:
     return []
 
 
-async def save_stream_history(session_id: str, new_messages: list):
+async def save_stream_history(session_id: str, new_messages: list, user_id: str = None):
     if not new_messages or not state.saver:
         return
     config = {"configurable": {"thread_id": session_id, "checkpoint_ns": ""}}
@@ -52,3 +54,9 @@ async def save_stream_history(session_id: str, new_messages: list):
             await state._checkpoint_conn.commit()
         except Exception:
             pass
+
+    # Session-list bookkeeping (for the "past chats" sidebar) -- title comes from
+    # the first HumanMessage ever saved for this session, so it only takes effect
+    # the first time (later calls just bump last_active_at/message_count).
+    first_human = next((m.content for m in new_messages if isinstance(m, HumanMessage)), None)
+    audit_log.touch_chat_session(session_id, user_id, title_source=first_human)

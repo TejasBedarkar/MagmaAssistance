@@ -97,6 +97,21 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT,
+                title TEXT,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_active_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_sessions_user ON chat_sessions(user_id, last_active_at)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS pending_approval_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -255,6 +270,57 @@ def get_transcript(session_id: str) -> list[dict[str, Any]]:
         }
         for r in rows
     ]
+
+
+# What a "New chat" / active session actually is, for a real per-user history --
+# conversation_log only ever gets a row when a tool runs, so a plain back-and-forth
+# with no tool calls would be invisible to list_sessions() above. This table is
+# touched on every save (history.save_stream_history), tool call or not.
+def touch_chat_session(session_id: str, user_id: Optional[str], title_source: Optional[str] = None) -> None:
+    """Upserts one row per chat session: sets the title (from the session's first
+    user message) only on creation, bumps last_active_at and message_count on
+    every call. Never raises -- same reasoning as log_turn, a bookkeeping failure
+    should not break the actual chat turn."""
+    now = datetime.now(timezone.utc).isoformat()
+    title = (title_source or "").strip().splitlines()[0][:80] if title_source else None
+    try:
+        with _lock, _connect() as conn:
+            existing = conn.execute(
+                "SELECT title FROM chat_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE chat_sessions SET last_active_at = ?, message_count = message_count + 1, "
+                    "user_id = COALESCE(?, user_id) WHERE session_id = ?",
+                    (now, user_id, session_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO chat_sessions (session_id, user_id, title, message_count, "
+                    "created_at, last_active_at) VALUES (?, ?, ?, 1, ?, ?)",
+                    (session_id, user_id, title or "New chat", now, now),
+                )
+    except Exception:
+        logger.exception("Could not update chat_sessions for %s", session_id)
+
+
+def list_chat_sessions(user_id: Optional[str], limit: int = 50) -> list[dict[str, Any]]:
+    """This user's chats, most recently active first. `user_id` empty/None lists
+    every session (used for local/no-auth dev setups with no real identity)."""
+    with _lock, _connect() as conn:
+        if user_id:
+            rows = conn.execute(
+                "SELECT session_id, title, message_count, created_at, last_active_at "
+                "FROM chat_sessions WHERE user_id = ? ORDER BY last_active_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT session_id, title, message_count, created_at, last_active_at "
+                "FROM chat_sessions ORDER BY last_active_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def list_sessions(since: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:

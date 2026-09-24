@@ -298,7 +298,7 @@ def register_voice_ws(app, stream_agent_turn, logger, load_stream_history, save_
                 delta = history[start_len:]
                 if delta:
                     try:
-                        await save_stream_history(session_id, delta)
+                        await save_stream_history(session_id, delta, user_id=user_id)
                     except Exception as save_err:
                         logger.warning(
                             "[WS/voice] Could not save stream history for %s: %s",
