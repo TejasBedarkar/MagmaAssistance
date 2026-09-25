@@ -42,6 +42,7 @@ retrieval behaves.
 
 import logging
 import os
+import re
 from typing import List, Optional
 
 from skills_engine.loader import discover_skills
@@ -176,11 +177,13 @@ class SkillManager:
         """Dependency-free fallback: fraction of a skill's trigger/name
         words that appear in the query, literally. Cruder than embedding
         similarity but keeps skills usable with zero extra ML deps."""
-        q_words = set(query.lower().split())
+        def words(text: str) -> set:
+            return set(re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", text.lower()))
+
+        q_words = words(query)
         scored = []
         for skill in self.skills:
-            vocab = set(w.lower() for w in (skill.triggers or []))
-            vocab |= set(skill.name.lower().split())
+            vocab = words(" ".join([*(skill.triggers or []), skill.name]))
             if not vocab:
                 continue
             overlap = len(vocab & q_words) / len(vocab)
