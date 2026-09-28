@@ -102,6 +102,8 @@ def init_db() -> None:
                 user_id TEXT,
                 title TEXT,
                 message_count INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                pinned_at TEXT,
                 created_at TEXT NOT NULL,
                 last_active_at TEXT NOT NULL
             )
@@ -110,6 +112,12 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_sessions_user ON chat_sessions(user_id, last_active_at)"
         )
+        # migrates a chat_sessions table created before pinned/pinned_at existed
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_sessions)")}
+        if "pinned" not in cols:
+            conn.execute("ALTER TABLE chat_sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        if "pinned_at" not in cols:
+            conn.execute("ALTER TABLE chat_sessions ADD COLUMN pinned_at TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS pending_approval_items (
@@ -304,23 +312,58 @@ def touch_chat_session(session_id: str, user_id: Optional[str], title_source: Op
         logger.exception("Could not update chat_sessions for %s", session_id)
 
 
+MAX_PINNED_CHATS = 3
+
+
 def list_chat_sessions(user_id: Optional[str], limit: int = 50) -> list[dict[str, Any]]:
-    """This user's chats, most recently active first. `user_id` empty/None lists
-    every session (used for local/no-auth dev setups with no real identity)."""
+    """This user's chats, pinned first (oldest pin last), then most recently active."""
     with _lock, _connect() as conn:
         if user_id:
             rows = conn.execute(
-                "SELECT session_id, title, message_count, created_at, last_active_at "
-                "FROM chat_sessions WHERE user_id = ? ORDER BY last_active_at DESC LIMIT ?",
+                "SELECT session_id, title, message_count, pinned, created_at, last_active_at "
+                "FROM chat_sessions WHERE user_id = ? "
+                "ORDER BY pinned DESC, pinned_at DESC, last_active_at DESC LIMIT ?",
                 (user_id, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT session_id, title, message_count, created_at, last_active_at "
-                "FROM chat_sessions ORDER BY last_active_at DESC LIMIT ?",
+                "SELECT session_id, title, message_count, pinned, created_at, last_active_at "
+                "FROM chat_sessions ORDER BY pinned DESC, pinned_at DESC, last_active_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-    return [dict(r) for r in rows]
+    return [{**dict(r), "pinned": bool(r["pinned"])} for r in rows]
+
+
+def set_chat_session_pinned(session_id: str, user_id: Optional[str], pinned: bool) -> None:
+    """Pinning past MAX_PINNED_CHATS unpins this user's oldest-pinned chat first."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock, _connect() as conn:
+        if pinned:
+            pinned_rows = conn.execute(
+                "SELECT session_id FROM chat_sessions WHERE user_id = ? AND pinned = 1 "
+                "ORDER BY pinned_at ASC", (user_id,),
+            ).fetchall()
+            if len(pinned_rows) >= MAX_PINNED_CHATS:
+                conn.execute(
+                    "UPDATE chat_sessions SET pinned = 0, pinned_at = NULL WHERE session_id = ?",
+                    (pinned_rows[0]["session_id"],),
+                )
+            conn.execute(
+                "UPDATE chat_sessions SET pinned = 1, pinned_at = ? WHERE session_id = ?",
+                (now, session_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE chat_sessions SET pinned = 0, pinned_at = NULL WHERE session_id = ?",
+                (session_id,),
+            )
+
+
+def delete_chat_session(session_id: str) -> None:
+    """Removes the session from the chat list. conversation_log (the audit trail)
+    is kept either way."""
+    with _lock, _connect() as conn:
+        conn.execute("DELETE FROM chat_sessions WHERE session_id = ?", (session_id,))
 
 
 def list_sessions(since: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:

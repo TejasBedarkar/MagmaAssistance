@@ -37,6 +37,20 @@ def list_chat_sessions(user_id: Optional[str] = None, limit: int = 50):
     return {"sessions": audit_log.list_chat_sessions(user_id, limit=limit)}
 
 
+@router.post("/api/chat/sessions/{session_id}/pin")
+def pin_chat_session(session_id: str, pinned: bool = True, user_id: Optional[str] = None):
+    audit_log.set_chat_session_pinned(session_id, user_id, pinned)
+    return {"session_id": session_id, "pinned": pinned}
+
+
+@router.delete("/api/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    audit_log.delete_chat_session(session_id)
+    if state.saver:
+        await state.saver.adelete_thread(session_id)
+    return {"session_id": session_id, "deleted": True}
+
+
 @router.get("/api/chat/sessions/{session_id}/messages")
 async def get_chat_session_messages(session_id: str):
     """Replays one past session as the plain {sender, text} shape the chat UI
