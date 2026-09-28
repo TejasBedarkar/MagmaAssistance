@@ -26,7 +26,6 @@ from urllib.parse import urlparse
 from langchain_core.tools import tool
 
 from .apollo_client import ApolloClient, _clean_domain
-from .company_crawler.resolver import resolve_company_website
 from .web_tool import web_company_extract, web_company_search
 
 logger = logging.getLogger("apollo-tool")
@@ -144,12 +143,10 @@ def enrich_lead_pipeline(
     domain: Optional[str] = None,
     client: Optional[ApolloClient] = None,
     crawler_fn: Optional[Any] = None,
-    resolver_fn: Optional[Any] = None,
 ) -> str:
     """Core enrichment logic decoupled for easy testing and tool execution."""
     c = client or _apollo_client
     crawler_dispatcher = crawler_fn or _dispatch_crawler
-    resolve_domain = resolver_fn if resolver_fn is not None else resolve_company_website
 
     company = (company_name or "").strip()
     person = (person_name or "").strip() or None
@@ -159,7 +156,13 @@ def enrich_lead_pipeline(
     if not dom and ("." in company and not " " in company):
         dom = _clean_domain(company)
 
-    # Fast heuristic: if company is a single word name, try company.com first
+    # A domain confirmed by the caller (explicit or embedded in the name) is safe to
+    # hand the crawler for direct extraction. Keep it separate from the guess below.
+    confirmed_dom = dom
+
+    # Fast heuristic: if company is a single word name, try company.com to help Apollo's
+    # own matching. This is only a guess, never confirmed, so it must NOT reach the
+    # crawler fallback -- that would extract from an unverified URL with no user confirmation.
     if not dom and company and " " not in company and "." not in company:
         dom = f"{company.lower()}.com"
 
@@ -205,7 +208,7 @@ def enrich_lead_pipeline(
     logger.info("Company '%s' not found in Apollo.io. Falling back to Web Crawler / ZaubaCorp...", company)
     notice = f"*Company '{company}' was not found in Apollo.io database. Triggering Web Crawler & ZaubaCorp fallback...*"
 
-    crawler_output = crawler_dispatcher(company_name=company, person_name=person, domain=dom)
+    crawler_output = crawler_dispatcher(company_name=company, person_name=person, domain=confirmed_dom)
     return f"{notice}\n\n{crawler_output}"
 
 

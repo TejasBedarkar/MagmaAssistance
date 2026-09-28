@@ -204,7 +204,6 @@ def test_enrich_lead_pipeline_company_not_in_apollo_triggers_crawler():
         person_name="Suresh",
         client=mock_client,
         crawler_fn=mock_crawler,
-        resolver_fn=lambda name, **kwargs: [],
     )
 
     assert "Company 'Unknown Local Shop' was not found in Apollo.io database" in result
@@ -213,6 +212,31 @@ def test_enrich_lead_pipeline_company_not_in_apollo_triggers_crawler():
     mock_crawler.assert_called_once_with(
         company_name="Unknown Local Shop",
         person_name="Suresh",
+        domain=None,
+    )
+
+
+def test_enrich_lead_pipeline_single_word_company_does_not_skip_confirmation():
+    """A single-word company name must not let the guessed '<name>.com' domain
+    reach the crawler directly -- it should still go through candidate search."""
+    mock_client = MagicMock(spec=ApolloClient)
+    mock_client.is_configured.return_value = True
+    mock_client.match_person.return_value = None
+    mock_client.enrich_organization.return_value = None
+
+    mock_crawler = MagicMock(return_value="Candidate websites for 'Sterling': 1. sterling.in")
+
+    result = enrich_lead_pipeline(
+        company_name="Sterling",
+        person_name="Rakesh",
+        client=mock_client,
+        crawler_fn=mock_crawler,
+    )
+
+    assert "Company 'Sterling' was not found in Apollo.io database" in result
+    mock_crawler.assert_called_once_with(
+        company_name="Sterling",
+        person_name="Rakesh",
         domain=None,
     )
 
