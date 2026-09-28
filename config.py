@@ -16,5 +16,11 @@ TOOL_RAG_TOP_K = int(os.environ.get("TOOL_RAG_TOP_K", "3"))
 TOOL_RAG_MIN_SCORE = float(os.environ.get("TOOL_RAG_MIN_SCORE", "0.25"))
 TOOL_RAG_BYPASS_THRESHOLD = int(os.environ.get("TOOL_RAG_BYPASS_THRESHOLD", "100"))
 
-MAX_HISTORY_TOKENS = 60000  # Approximated: 1 token ~= 4 chars
+# Skills: workflow-specific instruction blocks loaded from SKILLS_DIR and
+# injected into the system prompt only on the turns they're relevant to
+# (see skills_engine/ for the retrieval code, skills/ for the content).
+SKILLS_DIR = os.environ.get("SKILLS_DIR", "skills")
+SKILL_RAG_TOP_K = int(os.environ.get("SKILL_RAG_TOP_K", "2"))
+SKILL_RAG_MIN_SCORE = float(os.environ.get("SKILL_RAG_MIN_SCORE", "0.30"))
 
+MAX_HISTORY_TOKENS = 60000  # Approximated: 1 token ~= 4 chars
