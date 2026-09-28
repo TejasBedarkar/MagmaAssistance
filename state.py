@@ -25,6 +25,7 @@ from ERP_Unified.tools import ERP_UNIFIED_TOOLS
 from llm_client import OpenAIChatModel  # ensures LLM.model property is attached
 from Main import VoiceAssistant
 from skills_engine import SkillManager
+from web.apollo_tool import apollo_enrich_lead
 from web.web_tool import WEB_TOOLS
 
 logger = logging.getLogger("agent-server")
@@ -32,7 +33,8 @@ logger = logging.getLogger("agent-server")
 # ---------------------------------------------------------------------
 # Registered agent tools
 # ---------------------------------------------------------------------
-ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS]
+ALL_TOOLS = [*ERP_UNIFIED_TOOLS, *DASHBOARD_UI_TOOLS, *WEB_TOOLS, apollo_enrich_lead]
+
 
 tool_rag = None
 tool_map: Dict[str, Any] = {}

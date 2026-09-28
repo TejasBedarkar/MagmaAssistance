@@ -24,3 +24,5 @@ SKILL_RAG_TOP_K = int(os.environ.get("SKILL_RAG_TOP_K", "2"))
 SKILL_RAG_MIN_SCORE = float(os.environ.get("SKILL_RAG_MIN_SCORE", "0.30"))
 
 MAX_HISTORY_TOKENS = 60000  # Approximated: 1 token ~= 4 chars
+
+APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
