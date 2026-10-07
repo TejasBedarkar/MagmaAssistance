@@ -45,6 +45,8 @@ from ERP.tools.project_onboarding_tools import PROJECT_ONBOARDING_TOOLS
 from ERP.tools.project_onboarding_helpers import _default_company, _resolve_assignee
 from ERP.tools.task_assignment_tools import TASK_ASSIGNMENT_TOOLS
 from ERP.tools.crm_conversion_tools import CRM_CONVERSION_TOOLS
+from ERP.tools.performance_tools import PERFORMANCE_TOOLS
+from ERP.tools.performance_action_tools import PERFORMANCE_ACTION_TOOLS
 from ERP_Unified.validation import (
     find_blocking_link_problem,
     _is_valid_email,
@@ -773,4 +775,5 @@ def erp_send_email(
 ERP_UNIFIED_TOOLS = [
     erp_data_tool, erp_describe_fields, erp_send_email,
     *PROJECT_ONBOARDING_TOOLS, *TASK_ASSIGNMENT_TOOLS, *CRM_CONVERSION_TOOLS,
+    *PERFORMANCE_TOOLS, *PERFORMANCE_ACTION_TOOLS,
 ]

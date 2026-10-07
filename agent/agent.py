@@ -68,7 +68,22 @@ _ALWAYS_GATED_TOOLS = {"erp_send_email"}
 # create/update: intercept it, stash it, require a real confirmation.
 _DRY_RUN_GATED_TOOLS = {
     "onboard_new_lead", "batch_manage_project_tasks", "reassign_tasks", "convert_crm_record",
+    "draft_review_feedback", "set_employee_goals",
 }
+
+
+# A successful preview from these tools is stashed as the pending write, so the user's "yes"
+# saves exactly what they were shown and the model never has to repeat the call itself.
+_PREVIEW_STASHED_TOOLS = {"draft_review_feedback", "set_employee_goals"}
+_PREVIEW_MARKER = "PREVIEW (nothing saved yet)"
+_ALREADY_QUEUED = (
+    "Already queued: this exact action is waiting for the user's \"yes\" from the preview above. "
+    "Don't mention this notice or repeat anything; your reply should ask for confirmation only once."
+)
+
+
+def _same_args(a: dict, b: dict) -> bool:
+    return json.dumps(a or {}, sort_keys=True, default=str) == json.dumps(b or {}, sort_keys=True, default=str)
 
 
 def _is_write_call(tool_name: str, args: dict) -> bool:
@@ -128,6 +143,16 @@ def _describe_pending_action(tool_name: str, args: dict) -> str:
         name = args.get("source_name", "?")
         tgt = args.get("target_doctype", "?")
         return f"Convert {src} '{name}' to a new {tgt} (using MagnaERP's own field mapping)"
+
+    if tool_name == "draft_review_feedback":
+        quarter = f" for {args['quarter']}" if args.get("quarter") else ""
+        return f"Save draft review feedback for '{args.get('employee')}'{quarter}: \"{args.get('feedback', '')}\""
+
+    if tool_name == "set_employee_goals":
+        goals = args.get("goals") or []
+        names = ", ".join(str((g or {}).get("goal_name", "?")) for g in goals)
+        quarter = f" in {args['quarter']}" if args.get("quarter") else ""
+        return f"Create {len(goals)} goal(s) for '{args.get('employee')}'{quarter}: {names}"
 
     return f"Run {tool_name} with {args}"
 
@@ -311,6 +336,18 @@ async def _execute_tool(
                 )
                 return blocker
 
+        if tool_name in _PREVIEW_STASHED_TOOLS:
+            if any(
+                item["tool_name"] == tool_name and _same_args(item["args"], effective_args)
+                for item in audit_log.get_pending_approvals(session_id)
+            ):
+                return _ALREADY_QUEUED
+            # Never ask for a "yes" the server hasn't validated: run it as a preview instead.
+            return await _execute_tool(
+                tool_name, {**effective_args, "dry_run": True},
+                session_id=session_id, user_id=user_id, prompt_text=prompt_text,
+            )
+
         audit_log.save_pending_approval(session_id, tool_name, effective_args)
         proposal = (
             f"PROPOSED ACTION (not yet executed): {_describe_pending_action(tool_name, preview_args)}\n"
@@ -344,6 +381,11 @@ async def _execute_tool(
             )
         if bypass_gate and session_id:
             audit_log.clear_pending_approval(session_id)
+        elif (
+            session_id and tool_name in _PREVIEW_STASHED_TOOLS
+            and isinstance(result, str) and result.startswith(_PREVIEW_MARKER)
+        ):
+            audit_log.save_pending_approval(session_id, tool_name, {**effective_args, "dry_run": False})
         return result
     except PermissionError as e:
         logger.warning("Tool '%s' denied by ERPNext permission check: %s", tool_name, e)
