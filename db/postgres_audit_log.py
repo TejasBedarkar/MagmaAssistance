@@ -201,6 +201,32 @@ def clear_pending_approval(session_id: Optional[str]) -> None:
         conn.execute("DELETE FROM pending_approval_items WHERE session_id = ?", (session_id,))
 
 
+_RUN_ONLY_ARGS = {"dry_run", "session_id", "approved", "web_enriched"}
+
+
+def _action_args(args: Optional[dict]) -> dict:
+    return {k: v for k, v in (args or {}).items() if k not in _RUN_ONLY_ARGS}
+
+
+def recent_executed_write(session_id: str, tool_name: str, args: dict, within_seconds: int = 600) -> Optional[str]:
+    """Result of the same approved write if this session already ran it in the last few minutes, else None."""
+    since = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - within_seconds, timezone.utc).isoformat()
+    wanted = _action_args(args)
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT tool_args, content FROM conversation_log WHERE session_id = ? AND tool_name = ? "
+            "AND tool_status = 'approved_executed' AND created_at >= ? ORDER BY id DESC",
+            (session_id, tool_name, since),
+        ).fetchall()
+    for row in rows:
+        try:
+            if _action_args(json.loads(row["tool_args"] or "{}")) == wanted:
+                return row["content"]
+        except ValueError:
+            continue
+    return None
+
+
 def log_turn(
     session_id: str,
     role: str,

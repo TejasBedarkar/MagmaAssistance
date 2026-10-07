@@ -74,16 +74,18 @@ _TABLE_LINE_RE = re.compile(r'^\s*\|.*\|\s*$')
 _MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
 _BARE_URL_RE = re.compile(r'https?://\S+')
 _EMPTY_BULLET_RE = re.compile(r'^\s*[-*]\s*$')
+# a record field shown as a bullet, e.g. "- **Party Name:** CRM-LEAD-2026-00033" -- shown on screen, not read aloud
+_FIELD_LINE_RE = re.compile(r'^\s*(?:[-*•]|\d+[.)])\s+\*\*(?:[^*\n]{1,60}:\*\*|[^*\n]{1,60}\*\*\s*:)')
 _SENTENCE_SPLIT_RE = re.compile(r'(?<!\d\.)(?<!\d\d\.)(?<=[.!?।])\s+')
 
 
 def clean_for_speech(text: str) -> str:
-    """Strip markdown that sounds bad when spoken."""
+    """Strip markdown that sounds bad when spoken, including record fields listed as "- **Field:** value"."""
     text = _ACTION_TAG_RE.sub('', text)
     text = _CODE_BLOCK_RE.sub('', text)
     lines = [
         l for l in text.split('\n')
-        if not _TABLE_LINE_RE.match(l) and not _EMPTY_BULLET_RE.match(l)
+        if not _TABLE_LINE_RE.match(l) and not _EMPTY_BULLET_RE.match(l) and not _FIELD_LINE_RE.match(l)
     ]
     text = '\n'.join(lines)
     text = _MD_LINK_RE.sub(r'\1', text)

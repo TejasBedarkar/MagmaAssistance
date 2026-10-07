@@ -610,6 +610,12 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             yield {"type": "tool_result", "name": item["tool_name"], "result": result}
             results.append(result)
 
+        if session_id:
+            audit_log.clear_pending_approval(session_id)
+        # Recorded before the summary streams, so an interrupted turn still reads as done and a later "proceed" can't re-run it.
+        history.append(AIMessage(content="Done. The approved action was carried out: " + "; ".join(str(r)[:300] for r in results)))
+        note_index = len(history) - 1
+
         if len(results) == 1:
             results_text = f"Tool result: {results[0]}"
         else:
@@ -639,9 +645,7 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
         if not content.strip():
             content = str(results[-1]) if results else "Done."
             yield {"type": "token", "text": content}
-        if session_id:
-            audit_log.clear_pending_approval(session_id)
-        history.append(AIMessage(content=content))
+        history[note_index] = AIMessage(content=content)
         yield {"type": "done", "text": content, "_delta": history[start_len:]}
         return
 
@@ -819,13 +823,24 @@ async def stream_agent_turn(text, session_id=None, user_id=None, history=None, t
             for tc in tool_calls:
                 yield {"type": "tool_call", "name": tc["name"], "args": tc.get("args") or {}}
                 bypass = approving_proposal_turn and _is_write_call(tc["name"], tc.get("args") or {})
-                tool_task = asyncio.create_task(
-                    _execute_tool(
-                        tc["name"], tc.get("args") or {},
-                        session_id=session_id, user_id=user_id, prompt_text=text,
-                        bypass_gate=bypass,
+                already_done = bypass and session_id and audit_log.recent_executed_write(session_id, tc["name"], tc.get("args") or {})
+                if already_done:
+                    # The same approved write already ran moments ago; a second "proceed" must not duplicate it.
+                    tool_task = asyncio.create_task(asyncio.sleep(0, result=(
+                        "ALREADY DONE: this exact action was already carried out in this conversation a moment ago, "
+                        f"so nothing new was created. Earlier result: {str(already_done)[:500]}\n"
+                        "Tell the user it is already done and give the record ID. Do not call the tool again."
+                    )))
+                    bypass = False
+                    approving_proposal_turn = False
+                else:
+                    tool_task = asyncio.create_task(
+                        _execute_tool(
+                            tc["name"], tc.get("args") or {},
+                            session_id=session_id, user_id=user_id, prompt_text=text,
+                            bypass_gate=bypass,
+                        )
                     )
-                )
                 while not tool_task.done():
                     done, _ = await asyncio.wait([tool_task], timeout=1.5)
                     if not done:
