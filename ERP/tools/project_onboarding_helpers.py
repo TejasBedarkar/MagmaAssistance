@@ -141,7 +141,13 @@ def _resolve_assignee(identifier: str) -> Dict[str, Any]:
         return {"error": "No assignee given."}
 
     if _EMAIL_RE.match(identifier):
-        return {"user": identifier}
+        # A guessed address (firstname.lastname@...) isn't a login; only a real User passes straight through.
+        try:
+            if erp_client.get_list("User", fields=["name"], filters=[["name", "=", identifier]], limit=1, use_cache=False):
+                return {"user": identifier}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"could not look up MagnaERP user '{identifier}': {exc}"}
+        identifier = re.sub(r"[._\-]+", " ", identifier.split("@")[0]).strip()
 
     # 1. Try fetching exact Employee by ID (e.g. HR-EMP-0001)
     try:
@@ -191,7 +197,7 @@ def _resolve_assignee(identifier: str) -> Dict[str, Any]:
 
     user_id = emp_matches[0].get("user_id")
     if not user_id:
-        return {"error": f"Employee '{emp_matches[0].get('employee_name')}' found but has no linked User ID."}
+        return {"error": f"{emp_matches[0].get('employee_name')} has no MagnaERP login, so the task can't be assigned to them."}
 
     return {"user": user_id}
 

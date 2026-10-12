@@ -74,8 +74,8 @@ _DRY_RUN_GATED_TOOLS = {
 
 # A successful preview from these tools is stashed as the pending write, so the user's "yes"
 # saves exactly what they were shown and the model never has to repeat the call itself.
-_PREVIEW_STASHED_TOOLS = {"draft_review_feedback", "set_employee_goals"}
-_PREVIEW_MARKER = "PREVIEW (nothing saved yet)"
+_PREVIEW_STASHED_TOOLS = {"draft_review_feedback", "set_employee_goals", "reassign_tasks"}
+_PREVIEW_MARKERS = ("PREVIEW (nothing saved yet)", "DRY RUN --")
 _ALREADY_QUEUED = (
     "Already queued: this exact action is waiting for the user's \"yes\" from the preview above. "
     "Don't mention this notice or repeat anything; your reply should ask for confirmation only once."
@@ -383,7 +383,7 @@ async def _execute_tool(
             audit_log.clear_pending_approval(session_id)
         elif (
             session_id and tool_name in _PREVIEW_STASHED_TOOLS
-            and isinstance(result, str) and result.startswith(_PREVIEW_MARKER)
+            and isinstance(result, str) and result.startswith(_PREVIEW_MARKERS)
         ):
             audit_log.save_pending_approval(session_id, tool_name, {**effective_args, "dry_run": False})
         return result

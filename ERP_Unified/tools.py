@@ -41,6 +41,7 @@ from ERP.dynamic_fields import (
     apply_transaction_currency_defaults,
     safe_call as _safe_call,
 )
+from ERP_Unified.link_names import fill_links_from_names
 from ERP.tools.project_onboarding_tools import PROJECT_ONBOARDING_TOOLS
 from ERP.tools.project_onboarding_helpers import _default_company, _resolve_assignee
 from ERP.tools.task_assignment_tools import TASK_ASSIGNMENT_TOOLS
@@ -544,6 +545,7 @@ def _run_create(
             if not merged.get("lead_name"):
                 merged["lead_name"] = merged.get("first_name") or merged.get("company_name")
         merged = apply_default_values(doctype, merged)
+        merged, link_hint = fill_links_from_names(doctype, merged)
         missing = missing_required_fields(doctype, merged)
     except Exception as exc:  # noqa: BLE001
         return explain_erp_error(exc, context=f"look up required fields for {doctype}")
@@ -554,7 +556,7 @@ def _run_create(
         _PENDING_CREATE_FIELD[session_id] = (doctype, next_field["fieldname"])
         message = (
             f"I need a bit more information to create this {doctype}. "
-            f"{field_question(next_field)} "
+            f"{link_hint + ' ' if link_hint else ''}{field_question(next_field)} "
             f"(field: {next_field['fieldname']}; {len(missing)} field(s) still "
             f"needed after this one is answered)\n"
             f"Once you have the answer, call erp_data_tool again with "

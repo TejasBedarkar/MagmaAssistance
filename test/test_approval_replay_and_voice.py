@@ -1,12 +1,14 @@
 """An interrupted approval must not be re-run by a later "proceed", and voice must not read record fields aloud."""
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+import contextlib
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
 
 import db.postgres_audit_log as audit_log
+import state
 from agent import agent as agent_module
 from Voice.ws_voice import clean_for_speech
 
@@ -70,3 +72,28 @@ def test_interrupted_approval_still_records_the_action_as_done():
     assert isinstance(last, AIMessage) and last.content.startswith("Done.")
     assert "CRM-OPP-2026-00011" in last.content
     assert not agent_module._PROSE_PROPOSAL_RE.search(last.content)
+
+
+REASSIGN_ARGS = {"tasks": [{"task_name": "TASK-2026-00016", "assigned_to": "neha@magnadata.local"}]}
+
+
+def _run_reassign(tool_result, args):
+    fake_tool = MagicMock(args_schema=None)
+    fake_tool.ainvoke = AsyncMock(return_value=tool_result)
+    with patch.dict(state.tool_map, {"reassign_tasks": fake_tool}), \
+         patch.object(audit_log, "log_turn"), \
+         patch.object(audit_log, "time_tool_call", lambda: contextlib.nullcontext(lambda: 0)), \
+         patch.object(audit_log, "get_pending_approvals", return_value=[]), \
+         patch.object(audit_log, "save_pending_approval") as save:
+        asyncio.run(agent_module._execute_tool("reassign_tasks", dict(args), session_id="s1"))
+    return save
+
+
+def test_reassign_dry_run_is_queued_so_yes_executes_it():
+    save = _run_reassign("DRY RUN -- nothing has been assigned yet:\n - TASK-2026-00016: assign to neha@magnadata.local", REASSIGN_ARGS)
+    save.assert_called_once_with("s1", "reassign_tasks", {**REASSIGN_ARGS, "dry_run": False})
+
+
+def test_reassign_error_is_not_queued():
+    save = _run_reassign("Task TASK-2026-09999 was not found.", REASSIGN_ARGS)
+    save.assert_not_called()
